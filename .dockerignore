@@ -1,0 +1,53 @@
+# Build context control.
+#
+# The image needs the service modules, the sync script, entrypoint.sh,
+# templates/, static/, seed/ and tools/. Everything else in this directory is
+# history, working notes or documentation, and shipping it wastes context
+# transfer on every build. One entry matters for more than speed:
+# app5.py still contains a hardcoded LAN IP, so keeping the dead versions out
+# of the context keeps them out of any published layer too.
+
+# Dead and superseded versions
+app4.py
+app5.py
+app_old.py
+app_old_*.py
+app_pre_*.py
+app_post_*.py
+Dockerfile4
+Dockerfile_old
+extract_stream4.py
+extract_stream_old.py
+
+# Abandoned experiments
+intercept_jw.py
+test_stealth.py
+
+# Verification harness, run against the built image rather than shipped in it
+tools/check_console.py
+tools/check_render.py
+_shots/
+
+# Stale compose. The real one is the deployment's own.
+docker-compose.yml
+
+# Previous owner's snapshots
+_backups/
+
+# Documentation and working notes
+*.md
+docs/
+
+# Agent tooling
+.claude/
+
+# Python and editor noise
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+
+# VCS
+.git/
+.gitignore

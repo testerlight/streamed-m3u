@@ -1,0 +1,100 @@
+# streamed-m3u with a WireGuard VPN sidecar (gluetun).
+#
+#   cp .env.example .env        # fill in the VPN and Dispatcharr credentials
+#   docker compose up -d
+#
+# streamed-m3u shares gluetun's network, so every scrape and every stream
+# leaves through the tunnel, and port 8787 is published by gluetun. Reach the
+# console at http://<host>:8787 and, in Dispatcharr, add the M3U account with
+#   http://gluetun:8787/playlist-teams.m3u
+# and the EPG source with
+#   http://gluetun:8787/epg.xml
+# Stream URLs in the playlist are derived from that request, so they resolve
+# on the compose network without any further configuration.
+#
+# No VPN? Use docker-compose.novpn.yml instead.
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER:-airvpn}
+      VPN_TYPE: ${VPN_TYPE:-wireguard}
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:?set WIREGUARD_PRIVATE_KEY in .env}
+      WIREGUARD_PRESHARED_KEY: ${WIREGUARD_PRESHARED_KEY:-}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:?set WIREGUARD_ADDRESSES in .env}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES:-United States}
+    ports:
+      # This is streamed-m3u's port; it lives here because of network_mode below.
+      - "${STREAMED_M3U_PORT:-8787}:8787"
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  streamed-m3u:
+    image: ${STREAMED_M3U_IMAGE:-streamed-m3u:latest}
+    # To build from this directory instead of pulling an image:
+    # build: .
+    container_name: streamed-m3u
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-UTC}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:-}
+      CONSOLE_COOKIE_SECURE: ${CONSOLE_COOKIE_SECURE:-0}
+      PREWARM_TEAMS: ${PREWARM_TEAMS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ${CONFIG_DIR:-./config}/streamed-m3u:/data
+    restart: unless-stopped
+
+  dispatcharr:
+    image: ghcr.io/dispatcharr/dispatcharr:latest
+    container_name: dispatcharr
+    environment:
+      DISPATCHARR_ENV: aio
+      REDIS_HOST: 127.0.0.1
+      CELERY_BROKER_URL: redis://127.0.0.1:6379/0
+      DISPATCHARR_LOG_LEVEL: info
+    ports:
+      - "${DISPATCHARR_PORT:-9191}:9191"
+    volumes:
+      - ${CONFIG_DIR:-./config}/dispatcharr:/data
+    restart: unless-stopped
+
+  streamed-m3u-sync:
+    image: ${STREAMED_M3U_IMAGE:-streamed-m3u:latest}
+    container_name: streamed-m3u-sync
+    command: ["python", "dispatcharr_sync.py", "--loop"]
+    depends_on:
+      - dispatcharr
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      # Reaches Dispatcharr over the compose network. This container must not
+      # share gluetun's namespace: the tunnel has no route to other containers.
+      DISPATCHARR_URL: http://dispatcharr:9191
+      DISPATCHARR_USER: ${DISPATCHARR_USER:?set DISPATCHARR_USER in .env}
+      DISPATCHARR_PASS: ${DISPATCHARR_PASS:?set DISPATCHARR_PASS in .env}
+      M3U_ACCOUNT_NAME: ${M3U_ACCOUNT_NAME:-streamed.pk teams}
+      EPG_SOURCE_NAME: ${EPG_SOURCE_NAME:-streamed.pk teams EPG}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-480}
+    # The image's healthcheck probes the web service, which this container
+    # does not run.
+    healthcheck:
+      disable: true
+    restart: unless-stopped

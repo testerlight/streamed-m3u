@@ -1,0 +1,5 @@
+flask>=3.0,<4
+requests>=2.31,<3
+curl_cffi>=0.7,<1
+playwright>=1.40,<2
+psutil>=6.0,<7

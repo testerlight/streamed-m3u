@@ -1,0 +1,50 @@
+# Secrets and local configuration. Nothing in this project should ever carry a
+# real WireGuard key, Dispatcharr password or VPN credential into version
+# control. Keep .env.example tracked and .env out.
+.env
+*.env
+!.env.example
+
+# Local compose data directory (see docker-compose.yml CONFIG_DIR).
+config/
+
+# Runtime state. teams.json is the roster and the only irreplaceable state the
+# service holds; it belongs in a backup or a release asset, not in the repo.
+data/
+*.log
+
+# Rollback snapshots and dead versions. These are a working convention on the
+# host, not project history worth publishing.
+app4.py
+app5.py
+app_old.py
+app_old_*.py
+app_pre_*.py
+app_post_*.py
+Dockerfile4
+Dockerfile_old
+extract_stream4.py
+extract_stream_old.py
+channel_number_backup_*.json
+_backups/
+
+# Abandoned experiments
+intercept_jw.py
+test_stealth.py
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Screenshots from tools/check_render.py
+_shots/
+.claude/

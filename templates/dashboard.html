@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>streamed-m3u console</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+<meta name="csrf-token" content="{{ csrf_token }}">
+</head>
+<body>
+
+<nav class="global-nav">
+  <span class="wordmark">streamed-m3u <span class="dim">console</span></span>
+  <span class="nav-spacer"></span>
+  <button type="button" class="nav-control" id="poll-toggle" aria-pressed="true">Auto refresh on</button>
+  <button type="button" class="nav-control" id="refresh-now">Refresh</button>
+  <button type="button" class="nav-control" id="theme-toggle">Light</button>
+  {% if auth_enabled and logged_in %}
+  <button type="button" class="nav-control" id="sign-out">Sign out</button>
+  {% elif auth_enabled %}
+  <a class="nav-control" href="{{ url_for('auth.login', next='/') }}">Sign in</a>
+  {% endif %}
+</nav>
+
+<div class="sub-nav">
+  <span class="title">Diagnostics</span>
+  <span class="status-label" id="subnav-status">
+    <span class="dot" id="subnav-dot"></span>
+    <span id="subnav-status-text">Connecting</span>
+  </span>
+  <nav class="anchors" aria-label="Sections">
+    <a href="#overview">Overview</a>
+    <a href="#streams">Streams</a>
+    <a href="#prewarm">Pre-warm</a>
+    <a href="#roster">Roster</a>
+    <a href="#aliases">Aliases</a>
+    <a href="#caches">Caches</a>
+    <a href="#events">Events</a>
+    <a href="#config">Configuration</a>
+    <a href="#overrides">Overrides</a>
+    <a href="#endpoints">Endpoints</a>
+  </nav>
+</div>
+
+<main>
+
+  <section id="overview">
+    <div class="section-head">
+      <h1>Service overview</h1>
+    </div>
+    <p class="lede">
+      Live state of the playlist builder, the stream proxy and the caches behind
+      them.
+      {% if logged_in %}You are signed in, so settings can be changed below.
+      {% elif auth_enabled %}Read-only until you sign in.
+      {% else %}Read-only. Set CONSOLE_PASSWORD to enable editing.{% endif %}
+    </p>
+
+    <div class="status-banner" style="margin-top: 17px;">
+      <span class="status-label">
+        <span class="dot" id="health-dot"></span>
+        <span id="health-text">Checking service</span>
+      </span>
+      <div class="banner-facts" id="banner-facts">
+        <span class="skeleton w60" style="width: 220px;"></span>
+      </div>
+    </div>
+    <p class="section-note" id="base-note" style="margin: 0 0 12px 4px;"></p>
+    <div class="banner-warn" id="restart-banner" hidden></div>
+
+    <div class="stat-grid" id="stat-grid">
+      <div class="stat"><div class="stat-label">Roster</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Resolvable now</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Guide fixtures</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Active streams</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Favourites warm</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Extraction cache</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Next rebuild</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Uptime</div><div class="skeleton tall"></div></div>
+    </div>
+  </section>
+
+  <section id="streams">
+    <div class="section-head">
+      <h2>Active streams</h2>
+      <p class="section-note">What is being proxied right now, with per-stream throughput.</p>
+    </div>
+    <div class="table-wrap" id="streams-panel">
+      <div class="empty"><p>Loading.</p></div>
+    </div>
+  </section>
+
+  <section id="prewarm">
+    <div class="section-head">
+      <h2>Pre-warm</h2>
+      <p class="section-note">Favourites held ready so a click resolves instantly.</p>
+    </div>
+    <div class="table-wrap" id="prewarm-panel">
+      <div class="empty"><p>Loading.</p></div>
+    </div>
+  </section>
+
+  <section id="roster">
+    <div class="section-head">
+      <h2>Roster</h2>
+      <p class="section-note">Every channel the service knows about, and what it resolves to now.</p>
+    </div>
+    <div class="toolbar">
+      <input type="search" class="search" id="roster-search"
+             placeholder="Search team, match or slug" aria-label="Search the roster">
+      <button type="button" class="chip" id="roster-scope-playing" aria-pressed="true">Resolvable now</button>
+      <button type="button" class="chip" id="roster-scope-all" aria-pressed="false">Full roster</button>
+      <span class="toolbar-count" id="roster-count"></span>
+    </div>
+    <div class="table-wrap" id="roster-panel">
+      <div class="empty"><p>Loading.</p></div>
+    </div>
+  </section>
+
+  <section id="aliases">
+    <div class="section-head">
+      <h2>Aliases</h2>
+      <p class="section-note">
+        Major-league names granted away-side resolution. A name still unseen once
+        its season is running is usually a misspelling, which otherwise fails silently.
+      </p>
+    </div>
+    <div id="alias-panel">
+      <div class="panel"><div class="skeleton w40"></div></div>
+    </div>
+  </section>
+
+  <section id="caches">
+    <div class="section-head">
+      <h2>Caches</h2>
+      <p class="section-note">Resolved stream URLs, proxied logos, and sources confirmed to carry no audio.</p>
+    </div>
+    <div class="stat-grid" id="cache-stats" style="margin-bottom: 12px;">
+      <div class="stat"><div class="stat-label">Extraction entries</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Logo cache</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Logo failures</div><div class="skeleton tall"></div></div>
+      <div class="stat"><div class="stat-label">Silent sources</div><div class="skeleton tall"></div></div>
+    </div>
+    <div class="table-wrap" id="cache-panel">
+      <div class="empty"><p>Loading.</p></div>
+    </div>
+  </section>
+
+  <section id="events">
+    <div class="section-head">
+      <h2>Events</h2>
+      <p class="section-note">Recent log records, newest first. Verbosity follows the service log level.</p>
+    </div>
+    <div class="toolbar">
+      <button type="button" class="chip" data-level="" aria-pressed="true">All</button>
+      <button type="button" class="chip" data-level="INFO" aria-pressed="false">Info and above</button>
+      <button type="button" class="chip" data-level="WARNING" aria-pressed="false">Warnings</button>
+      <button type="button" class="chip" data-level="ERROR" aria-pressed="false">Errors</button>
+      <span class="toolbar-count" id="events-count"></span>
+    </div>
+    <div class="table-wrap">
+      <div class="events" id="events-panel">
+        <div class="empty"><p>Loading.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="config">
+    <div class="section-head">
+      <h2>Configuration</h2>
+      <p class="section-note">
+        Effective values. Set marks a setting supplied through the environment,
+        Default marks one left at the built-in value.
+      </p>
+    </div>
+    <div class="toolbar">
+      <input type="search" class="search" id="config-search"
+             placeholder="Search settings" aria-label="Search configuration">
+      <button type="button" class="chip" id="config-all" aria-pressed="true">All</button>
+      <button type="button" class="chip" id="config-custom" aria-pressed="false">Set here only</button>
+      <span class="save-bar" id="save-bar" hidden>
+        <span class="count" id="save-count"></span>
+        <button type="button" class="btn btn-primary" id="save-settings">Save</button>
+        <button type="button" class="btn" id="discard-settings">Discard</button>
+      </span>
+      <span class="toolbar-count" id="config-count"></span>
+    </div>
+    <div id="config-panel">
+      <div class="panel"><div class="skeleton w60"></div></div>
+    </div>
+  </section>
+
+  <section id="overrides">
+    <div class="section-head">
+      <h2>Overrides</h2>
+      <p class="section-note">
+        Additions to the built-in tables: extra league names for away-side resolution,
+        and alias maps for feeds and series. Additions only; a built-in entry cannot be removed here.
+      </p>
+    </div>
+    <div id="overrides-panel">
+      <div class="panel"><div class="skeleton w60"></div></div>
+    </div>
+  </section>
+
+  <section id="endpoints">
+    <div class="section-head">
+      <h2>Endpoints</h2>
+      <p class="section-note">Addresses built from the host you reached this page on.</p>
+    </div>
+    <div class="endpoints" id="endpoints-panel"></div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="footer-inner">
+    <span>streamed-m3u {{ version }}</span>
+    <span id="footer-uptime"></span>
+    <span id="footer-source"></span>
+    <span class="sep" id="footer-updated"></span>
+  </div>
+</footer>
+
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

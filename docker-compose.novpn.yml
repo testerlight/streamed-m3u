@@ -1,0 +1,71 @@
+# streamed-m3u without the VPN sidecar.
+#
+# Use this when your VPN runs on the router or the host, or when you do not
+# need one. streamed-m3u publishes its own port here; in docker-compose.yml
+# that port belongs to gluetun because streamed-m3u shares its network.
+#
+#   cp .env.example .env        # fill in the Dispatcharr credentials
+#   docker compose -f docker-compose.novpn.yml up -d
+#
+# In Dispatcharr, add the M3U account with the URL
+#   http://streamed-m3u:8787/playlist-teams.m3u
+# and the EPG source with
+#   http://streamed-m3u:8787/epg.xml
+
+services:
+  streamed-m3u:
+    image: ${STREAMED_M3U_IMAGE:-streamed-m3u:latest}
+    # To build from this directory instead of pulling an image:
+    # build: .
+    container_name: streamed-m3u
+    ports:
+      - "${STREAMED_M3U_PORT:-8787}:8787"
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-UTC}
+      # No VPN tunnel to wait for.
+      STARTUP_DELAY: ${STARTUP_DELAY:-0}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      CONSOLE_PASSWORD: ${CONSOLE_PASSWORD:-}
+      CONSOLE_COOKIE_SECURE: ${CONSOLE_COOKIE_SECURE:-0}
+      PREWARM_TEAMS: ${PREWARM_TEAMS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ${CONFIG_DIR:-./config}/streamed-m3u:/data
+    restart: unless-stopped
+
+  dispatcharr:
+    image: ghcr.io/dispatcharr/dispatcharr:latest
+    container_name: dispatcharr
+    environment:
+      DISPATCHARR_ENV: aio
+      REDIS_HOST: 127.0.0.1
+      CELERY_BROKER_URL: redis://127.0.0.1:6379/0
+      DISPATCHARR_LOG_LEVEL: info
+    ports:
+      - "${DISPATCHARR_PORT:-9191}:9191"
+    volumes:
+      - ${CONFIG_DIR:-./config}/dispatcharr:/data
+    restart: unless-stopped
+
+  streamed-m3u-sync:
+    image: ${STREAMED_M3U_IMAGE:-streamed-m3u:latest}
+    container_name: streamed-m3u-sync
+    command: ["python", "dispatcharr_sync.py", "--loop"]
+    depends_on:
+      - dispatcharr
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      DISPATCHARR_URL: http://dispatcharr:9191
+      DISPATCHARR_USER: ${DISPATCHARR_USER:?set DISPATCHARR_USER in .env}
+      DISPATCHARR_PASS: ${DISPATCHARR_PASS:?set DISPATCHARR_PASS in .env}
+      M3U_ACCOUNT_NAME: ${M3U_ACCOUNT_NAME:-streamed.pk teams}
+      EPG_SOURCE_NAME: ${EPG_SOURCE_NAME:-streamed.pk teams EPG}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-480}
+    # The image's healthcheck probes the web service, which this container
+    # does not run.
+    healthcheck:
+      disable: true
+    restart: unless-stopped

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Sign in to streamed-m3u</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+<script>
+  try {
+    var t = localStorage.getItem("streamed-m3u-theme");
+    if (t === "light" || t === "dark") { document.documentElement.setAttribute("data-theme", t); }
+  } catch (e) {}
+</script>
+</head>
+<body>
+
+<nav class="global-nav">
+  <span class="wordmark">streamed-m3u <span class="dim">console</span></span>
+</nav>
+
+<main style="max-width: 440px; padding-top: 64px;">
+  <h1>Sign in</h1>
+  <p class="lede">Changing settings needs the console password. Everything else on the service stays reachable without it.</p>
+
+  <form method="post" action="{{ url_for('auth.login') }}" class="panel" style="margin-top: 24px;">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label for="password" class="stat-label" style="display: block;">Password</label>
+    <input class="search" type="password" id="password" name="password"
+           autocomplete="current-password" autofocus required
+           style="width: 100%; min-width: 0; margin: 8px 0 12px;">
+    {% if error %}
+    <p class="section-note" style="color: var(--error); margin: 0 0 12px;">{{ error }}</p>
+    {% endif %}
+    <button type="submit" class="btn">Sign in</button>
+  </form>
+</main>
+
+</body>
+</html>
