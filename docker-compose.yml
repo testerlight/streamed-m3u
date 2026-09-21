@@ -60,6 +60,10 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ${CONFIG_DIR:-./config}/streamed-m3u:/data
+      # Lets the console Restart control bounce this service and
+      # streamed-m3u-sync. The mount is read-only; the socket itself is
+      # still bidirectional. Omit the line to disable the control.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     restart: unless-stopped
 
   dispatcharr:
@@ -92,6 +96,7 @@ services:
       DISPATCHARR_PASS: ${DISPATCHARR_PASS:?set DISPATCHARR_PASS in .env}
       M3U_ACCOUNT_NAME: ${M3U_ACCOUNT_NAME:-streamed.pk teams}
       EPG_SOURCE_NAME: ${EPG_SOURCE_NAME:-streamed.pk teams EPG}
+      STREAMED_M3U_URL: ${STREAMED_M3U_URL:-http://gluetun:8787}
       SYNC_INTERVAL: ${SYNC_INTERVAL:-480}
     # The image's healthcheck probes the web service, which this container
     # does not run.

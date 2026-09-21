@@ -22,6 +22,7 @@ DATA = tempfile.mkdtemp(prefix="render-")
 os.environ.setdefault("STARTUP_DELAY", "0")
 os.environ["DATA_DIR"] = DATA
 os.environ["TEAMS_FILE"] = os.path.join(DATA, "teams.json")
+os.environ["LINEUP_FILE"] = os.path.join(DATA, "lineup.json")
 os.environ["EXTRACT_CACHE_FILE"] = os.path.join(DATA, "extract_cache.json")
 os.environ["SETTINGS_FILE"] = os.path.join(DATA, "settings.json")
 os.environ["PORT"] = "8899"
@@ -76,7 +77,15 @@ with sync_playwright() as pw:
     page.wait_for_timeout(1500)
     check("signed in lands on console", page.url.rstrip("/") == BASE)
     check("sign out control present", page.locator("#sign-out").count() == 1)
+    check("power button present", page.locator("#power-btn").count() == 1)
+    page.click("#power-btn")
+    page.wait_for_timeout(200)
+    check("power menu opens", page.locator("#power-menu").is_visible())
+    check("Restart label is typed out", page.locator("#restart-services").inner_text().strip() == "Restart")
     page.screenshot(path=OUT + "/console-signed-in.png")
+    page.click("#power-btn")
+    page.wait_for_timeout(150)
+    check("power menu closes on toggle", page.locator("#power-menu").is_hidden())
 
     # Edit mode: inputs render for editable settings.
     page.evaluate("document.getElementById('config').scrollIntoView()")

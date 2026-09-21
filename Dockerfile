@@ -33,7 +33,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium && playwright install-deps chromium \
     && chmod -R a+rX /ms-playwright
 
-COPY app.py extract_stream.py dashboard.py settings.py auth.py dispatcharr_sync.py entrypoint.sh ./
+COPY app.py extract_stream.py dashboard.py settings.py auth.py dockerctl.py dispatcharr_sync.py lineup.py entrypoint.sh ./
 COPY templates/ ./templates/
 COPY static/ ./static/
 COPY seed/ ./seed/

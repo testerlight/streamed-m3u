@@ -15,8 +15,17 @@ Endpoints:
   GET /api/overview          - Aggregate status, uptime, cache sizes
   GET /api/config            - Every setting with value, source and bounds
   PUT /api/settings          - Change settings (session + CSRF; settings.py)
+  GET /api/lineup            - Jellyfin lineup policy, counts and groups
+  PUT /api/lineup            - Add or remove slugs/groups (session + CSRF)
   GET /api/cache             - Extraction, logo and no-audio cache contents
+  POST /api/cache/extract/refresh
+                             - Force a new Chromium extract for one cache entry
+  POST /api/cache/extract/clear
+                             - Drop one extract-cache entry
   GET /api/events            - Recent log records, newest first
+  POST /api/streams/<id>/disconnect
+                             - Stop one active proxy session (console)
+  POST /api/restart          - Restart this service and streamed-m3u-sync
   GET /login, POST /logout   - Console session (only with CONSOLE_PASSWORD)
 
 Configuration precedence: /data/settings.json > environment > defaults.
@@ -49,6 +58,8 @@ from flask import Flask, Response, jsonify, request, has_request_context
 
 import auth
 import dashboard
+import dockerctl
+import lineup
 import settings as _settings
 
 # Compose interpolation and uncommented .env lines hand us VAR="" for unset
@@ -92,8 +103,11 @@ BROWSER_TIMEOUT   = int(os.getenv("BROWSER_TIMEOUT", "15"))
 EXTRACT_CACHE_TTL  = int(os.getenv("EXTRACT_CACHE_TTL", "300"))  # 5 minutes
 EXTRACT_CACHE_FILE = os.getenv("EXTRACT_CACHE_FILE", "/data/extract_cache.json")
 TEAMS_FILE         = os.getenv("TEAMS_FILE", "/data/teams.json")
+LINEUP_FILE        = os.getenv("LINEUP_FILE", "/data/lineup.json")
 # Bundled roster copied into place when TEAMS_FILE does not exist yet.
 SEED_TEAMS_FILE    = os.getenv("SEED_TEAMS_FILE", "/app/seed/teams.json")
+# Bundled majors-only lineup, copied only on the same first-boot as the roster.
+SEED_LINEUP_FILE   = os.getenv("SEED_LINEUP_FILE", "/app/seed/lineup.json")
 # Cascade budget. Dispatcharr aborts a channel at channel_init_grace_period
 # (currently 60s), so we stop starting new attempts before that ceiling.
 # A wall-clock deadline beats an attempt count because a dead source costs
@@ -165,8 +179,7 @@ PREWARM_WINDOW_AFTER  = int(os.getenv("PREWARM_WINDOW_AFTER", "300"))
 # included as cheap insurance, since an unused name costs nothing. Confirm
 # them with /teams?alias=1 once those seasons start: a major-league name
 # still listed as unseen mid-season is a misspelling here.
-MAJOR_LEAGUE_TEAMS = [
-    # NFL (32)
+NFL_TEAMS = [
     "Arizona Cardinals", "Atlanta Falcons", "Baltimore Ravens",
     "Buffalo Bills", "Carolina Panthers", "Chicago Bears",
     "Cincinnati Bengals", "Cleveland Browns", "Dallas Cowboys",
@@ -178,7 +191,8 @@ MAJOR_LEAGUE_TEAMS = [
     "New York Jets", "Philadelphia Eagles", "Pittsburgh Steelers",
     "San Francisco 49ers", "Seattle Seahawks", "Tampa Bay Buccaneers",
     "Tennessee Titans", "Washington Commanders",
-    # MLB (30)
+]
+MLB_TEAMS = [
     "Arizona Diamondbacks", "Athletics", "Atlanta Braves",
     "Baltimore Orioles", "Boston Red Sox", "Chicago Cubs",
     "Chicago White Sox", "Cincinnati Reds", "Cleveland Guardians",
@@ -189,8 +203,10 @@ MAJOR_LEAGUE_TEAMS = [
     "Pittsburgh Pirates", "San Diego Padres", "San Francisco Giants",
     "Seattle Mariners", "St. Louis Cardinals", "Tampa Bay Rays",
     "Texas Rangers", "Toronto Blue Jays", "Washington Nationals",
-    # NBA (30) - "LA Clippers" is the team's own branding, "Los Angeles
-    # Clippers" the formal name; both are listed since either may appear.
+]
+# "LA Clippers" is the team's own branding, "Los Angeles Clippers" the
+# formal name; both are listed since either may appear.
+NBA_TEAMS = [
     "Atlanta Hawks", "Boston Celtics", "Brooklyn Nets",
     "Charlotte Hornets", "Chicago Bulls", "Cleveland Cavaliers",
     "Dallas Mavericks", "Denver Nuggets", "Detroit Pistons",
@@ -202,10 +218,12 @@ MAJOR_LEAGUE_TEAMS = [
     "Phoenix Suns", "Portland Trail Blazers", "Sacramento Kings",
     "San Antonio Spurs", "Toronto Raptors", "Utah Jazz",
     "Washington Wizards",
-    # NHL (32) - the Utah franchise was "Utah Hockey Club" before being
-    # renamed "Utah Mammoth", and Vegas is sometimes written "Las Vegas";
-    # both forms of each are listed. Accents fold in _slugify, so
-    # "Montreal" also matches "Montreal" spelled with an accent.
+]
+# The Utah franchise was "Utah Hockey Club" before being renamed "Utah
+# Mammoth", and Vegas is sometimes written "Las Vegas"; both forms of
+# each are listed. Accents fold in _slugify, so "Montreal" also matches
+# "Montreal" spelled with an accent.
+NHL_TEAMS = [
     "Anaheim Ducks", "Boston Bruins", "Buffalo Sabres", "Calgary Flames",
     "Carolina Hurricanes", "Chicago Blackhawks", "Colorado Avalanche",
     "Columbus Blue Jackets", "Dallas Stars", "Detroit Red Wings",
@@ -218,6 +236,8 @@ MAJOR_LEAGUE_TEAMS = [
     "Utah Hockey Club", "Vancouver Canucks", "Vegas Golden Knights",
     "Las Vegas Golden Knights", "Washington Capitals", "Winnipeg Jets",
 ]
+# Concat kept so away-side aliasing and the settings overlay do not change.
+MAJOR_LEAGUE_TEAMS = NFL_TEAMS + MLB_TEAMS + NBA_TEAMS + NHL_TEAMS
 # Extends the list above rather than replacing it, so a typo in the
 # environment can never blank out all four leagues.
 EXTRA_ALIAS_TEAMS = [t.strip() for t in os.getenv(
@@ -315,6 +335,12 @@ STREAM_IDLE_TIMEOUT = int(os.getenv("STREAM_IDLE_TIMEOUT", "45"))
 # every decoder discards, so emitting one per interval during those gaps keeps
 # bytes on the wire without touching the picture. 0 disables.
 STREAM_KEEPALIVE_INTERVAL = float(os.getenv("STREAM_KEEPALIVE_INTERVAL", "1"))
+# After an operator disconnect, refuse new /stream requests for the same
+# channel so Dispatcharr's automatic reconnect does not resume playback.
+# Must outlast that reconnect window (observed ~6s; established-channel
+# retry/switch runs about 21s). HEAD stays 200 so playlist validation is
+# not broken. 0 disables the hold.
+STREAM_DISCONNECT_HOLD = int(os.getenv("STREAM_DISCONNECT_HOLD", "90"))
 # sync 0x47, PID 0x1FFF, adaptation_field_control=01 (payload only), cc=0.
 # The continuity counter is undefined for null packets, so a constant is fine.
 TS_NULL_PACKET = b"\x47\x1f\xff\x10" + b"\xff" * 184
@@ -413,6 +439,12 @@ _extract_url_locks_lock    = threading.Lock()
 _active_streams: dict      = {}   # stream_id -> metadata dict
 _active_streams_lock       = threading.Lock()
 
+# Operator disconnect holds: hold_key -> expiry (monotonic seconds).
+# A console stop closes one generator; Dispatcharr then retries /stream
+# on the same team URL and playback resumes unless we refuse that retry.
+_disconnect_holds: dict    = {}
+_disconnect_holds_lock     = threading.Lock()
+
 # Team roster (permanent) and the current team -> match resolution.
 _team_lock                 = threading.Lock()
 _team_roster: dict         = {}   # slug -> {name, first_seen, last_seen}
@@ -492,6 +524,35 @@ def _save_extract_cache():
         log.warning("Could not save extract cache: %s", e)
 
 
+def _refresh_extract_entry(embed_url: str) -> str:
+    """Force a new Chromium extract for one cached embed URL.
+
+    Only operates on keys that are already in the cache, so the console
+    cannot be used to point Chromium at an arbitrary address. A failed
+    extract leaves the previous entry in place. Returns 'ok', 'missing'
+    or 'failed'.
+    """
+    with _extract_cache_lock:
+        if embed_url not in _extract_cache:
+            return "missing"
+    log.info("Console extract-cache refresh: %s", embed_url)
+    data = extract_m3u8_via_browser(embed_url, force=True)
+    if not data:
+        return "failed"
+    return "ok"
+
+
+def _clear_extract_entry(embed_url: str) -> str:
+    """Drop one extract-cache entry. Returns 'ok' or 'missing'."""
+    with _extract_cache_lock:
+        if embed_url not in _extract_cache:
+            return "missing"
+        _extract_cache.pop(embed_url, None)
+    _save_extract_cache()
+    log.info("Console extract-cache clear: %s", embed_url)
+    return "ok"
+
+
 # ─── Zombie / orphan cleanup ──────────────────────────────────────────────────
 
 def kill_orphan_chromium():
@@ -517,38 +578,43 @@ def kill_orphan_chromium():
 
 # ─── Playwright m3u8 extraction ───────────────────────────────────────────────
 
-def extract_m3u8_via_browser(embed_url: str) -> dict | None:
+def extract_m3u8_via_browser(embed_url: str, force: bool = False) -> dict | None:
     """
     Returns a cached extraction result if still fresh, otherwise launches
     extract_stream.py in its own process group so the entire Chromium tree
     (parent + all children) can be killed cleanly on timeout.
 
     Concurrent requests for the same URL wait for the first browser to finish
-    rather than each spawning their own instance.
+    rather than each spawning their own instance. force=True skips the cache
+    read so a console refresh actually launches Chromium again; a failed
+    force leaves the previous entry in place.
     """
     now = time.time()
 
     # 1. Fast path: check cache without blocking
-    with _extract_cache_lock:
-        entry = _extract_cache.get(embed_url)
-        if entry and (now - entry["ts"]) < EXTRACT_CACHE_TTL:
-            log.info("Cache hit for: %s (age %.0fs)", embed_url, now - entry["ts"])
-            return entry["data"]
+    if not force:
+        with _extract_cache_lock:
+            entry = _extract_cache.get(embed_url)
+            if entry and (now - entry["ts"]) < EXTRACT_CACHE_TTL:
+                log.info("Cache hit for: %s (age %.0fs)", embed_url, now - entry["ts"])
+                return entry["data"]
 
     # 2. Acquire per-URL lock — only one browser per URL at a time
     url_lock = _get_url_lock(embed_url)
     with url_lock:
         # Re-check cache: another thread may have populated it while we waited
-        now = time.time()
-        with _extract_cache_lock:
-            entry = _extract_cache.get(embed_url)
-            if entry and (now - entry["ts"]) < EXTRACT_CACHE_TTL:
-                log.info("Cache hit (post-lock) for: %s", embed_url)
-                return entry["data"]
+        if not force:
+            now = time.time()
+            with _extract_cache_lock:
+                entry = _extract_cache.get(embed_url)
+                if entry and (now - entry["ts"]) < EXTRACT_CACHE_TTL:
+                    log.info("Cache hit (post-lock) for: %s", embed_url)
+                    return entry["data"]
 
         # 3. Launch subprocess in its own process group so SIGKILL reaches
         #    Chromium and every child process it spawned
-        log.info("Browser navigating to: %s", embed_url)
+        log.info("Browser navigating to: %s%s",
+                 embed_url, " (forced)" if force else "")
         proc = None
         try:
             proc = subprocess.Popen(
@@ -1056,6 +1122,21 @@ _PREWARM_SLUGS = frozenset(
 _ALIAS_SLUGS = frozenset(
     s for s in (_slugify(t) for t in MAJOR_LEAGUE_TEAMS + EXTRA_ALIAS_TEAMS)
     if s)
+# Per-league slug sets for console grouping. Membership is slug-in-list
+# AND sport in MAJOR_LEAGUE_SPORTS (gotcha #10), so leftover
+# american-football is NCAA/CFL, not NFL.
+_LEAGUE_SLUGS = {
+    "mlb": frozenset(s for s in (_slugify(t) for t in MLB_TEAMS) if s),
+    "nfl": frozenset(s for s in (_slugify(t) for t in NFL_TEAMS) if s),
+    "nba": frozenset(s for s in (_slugify(t) for t in NBA_TEAMS) if s),
+    "nhl": frozenset(s for s in (_slugify(t) for t in NHL_TEAMS) if s),
+}
+_LEAGUE_ORDER = ("mlb", "nfl", "nhl", "nba")
+_KIND_GROUPS = (
+    ("kind:feed", "feed", "Stations"),
+    ("kind:series", "series", "Racing"),
+    ("kind:pool", "pool", "Events"),
+)
 
 
 _SERIES_RE = re.compile(r"^(.+?)\s+(?:19|20)\d{2}\s*[-\u2013]\s*(.+)$")
@@ -1194,14 +1275,19 @@ def _rank_streams(streams: list[dict]) -> list[dict]:
 
 
 def _install_seed_roster():
-    """Copy the bundled roster into place on a fresh /data.
+    """Copy the bundled roster (and lineup) into place on a fresh /data.
 
     The seed is a scrubbed snapshot: team entries only, no favourites, no
     feed/series/pool channels (those are recreated from config). Without it a
     new deployment starts at roughly twenty channels and fills in over days as
     fixtures are listed. An existing roster is never touched.
+
+    The majors-only seed lineup is copied only in this same first-boot path.
+    An existing /data with no lineup.json stays implicit-all: every slug is
+    visible until someone presses −.
     """
-    if os.path.exists(TEAMS_FILE) or not os.path.exists(SEED_TEAMS_FILE):
+    teams_existed = os.path.exists(TEAMS_FILE)
+    if teams_existed or not os.path.exists(SEED_TEAMS_FILE):
         return
     try:
         os.makedirs(os.path.dirname(TEAMS_FILE), exist_ok=True)
@@ -1211,6 +1297,157 @@ def _install_seed_roster():
         log.info("Installed seed roster: %d teams -> %s", count, TEAMS_FILE)
     except Exception as e:
         log.warning("Could not install seed roster: %s", e)
+        return
+    lineup.install_seed(LINEUP_FILE, SEED_LINEUP_FILE, teams_existed=False)
+
+
+def _league_of(slug: str, sport: str, kind: str = "team"):
+    """mlb/nfl/nba/nhl or None. Sport-gated so leftover football is not NFL."""
+    if (kind or "team") != "team":
+        return None
+    if (sport or "") not in MAJOR_LEAGUE_SPORTS:
+        return None
+    for league in _LEAGUE_ORDER:
+        if slug in _LEAGUE_SLUGS[league]:
+            return league
+    return None
+
+
+def _entry_view(slug: str, entry: dict, doc=None) -> dict:
+    """kind, sport, league, in_lineup for a roster row. Does not mutate entry."""
+    if doc is None:
+        doc, _ = lineup.current()
+    kind = entry.get("kind", "team")
+    sport = entry.get("sport") or ""
+    return {
+        "kind": kind,
+        "sport": sport,
+        "league": _league_of(slug, sport, kind),
+        "in_lineup": lineup.in_lineup(doc, slug),
+    }
+
+
+def _group_id_of(kind: str, sport: str, league):
+    if kind in ("feed", "series", "pool"):
+        return "kind:" + kind
+    if league:
+        return league
+    return "sport:" + (sport or "unknown")
+
+
+def _slugs_in_group(roster: dict, group: str, doc=None) -> list:
+    """Roster slugs that belong to a console group id."""
+    if doc is None:
+        doc, _ = lineup.current()
+    out = []
+    for slug, entry in roster.items():
+        view = _entry_view(slug, entry, doc)
+        if _group_id_of(view["kind"], view["sport"], view["league"]) == group:
+            out.append(slug)
+    return out
+
+
+def _lineup_counts(roster=None):
+    doc, implicit = lineup.current()
+    if roster is None:
+        with _team_lock:
+            roster = dict(_team_roster)
+    n_in = sum(1 for s in roster if lineup.in_lineup(doc, s))
+    return {
+        "policy": doc["policy"],
+        "implicit": implicit,
+        "in_lineup": n_in,
+        "out_of_lineup": len(roster) - n_in,
+        "roster": len(roster),
+    }
+
+
+def _lineup_snapshot():
+    """GET /api/lineup payload: policy, counts, group sizes."""
+    doc, implicit = lineup.current()
+    with _team_lock:
+        roster = dict(_team_roster)
+    counts = _lineup_counts(roster)
+    groups = []
+    labels = {"mlb": "MLB", "nfl": "NFL", "nhl": "NHL", "nba": "NBA"}
+    for league in _LEAGUE_ORDER:
+        slugs = _slugs_in_group(roster, league, doc)
+        groups.append({
+            "id": league,
+            "label": labels[league],
+            "size": len(slugs),
+            "in_lineup": lineup.count_in(doc, slugs),
+        })
+    for gid, _kind, label in _KIND_GROUPS:
+        slugs = _slugs_in_group(roster, gid, doc)
+        groups.append({
+            "id": gid,
+            "label": label,
+            "size": len(slugs),
+            "in_lineup": lineup.count_in(doc, slugs),
+        })
+    leftover = {}
+    for slug, entry in roster.items():
+        view = _entry_view(slug, entry, doc)
+        gid = _group_id_of(view["kind"], view["sport"], view["league"])
+        if gid.startswith("sport:"):
+            leftover.setdefault(gid, []).append(slug)
+    for gid in sorted(leftover, key=lambda g: _sport_display(g.split(":", 1)[1])):
+        slugs = leftover[gid]
+        sport = gid.split(":", 1)[1]
+        groups.append({
+            "id": gid,
+            "label": _sport_display(sport),
+            "size": len(slugs),
+            "in_lineup": lineup.count_in(doc, slugs),
+        })
+    return {
+        "policy": counts["policy"],
+        "implicit": implicit,
+        "in_lineup": counts["in_lineup"],
+        "out_of_lineup": counts["out_of_lineup"],
+        "roster": counts["roster"],
+        "groups": groups,
+    }
+
+
+def _lineup_apply(payload: dict):
+    """Apply a console add/remove. Returns (snapshot, error, status)."""
+    if not isinstance(payload, dict):
+        return None, "expected_json", 400
+    op = payload.get("op")
+    if op not in ("add", "remove"):
+        return None, "op must be add or remove", 400
+    slugs = payload.get("slugs")
+    group = payload.get("group")
+    if slugs is not None and group is not None:
+        return None, "pass slugs or group, not both", 400
+    if group is not None:
+        if not isinstance(group, str) or not group.strip():
+            return None, "invalid group", 400
+        group = group.strip()
+        known = set(_LEAGUE_ORDER)
+        known.update(g[0] for g in _KIND_GROUPS)
+        if group not in known and not group.startswith("sport:"):
+            return None, "unknown group", 400
+        with _team_lock:
+            roster = dict(_team_roster)
+        slugs = _slugs_in_group(roster, group, lineup.current()[0])
+        if not slugs:
+            return None, "empty group", 400
+    elif isinstance(slugs, str):
+        slugs = [slugs]
+    elif not isinstance(slugs, (list, tuple)):
+        return None, "expected slugs or group", 400
+    try:
+        doc, _implicit = lineup.current()
+        new = lineup.apply_op(doc, op, slugs)
+        lineup.persist(new, LINEUP_FILE)
+    except ValueError as e:
+        return None, str(e), 400
+    except OSError as e:
+        return None, "save_failed: %s" % e, 500
+    return _lineup_snapshot(), None, 200
 
 
 def _load_team_roster():
@@ -1889,6 +2126,11 @@ def stream_proxy():
     if request.method == "HEAD":
         return Response(status=200, headers={"Content-Type": "video/mp2t"})
 
+    hold_key = _stream_hold_key(team_arg, embed_url)
+    if _disconnect_held(hold_key):
+        log.info("Refusing stream, disconnect hold active (%s)", hold_key)
+        return Response("Stream disconnected by operator\n", status=410)
+
     # Candidate list:
     #   ?url=...        -> exactly that stream (unchanged behaviour)
     #   ?team=X&slot=N  -> pinned to one slot, no cascade
@@ -1966,12 +2208,13 @@ def stream_proxy():
             "No playable stream found (tried: %s)\n" % detail, status=502)
 
     def stream_ts(m3u8_url, headers, cookies, initial_segments, stream_id,
-                  primed=None):
+                  primed=None, stop=None):
         """Continuously fetch and yield TS segments as a raw byte stream.
-        Uses a stop event so the loop exits cleanly when the client disconnects.
-        On fatal CDN errors, invalidates the extract cache so the next request
-        triggers a fresh browser extraction rather than re-using a dead URL."""
-        stop = threading.Event()
+        Uses a stop event so the loop exits cleanly when the client
+        disconnects or the console asks this session to stop. On fatal CDN
+        errors, invalidates the extract cache so the next request triggers
+        a fresh browser extraction rather than re-using a dead URL."""
+        stop = stop or threading.Event()
 
         def _bump(field, n=1):
             with _active_streams_lock:
@@ -2263,8 +2506,11 @@ def stream_proxy():
                 _active_streams.pop(stream_id, None)
             log.info("Stream closed for: %s", m3u8_url)
 
-    # Register stream in active tracking before starting response
+    # Register stream in active tracking before starting response.
+    # The stop event lives on the record so the console can ask this
+    # session to exit without a second shutdown path.
     stream_id = str(uuid.uuid4())[:8]
+    stop = threading.Event()
     with _active_streams_lock:
         _active_streams[stream_id] = {
             "stream_id":       stream_id,
@@ -2286,15 +2532,79 @@ def stream_proxy():
             # and had it removed before forwarding.
             "prefix_stripped":   0,
             "prefix_bytes":      0,
+            "hold_key":          hold_key,
+            "stop":              stop,
         }
 
     log.info("Streaming TS from: %s (id=%s)", m3u8_url, stream_id)
     return Response(
         stream_ts(m3u8_url, headers, cookies, probe_segments, stream_id,
-                  primed),
+                  primed, stop=stop),
         content_type="video/mp2t",
         direct_passthrough=True,
     )
+
+
+# Stream ids are 8 hex chars from uuid4. Anything else is a bad request,
+# not a miss, so the console can tell a typo from a session that already ended.
+_STREAM_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _stream_hold_key(team_arg: str, embed_url: str) -> str:
+    """Stable identity for a /stream request, matching how candidates are
+    chosen: an explicit url= wins, otherwise the team slug."""
+    if embed_url:
+        return "url:" + embed_url
+    if team_arg:
+        return "team:" + _slugify(team_arg)
+    return ""
+
+
+def _hold_disconnect(key: str) -> None:
+    if not key:
+        return
+    now = time.monotonic()
+    with _disconnect_holds_lock:
+        _disconnect_holds[key] = now + STREAM_DISCONNECT_HOLD
+        expired = [k for k, exp in _disconnect_holds.items()
+                   if exp <= now and k != key]
+        for k in expired:
+            _disconnect_holds.pop(k, None)
+
+
+def _disconnect_held(key: str) -> bool:
+    if not key or STREAM_DISCONNECT_HOLD <= 0:
+        return False
+    now = time.monotonic()
+    with _disconnect_holds_lock:
+        exp = _disconnect_holds.get(key)
+        if exp is None:
+            return False
+        if exp <= now:
+            _disconnect_holds.pop(key, None)
+            return False
+        return True
+
+
+def _stop_active_stream(stream_id: str) -> str:
+    """Set the stop event for one proxy session and refuse reconnects for
+    that channel for STREAM_DISCONNECT_HOLD seconds. Returns 'ok',
+    'invalid', or 'missing'. Does not pop the record: stream_ts's finally
+    block owns that, so a console stop and a client hangup stay on the
+    same path."""
+    if not _STREAM_ID_RE.match(stream_id or ""):
+        return "invalid"
+    with _active_streams_lock:
+        rec = _active_streams.get(stream_id)
+        ev = rec.get("stop") if rec else None
+        hold_key = rec.get("hold_key") if rec else None
+    if ev is None:
+        return "missing"
+    ev.set()
+    if hold_key:
+        _hold_disconnect(hold_key)
+    log.info("Stream disconnect requested (id=%s hold=%s)", stream_id, hold_key)
+    return "ok"
 
 
 @app.route("/stream/status")
@@ -2385,12 +2695,20 @@ def logo():
     return "", 502
 
 
+def _enrich_roster_entry(slug, entry, doc=None):
+    """Copy a roster row and add kind/sport/league/in_lineup."""
+    row = dict(entry or {})
+    row.update(_entry_view(slug, row, doc))
+    return row
+
+
 @app.route("/teams")
 def teams():
     """Diagnostic view of the team roster and current match resolution."""
     with _team_lock:
         roster = dict(_team_roster)
         tmap   = {k: dict(v) for k, v in _team_map.items()}
+    doc, _ = lineup.current()
 
     want = request.args.get("team", "").strip()
     if want:
@@ -2398,11 +2716,18 @@ def teams():
         # RedZone's channel is pinned to nfl-vs-redzone, but nobody looking
         # it up knows that - they type "NFL RedZone".
         slug = _feed_slug(want)
+        entry = roster.get(slug)
+        view = _entry_view(slug, entry or {}, doc) if entry is not None else {
+            "kind": None, "sport": "", "league": None,
+            "in_lineup": lineup.in_lineup(doc, slug),
+        }
         return jsonify({"slug": slug, "known": slug in roster,
-                        "roster": roster.get(slug), "playing": tmap.get(slug)})
+                        "roster": _enrich_roster_entry(slug, entry, doc) if entry else None,
+                        "playing": tmap.get(slug), **view})
 
     if request.args.get("all"):
-        return jsonify({"roster_size": len(roster), "roster": roster})
+        enriched = {s: _enrich_roster_entry(s, e, doc) for s, e in roster.items()}
+        return jsonify({"roster_size": len(roster), "roster": enriched})
 
     # Which away-side alias names the upstream API has actually produced.
     # A major-league name still listed as unseen once its season is under
@@ -2433,7 +2758,7 @@ def teams():
         "teams": sorted(
             [{"slug": k, "team": v["team"], "match": v["match_title"],
               "category": v["category"], "streams": len(v["streams"]),
-              "best": best(v)}
+              "best": best(v), **_entry_view(k, roster.get(k, {}), doc)}
              for k, v in playing.items()],
             key=lambda x: x["team"],
         ),
@@ -2696,6 +3021,7 @@ def _dash_runtime() -> dict:
         resolvable  = sum(1 for v in _team_map.values() if v["streams"])
         listed      = len(_team_map) - resolvable
         fixtures    = sum(len(v) for v in _team_schedule.values())
+    lineup_n = _lineup_counts()["in_lineup"]
     with _extract_cache_lock:
         extract_entries = len(_extract_cache)
     with _logo_cache_lock:
@@ -2728,6 +3054,7 @@ def _dash_runtime() -> dict:
             "listed_no_streams": listed,
             "epg_fixtures":      fixtures,
             "alias_names":       len(_ALIAS_SLUGS),
+            "lineup":            lineup_n,
         },
         "prewarm": {
             "configured": len(_PREWARM_SLUGS),
@@ -2823,6 +3150,12 @@ dashboard.register_dashboard(
     caches=_dash_caches,
     config_values=lambda: globals(),
     apply_settings=lambda s, o: _settings.apply_live(globals(), s, o),
+    stop_stream=_stop_active_stream,
+    refresh_extract=_refresh_extract_entry,
+    clear_extract=_clear_extract_entry,
+    restart_services=dockerctl.restart_services,
+    lineup_view=_lineup_snapshot,
+    lineup_update=_lineup_apply,
 )
 
 
@@ -2834,6 +3167,7 @@ if __name__ == "__main__":
     _load_extract_cache()
     _install_seed_roster()
     _load_team_roster()
+    lineup.reload(LINEUP_FILE)
     _seed_favourites()
     _seed_nonteam()
     time.sleep(STARTUP_DELAY)

@@ -7,9 +7,15 @@ Two documents, no overlap between them:
   `python settings.py --markdown`; regenerate it rather than editing by hand.
 - `instructions.md` is the maintainer handover: how the system works
   internally, the TrueNAS SCALE deployment specifics, the settings and auth
-  model, and a numbered list of gotchas (currently 21) covering real bugs
+  model, and a numbered list of gotchas (currently 26) covering real bugs
   already hit here. **Read it before changing `app.py`.** Skipping it risks
   redoing debugging that has already been done.
+
+Lineup state is `/data/lineup.json`. If that file is missing the policy is
+implicit-all: every roster slug is on the Jellyfin lineup until someone
+presses −, which materializes the file. New installs seed an MLB/NFL/NHL/NBA
+allowlist on the same first-boot path as `seed/teams.json`. Never copy the
+seed lineup onto an existing `/data`, and never filter `build_team_m3u()`.
 
 Working notes and scoped-out plans live in `docs/internal/`. Check
 `docs/internal/PENDING_stream_quality.md` for anything touching playback

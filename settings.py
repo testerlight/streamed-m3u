@@ -92,6 +92,9 @@ SCHEMA = [
     _s("EXTRACT_CACHE_FILE", "EXTRACT_CACHE_FILE", "Service", "restart", "str",
        "Where resolved stream URLs are persisted across restarts.",
        editable=False),
+    _s("LINEUP_FILE", "LINEUP_FILE", "Service", "restart", "str",
+       "Jellyfin lineup file. Missing means every roster slug is visible.",
+       editable=False),
 
     # Upstream
     _s("STREAMED_BASE_URL", "BASE_URL", "Upstream", "live", "url",
@@ -658,8 +661,9 @@ _ENV_HEADER = """\
 #   2. this environment     compose, .env, or your platform's app config
 #   3. built-in defaults
 # The console shows which layer each value came from. An empty value counts as
-# unset. PORT, TEAMS_FILE, EXTRACT_CACHE_FILE, DATA_DIR, CONSOLE_PASSWORD,
-# PUID and PGID are environment-only and never written to the settings file.
+# unset. PORT, TEAMS_FILE, EXTRACT_CACHE_FILE, LINEUP_FILE, DATA_DIR,
+# CONSOLE_PASSWORD, PUID and PGID are environment-only and never written to
+# the settings file.
 
 # ── Compose ─────────────────────────────────────────────────────────────────
 # Image to run. Build locally or pull a published tag.
@@ -700,6 +704,8 @@ _ENV_HEADER = """\
 #EPG_SOURCE_NAME=streamed.pk teams EPG
 # Seconds between sync cycles.
 #SYNC_INTERVAL=480
+# streamed-m3u base URL the sync container uses for /teams?all=1.
+#STREAMED_M3U_URL=http://gluetun:8787
 """
 
 

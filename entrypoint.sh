@@ -28,4 +28,16 @@ if [ "$(stat -c %u:%g /data)" != "${PUID}:${PGID}" ]; then
 fi
 
 export HOME=/tmp
+
+# The console Restart control talks to the Docker Engine over a Unix socket.
+# The mount is optional; when it is present, grant the runtime user the
+# socket's group so connect() succeeds after the privilege drop. --groups
+# replaces --init-groups here because app is not in that group in /etc/group.
+DOCKER_SOCKET="${DOCKER_SOCKET:-/var/run/docker.sock}"
+if [ -S "$DOCKER_SOCKET" ]; then
+  SOCK_GID="$(stat -c %g "$DOCKER_SOCKET")"
+  exec setpriv --reuid="${PUID}" --regid="${PGID}" \
+       --groups="${PGID},${SOCK_GID}" "$@"
+fi
+
 exec setpriv --reuid="${PUID}" --regid="${PGID}" --init-groups "$@"

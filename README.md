@@ -85,8 +85,8 @@ console removes it from the file and restores the environment or default value.
 An empty environment value counts as unset.
 
 A few settings are environment-only and never written to the file: `PORT`,
-`TEAMS_FILE`, `EXTRACT_CACHE_FILE`, `DATA_DIR`, `CONSOLE_PASSWORD`, `PUID`
-and `PGID`.
+`TEAMS_FILE`, `EXTRACT_CACHE_FILE`, `LINEUP_FILE`, `DATA_DIR`,
+`CONSOLE_PASSWORD`, `PUID` and `PGID`.
 
 ### Editing from the console
 
@@ -130,6 +130,7 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `STARTUP_DELAY` | `15` | restart | Pause before the first scrape, giving the VPN tunnel time to come up. |
 | `TEAMS_FILE` | `/data/teams.json` | env only | Roster file. The only irreplaceable state the service holds. |
 | `EXTRACT_CACHE_FILE` | `/data/extract_cache.json` | env only | Where resolved stream URLs are persisted across restarts. |
+| `LINEUP_FILE` | `/data/lineup.json` | env only | Jellyfin lineup file. Missing means every roster slug is visible. |
 | **Upstream** | | | |
 | `STREAMED_BASE_URL` | `https://streamed.pk` | live | Catalog the service scrapes. Change this when the site moves domain. |
 | `REQUEST_TIMEOUT` | `10` | live | Seconds before an upstream API call is abandoned. |
@@ -182,6 +183,8 @@ Everything persistent lives in `/data` (mounted from `${CONFIG_DIR}/streamed-m3u
 |---|---|
 | `teams.json` | The roster: every channel that exists. It only ever grows. This is the one irreplaceable file; back it up. |
 | `teams.json.bak` | The previous save. Used automatically if `teams.json` is unreadable, which is then kept as `teams.json.corrupt-<time>`. |
+| `lineup.json` | Which roster slugs Jellyfin can see. Missing means every slug is visible. This box has the file (`policy: all`) after the first −. A new install seeds MLB / NFL / NHL / NBA only. |
+| `lineup.json.bak` | The previous lineup save. Same recovery as the roster. |
 | `settings.json` | Settings written by the console. Same `.bak` protection. |
 | `extract_cache.json` | Resolved stream URLs, so a restart does not need to re-resolve everything. |
 | `.secret_key` | Session signing key for console logins. |
@@ -192,16 +195,26 @@ one by one as fixtures are listed. The seed is a snapshot: team entries only,
 no favourites, and no feed or series channels (those are created from
 `FEED_CHANNELS` and `SERIES_CHANNELS`). An existing roster is never touched.
 
+The same first-boot copies `seed/lineup.json`: an allowlist of MLB / NFL /
+NHL / NBA. Stations, racing series, pool slots, and everything else stay
+Dispatcharr streams until you add them in the console. **This box is
+different.** It already had a roster, so the first boot did not install the
+seed allowlist. The first − wrote `lineup.json` with `policy: all`; every
+slug stays on the Jellyfin lineup until excluded. The playlist is never
+filtered; visibility is `hidden_from_output` in Dispatcharr.
+
 ## Endpoints
 
 | Endpoint | Purpose |
 |---|---|
 | `/` | The console |
-| `/playlist-teams.m3u` | The playlist Dispatcharr subscribes to |
+| `/playlist-teams.m3u` | The playlist Dispatcharr subscribes to. Always the full roster. |
 | `/epg.xml` | XMLTV guide |
 | `/stream?team=<slug>` | Resolve and proxy a team's current fixture |
 | `/health` | Machine-readable status |
-| `/teams`, `/teams?all=1`, `/teams?alias=1`, `/teams?team=<name>` | Roster diagnostics |
+| `/teams`, `/teams?all=1`, `/teams?alias=1`, `/teams?team=<name>` | Roster diagnostics, including `in_lineup` |
+| `GET /api/lineup` | Jellyfin lineup policy, counts and groups |
+| `PUT /api/lineup` | Add or remove slugs or a group (session and CSRF) |
 | `/prewarm` | Pre-warm state per favourite |
 | `/stream/status` | Active streams with throughput |
 | `/api/overview`, `/api/config`, `/api/cache`, `/api/events` | Console data |

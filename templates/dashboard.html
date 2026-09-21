@@ -21,6 +21,22 @@
   {% elif auth_enabled %}
   <a class="nav-control" href="{{ url_for('auth.login', next='/') }}">Sign in</a>
   {% endif %}
+  <div class="power-wrap" id="power-wrap">
+    <button type="button" class="nav-control nav-control-icon" id="power-btn"
+            aria-label="Power" aria-haspopup="true" aria-expanded="false"
+            aria-controls="power-menu">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round"
+              d="M12 3v9M8.2 6.4a7 7 0 1 0 7.6 0"/>
+      </svg>
+    </button>
+    <div class="power-menu" id="power-menu" hidden role="menu">
+      <button type="button" class="power-menu-item" id="restart-services"
+              role="menuitem">Restart</button>
+      <p class="power-menu-note" id="power-menu-note" hidden></p>
+    </div>
+  </div>
 </nav>
 
 <div class="sub-nav">
@@ -84,7 +100,7 @@
   <section id="streams">
     <div class="section-head">
       <h2>Active streams</h2>
-      <p class="section-note">What is being proxied right now, with per-stream throughput.</p>
+      <p class="section-note">What is being proxied right now, with per-stream throughput. Disconnect stops this session and refuses reconnects for 90 seconds so the player actually drops.</p>
     </div>
     <div class="table-wrap" id="streams-panel">
       <div class="empty"><p>Loading.</p></div>
@@ -104,14 +120,21 @@
   <section id="roster">
     <div class="section-head">
       <h2>Roster</h2>
-      <p class="section-note">Every channel the service knows about, and what it resolves to now.</p>
+      <p class="section-note">Every channel the service knows about, and which of them Jellyfin can see.</p>
     </div>
     <div class="toolbar">
       <input type="search" class="search" id="roster-search"
-             placeholder="Search team, match or slug" aria-label="Search the roster">
-      <button type="button" class="chip" id="roster-scope-playing" aria-pressed="true">Resolvable now</button>
-      <button type="button" class="chip" id="roster-scope-all" aria-pressed="false">Full roster</button>
+             placeholder="Search team, match, slug or sport" aria-label="Search the roster">
+      <button type="button" class="chip roster-scope" id="roster-scope-playing" data-scope="playing" aria-pressed="true">Resolvable now</button>
+      <button type="button" class="chip roster-scope" id="roster-scope-all" data-scope="all" aria-pressed="false">Full roster</button>
+      <button type="button" class="chip roster-scope" id="roster-scope-lineup" data-scope="lineup" aria-pressed="false">On Jellyfin</button>
+      <button type="button" class="chip roster-scope" id="roster-scope-hidden" data-scope="hidden" aria-pressed="false">Not on Jellyfin</button>
       <span class="toolbar-count" id="roster-count"></span>
+    </div>
+    <div class="toolbar" id="roster-groups" hidden></div>
+    <div class="toolbar" id="roster-group-action" hidden>
+      <button type="button" class="btn btn-ok btn-pill" id="roster-group-add">Add group</button>
+      <button type="button" class="btn btn-danger btn-pill" id="roster-group-remove">Remove group</button>
     </div>
     <div class="table-wrap" id="roster-panel">
       <div class="empty"><p>Loading.</p></div>
@@ -134,7 +157,7 @@
   <section id="caches">
     <div class="section-head">
       <h2>Caches</h2>
-      <p class="section-note">Resolved stream URLs, proxied logos, and sources confirmed to carry no audio.</p>
+      <p class="section-note">Resolved stream URLs, proxied logos, and sources confirmed to carry no audio. Refresh re-extracts one embed; Clear drops it so the next click is a cold start.</p>
     </div>
     <div class="stat-grid" id="cache-stats" style="margin-bottom: 12px;">
       <div class="stat"><div class="stat-label">Extraction entries</div><div class="skeleton tall"></div></div>

@@ -23,7 +23,10 @@
     eventLevel: "",
     rosterQuery: "",
     rosterScope: "playing",
+    rosterGroup: "",
     rosterLimit: ROSTER_WINDOW,
+    lineup: null,
+    lineupBusy: false,
     configQuery: "",
     configCustomOnly: false,
     teams: null,
@@ -34,7 +37,9 @@
     pendingOverrides: {},   // override key -> table, or null to clear
     errors: {},             // env or "overrides.key" -> message; "_cross" -> [messages]
     flash: {},              // env or "overrides.key" -> "applied" | "restart"
-    saving: false
+    saving: false,
+    disconnecting: {},      // stream_id -> true while a stop is in flight
+    cacheBusy: {}           // embed_url -> "refresh" | "clear" while in flight
   };
 
   var timers = { fast: null, slow: null };
@@ -157,6 +162,16 @@
     });
   }
 
+  /* Attribute values here are full embed URLs, so querySelector with a
+   * quoted selector would break on quotes and other CSS-special characters. */
+  function findAttr(attr, value) {
+    var nodes = document.querySelectorAll("[" + attr + "]");
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].getAttribute(attr) === value) { return nodes[i]; }
+    }
+    return null;
+  }
+
   function errorState(message, retryId) {
     return '<div class="error-state">' +
       '<p class="error-title">Could not load this panel</p>' +
@@ -243,6 +258,7 @@
 
     $("stat-grid").innerHTML = [
       stat("roster", "Roster", num(r.size), "channels that exist"),
+      stat("lineup", "On Jellyfin", num(r.lineup), "of " + num(r.size) + " in the lineup"),
       stat("resolvable", "Resolvable now", num(r.resolvable),
            num(r.listed_no_streams) + " listed without a stream"),
       stat("fixtures", "Guide fixtures", num(r.epg_fixtures), "programmes published"),
@@ -269,6 +285,11 @@
 
   function renderStreams(d) {
     var streams = d.streams || [];
+    Object.keys(state.disconnecting).forEach(function (id) {
+      if (!streams.some(function (s) { return s.stream_id === id; })) {
+        delete state.disconnecting[id];
+      }
+    });
     if (!streams.length) {
       $("streams-panel").innerHTML = emptyState(
         "Nothing playing",
@@ -281,6 +302,7 @@
       var stalled = s.last_segment_ago !== null &&
                     s.last_segment_ago > (d.segment_timeout || 30);
       var failed = (s.segments_failed || 0) > 0;
+      var stopping = !!state.disconnecting[s.stream_id];
       return "<tr>" +
         '<td class="nowrap"><span class="dot ' + (stalled ? "error" : "live") +
           '" style="display:inline-block;margin-right:7px;"></span>' +
@@ -298,6 +320,12 @@
         '<td class="right nowrap">' + num(s.segments_retried) + "</td>" +
         '<td class="right nowrap">' +
           (s.last_segment_ago === null ? "n/a" : s.last_segment_ago + "s") + "</td>" +
+        '<td class="right nowrap">' +
+          '<button type="button" class="btn btn-danger" data-disconnect="' +
+            esc(s.stream_id) + '"' +
+            (stopping ? " disabled" : "") + ">" +
+            (stopping ? "Stopping" : "Disconnect") +
+          "</button></td>" +
         "</tr>";
     });
     $("streams-panel").innerHTML = table([
@@ -305,8 +333,40 @@
       { label: "Elapsed", right: true }, { label: "Rate", right: true },
       { label: "Sent", right: true }, { label: "Segments", right: true },
       { label: "Failed", right: true }, { label: "Retried", right: true },
-      { label: "Last segment", right: true }
+      { label: "Last segment", right: true },
+      { label: "", right: true }
     ], rows);
+  }
+
+  function disconnectStream(id) {
+    if (!id || state.disconnecting[id]) { return; }
+    state.disconnecting[id] = true;
+    var btn = document.querySelector('[data-disconnect="' + id + '"]');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Stopping";
+    }
+    send("POST", "/api/streams/" + encodeURIComponent(id) + "/disconnect", {})
+      .then(function (r) {
+        if (r.ok) {
+          get("/stream/status").then(renderStreams).catch(guard("streams-panel", "streams"));
+          return;
+        }
+        delete state.disconnecting[id];
+        var again = document.querySelector('[data-disconnect="' + id + '"]');
+        if (again) {
+          again.disabled = false;
+          again.textContent = "Disconnect";
+        }
+      })
+      .catch(function () {
+        delete state.disconnecting[id];
+        var again = document.querySelector('[data-disconnect="' + id + '"]');
+        if (again) {
+          again.disabled = false;
+          again.textContent = "Disconnect";
+        }
+      });
   }
 
   /* ── Pre-warm ─────────────────────────────────────────────────────────── */
@@ -355,47 +415,142 @@
 
   /* ── Roster ───────────────────────────────────────────────────────────── */
 
+  var SPORT_LABEL = {
+    "american-football": "American Football",
+    "motor-sports": "Motor Sports",
+    "afl": "AFL",
+    "football": "Soccer"
+  };
+
+  function sportLabel(s) {
+    if (!s) { return ""; }
+    return SPORT_LABEL[s] || String(s).replace(/-/g, " ").replace(/\b\w/g, function (c) {
+      return c.toUpperCase();
+    });
+  }
+
+  function rowInGroup(e, group) {
+    if (!group) { return true; }
+    if (group.indexOf("kind:") === 0) { return e.kind === group.slice(5); }
+    if (group.indexOf("sport:") === 0) {
+      return e.kind === "team" && !e.league && e.sport === group.slice(6);
+    }
+    return e.league === group;
+  }
+
+  function rosterHay(e) {
+    return [e.name || e.team, e.match, e.slug, e.sport, e.league, e.category]
+      .map(function (x) { return String(x || "").toLowerCase(); })
+      .join(" ");
+  }
+
+  function lineupCell(e) {
+    if (!editing()) { return ""; }
+    var on = !!e.in_lineup;
+    var title = on ? "Remove from Jellyfin" : "Add to Jellyfin";
+    var attr = on ? "data-lineup-remove" : "data-lineup-add";
+    return '<td class="right nowrap"><span class="row-actions">' +
+      '<button type="button" class="btn btn-circle" ' + attr + '="' + esc(e.slug) +
+      '" aria-label="' + title + '" title="' + title + '"' +
+      (state.lineupBusy ? " disabled" : "") + ">" +
+      (on ? "\u2212" : "+") + "</button></span></td>";
+  }
+
+  function renderRosterGroups() {
+    var host = $("roster-groups");
+    var action = $("roster-group-action");
+    if (!host) { return; }
+    var groups = ((state.lineup && state.lineup.groups) || []).filter(function (g) {
+      return g.size > 0;
+    });
+    if (!groups.length) {
+      host.hidden = true;
+      host.innerHTML = "";
+      if (action) { action.hidden = true; }
+      return;
+    }
+    host.hidden = false;
+    host.innerHTML = groups.map(function (g) {
+      return '<button type="button" class="chip" data-roster-group="' + esc(g.id) +
+        '" aria-pressed="' + (state.rosterGroup === g.id ? "true" : "false") + '">' +
+        esc(g.label) + "</button>";
+    }).join("");
+    if (action) { action.hidden = !(state.rosterGroup && editing()); }
+  }
+
   function renderRoster() {
     var panel = $("roster-panel");
     var q = state.rosterQuery.toLowerCase();
+    var scope = state.rosterScope;
     var rows, total, headers;
+    var needsAll = scope !== "playing";
+    var entries;
 
-    if (state.rosterScope === "all") {
-      if (!state.rosterAll) { panel.innerHTML = emptyState("Loading full roster", "Fetching every known channel."); return; }
-      var entries = Object.keys(state.rosterAll.roster || {}).map(function (slug) {
-        var v = state.rosterAll.roster[slug] || {};
-        return { slug: slug, name: v.name || slug, first: v.first_seen, last: v.last_seen };
-      });
-      if (q) {
-        entries = entries.filter(function (e) {
-          return e.name.toLowerCase().indexOf(q) >= 0 || e.slug.indexOf(q) >= 0;
-        });
+    if (needsAll) {
+      if (!state.rosterAll) {
+        panel.innerHTML = emptyState("Loading full roster", "Fetching every known channel.");
+        return;
       }
-      entries.sort(function (a, b) { return a.name.localeCompare(b.name); });
-      total = entries.length;
-      headers = [{ label: "Channel" }, { label: "Slug" }, { label: "First seen" }, { label: "Last seen" }];
+      entries = Object.keys(state.rosterAll.roster || {}).map(function (slug) {
+        var v = state.rosterAll.roster[slug] || {};
+        return {
+          slug: slug, name: v.name || slug, team: v.name || slug,
+          first: v.first_seen, last: v.last_seen,
+          kind: v.kind || "team", sport: v.sport || "", league: v.league || null,
+          in_lineup: !!v.in_lineup, match: "", category: ""
+        };
+      });
+      if (scope === "lineup") {
+        entries = entries.filter(function (e) { return e.in_lineup; });
+      } else if (scope === "hidden") {
+        entries = entries.filter(function (e) { return !e.in_lineup; });
+      }
+    } else {
+      if (!state.teams) {
+        panel.innerHTML = emptyState("Loading roster", "Fetching resolvable channels.");
+        return;
+      }
+      entries = (state.teams.teams || []).map(function (t) {
+        return {
+          slug: t.slug, name: t.team, team: t.team, match: t.match,
+          category: t.category, streams: t.streams, best: t.best,
+          kind: t.kind || "team", sport: t.sport || "", league: t.league || null,
+          in_lineup: !!t.in_lineup
+        };
+      });
+    }
+
+    if (state.rosterGroup) {
+      entries = entries.filter(function (e) { return rowInGroup(e, state.rosterGroup); });
+    }
+    if (q) {
+      entries = entries.filter(function (e) { return rosterHay(e).indexOf(q) >= 0; });
+    }
+    entries.sort(function (a, b) { return String(a.name).localeCompare(b.name); });
+    total = entries.length;
+
+    if (needsAll) {
+      headers = [{ label: "Channel" }, { label: "Sport" }, { label: "Lineup" },
+                 { label: "Slug" }, { label: "First seen" }, { label: "Last seen" }];
+      if (editing()) { headers.push({ label: "", right: true }); }
       rows = entries.slice(0, state.rosterLimit).map(function (e) {
         return "<tr>" +
           '<td class="cell-strong">' + esc(e.name) + "</td>" +
+          '<td class="nowrap">' + esc(sportLabel(e.sport) || e.kind) + "</td>" +
+          '<td class="nowrap">' +
+            (e.in_lineup ? '<span class="badge ok">On</span>' : '<span class="badge default">Off</span>') +
+          "</td>" +
           '<td class="mono">' + esc(e.slug) + "</td>" +
           '<td class="nowrap cell-dim">' + esc(e.first || "") + "</td>" +
           '<td class="nowrap cell-dim">' + esc(e.last || "") + "</td>" +
+          lineupCell(e) +
           "</tr>";
       });
     } else {
-      if (!state.teams) { panel.innerHTML = emptyState("Loading roster", "Fetching resolvable channels."); return; }
-      var list = (state.teams.teams || []).slice();
-      if (q) {
-        list = list.filter(function (t) {
-          return String(t.team).toLowerCase().indexOf(q) >= 0 ||
-                 String(t.match).toLowerCase().indexOf(q) >= 0 ||
-                 String(t.slug).indexOf(q) >= 0;
-        });
-      }
-      total = list.length;
       headers = [{ label: "Channel" }, { label: "Resolves to" }, { label: "Category" },
                  { label: "Sources", right: true }, { label: "Best" }, { label: "Slug" }];
-      rows = list.slice(0, state.rosterLimit).map(function (t) {
+      if (editing()) { headers.push({ label: "", right: true }); }
+      rows = entries.slice(0, state.rosterLimit).map(function (t) {
         return "<tr>" +
           '<td class="cell-strong">' + esc(t.team) + "</td>" +
           "<td>" + esc(t.match) + "</td>" +
@@ -403,14 +558,15 @@
           '<td class="right">' + num(t.streams) + "</td>" +
           '<td class="nowrap mono">' + esc(t.best) + "</td>" +
           '<td class="mono cell-dim">' + esc(t.slug) + "</td>" +
+          lineupCell(t) +
           "</tr>";
       });
     }
 
     if (!rows.length) {
       panel.innerHTML = emptyState(
-        q ? "Nothing matches that search" : "No channels resolvable",
-        q ? "Try a team name, a fixture title, or a slug."
+        q || state.rosterGroup ? "Nothing matches that filter" : "No channels in this view",
+        q ? "Try a team name, a fixture title, a slug, or a sport."
           : "The roster fills in as the upstream catalog lists fixtures."
       );
     } else {
@@ -432,6 +588,36 @@
 
     $("roster-count").textContent =
       num(Math.min(state.rosterLimit, total)) + " shown of " + num(total);
+    renderRosterGroups();
+  }
+
+  function refreshRosterData() {
+    return Promise.all([
+      get("/teams"),
+      get("/teams?all=1"),
+      get("/api/lineup"),
+      get("/api/overview")
+    ]).then(function (parts) {
+      state.teams = parts[0];
+      state.rosterAll = parts[1];
+      state.lineup = parts[2];
+      renderOverview(parts[3]);
+      renderRoster();
+    });
+  }
+
+  function lineupAction(body) {
+    if (!editing() || state.lineupBusy) { return; }
+    state.lineupBusy = true;
+    renderRoster();
+    send("PUT", "/api/lineup", body).then(function (r) {
+      state.lineupBusy = false;
+      if (r.ok && r.body) { state.lineup = r.body; }
+      refreshRosterData().catch(guard("roster-panel", "roster"));
+    }).catch(function () {
+      state.lineupBusy = false;
+      renderRoster();
+    });
   }
 
   /* ── Aliases ──────────────────────────────────────────────────────────── */
@@ -472,9 +658,17 @@
            na.enabled ? "audio check on" : "audio check off")
     ].join("");
 
-    var rows = (ex.entries || []).map(function (e) {
+    var entries = ex.entries || [];
+    Object.keys(state.cacheBusy).forEach(function (url) {
+      if (!entries.some(function (e) { return e.embed_url === url; })) {
+        delete state.cacheBusy[url];
+      }
+    });
+
+    var rows = entries.map(function (e) {
       var cls = e.expired ? "out" : (e.ttl_left_s < 60 ? "low" : "");
       var width = Math.max(4, Math.min(56, Math.round((e.ttl_left_s / (ex.ttl_s || 300)) * 56)));
+      var busy = state.cacheBusy[e.embed_url];
       return "<tr>" +
         '<td><span class="cell-truncate mono" title="' + esc(e.embed_url) + '">' +
           esc(shortUrl(e.embed_url)) + "</span></td>" +
@@ -485,6 +679,14 @@
         '<td class="right nowrap"><span class="ttl">' +
           (e.expired ? "" : '<span class="ttl-rule ' + cls + '" style="width:' + width + 'px"></span>') +
           "<span>" + (e.expired ? "expired" : Math.round(e.ttl_left_s) + "s") + "</span></span></td>" +
+        '<td class="right nowrap"><span class="row-actions">' +
+          '<button type="button" class="btn btn-warn" data-cache-refresh="' +
+            esc(e.embed_url) + '"' + (busy ? " disabled" : "") + ">" +
+            (busy === "refresh" ? "Refreshing" : "Refresh") + "</button>" +
+          '<button type="button" class="btn btn-danger" data-cache-clear="' +
+            esc(e.embed_url) + '"' + (busy ? " disabled" : "") + ">" +
+            (busy === "clear" ? "Clearing" : "Clear") + "</button>" +
+        "</span></td>" +
         "</tr>";
     });
 
@@ -497,8 +699,36 @@
     }
     $("cache-panel").innerHTML = table([
       { label: "Embed page" }, { label: "Resolved stream" },
-      { label: "Age", right: true }, { label: "TTL left", right: true }
+      { label: "Age", right: true }, { label: "TTL left", right: true },
+      { label: "", right: true }
     ], rows);
+  }
+
+  function cacheAction(kind, url) {
+    if (!url || state.cacheBusy[url]) { return; }
+    state.cacheBusy[url] = kind;
+    var refreshBtn = findAttr("data-cache-refresh", url);
+    var clearBtn = findAttr("data-cache-clear", url);
+    if (refreshBtn) {
+      refreshBtn.disabled = true;
+      if (kind === "refresh") { refreshBtn.textContent = "Refreshing"; }
+    }
+    if (clearBtn) {
+      clearBtn.disabled = true;
+      if (kind === "clear") { clearBtn.textContent = "Clearing"; }
+    }
+    var path = kind === "refresh"
+      ? "/api/cache/extract/refresh"
+      : "/api/cache/extract/clear";
+    send("POST", path, { embed_url: url })
+      .then(function () {
+        delete state.cacheBusy[url];
+        get("/api/cache").then(renderCaches).catch(guard("cache-panel", "caches"));
+      })
+      .catch(function () {
+        delete state.cacheBusy[url];
+        get("/api/cache").then(renderCaches).catch(guard("cache-panel", "caches"));
+      });
   }
 
   /* ── Events ───────────────────────────────────────────────────────────── */
@@ -860,6 +1090,7 @@
     if (pendingCount() || configFocused()) { renderSaveBar(); return; }
     renderConfig();
     renderOverrides();
+    renderRoster();
   }
 
   /* ── Endpoints ────────────────────────────────────────────────────────── */
@@ -876,8 +1107,13 @@
       ["/api/overview", "Aggregate figures behind this page."],
       ["/api/config", "Effective configuration as JSON, with sources and bounds."],
       ["/api/settings", "PUT a change here. Needs a session and the CSRF token."],
+      ["/api/lineup", "GET the Jellyfin lineup; PUT add/remove slugs or a group."],
+      ["/api/streams/<id>/disconnect", "POST to stop one active proxy session."],
       ["/api/cache", "Extraction, logo and no-audio cache contents."],
+      ["/api/cache/extract/refresh", "POST {embed_url} to force a new Chromium extract for one cache entry."],
+      ["/api/cache/extract/clear", "POST {embed_url} to drop one extract-cache entry."],
       ["/api/events", "Recent log records as JSON."],
+      ["/api/restart", "POST to restart streamed-m3u and streamed-m3u-sync. Needs the Docker socket."],
       ["/playlist.m3u", "Legacy per-match playlist. Kept as a fallback, consumed by nothing."]
     ];
     $("endpoints-panel").innerHTML = items.map(function (it) {
@@ -913,10 +1149,10 @@
   function pollSlow() {
     get("/teams").then(function (d) { state.teams = d; renderRoster(); })
       .catch(guard("roster-panel", "roster"));
-    if (state.rosterScope === "all" && !state.rosterAll) {
-      get("/teams?all=1").then(function (d) { state.rosterAll = d; renderRoster(); })
-        .catch(guard("roster-panel", "roster"));
-    }
+    get("/teams?all=1").then(function (d) { state.rosterAll = d; renderRoster(); })
+      .catch(guard("roster-panel", "roster"));
+    get("/api/lineup").then(function (d) { state.lineup = d; renderRosterGroups(); renderRoster(); })
+      .catch(function () { /* gated when signed out; roster still renders */ });
     get("/teams?alias=1").then(renderAliases).catch(guard("alias-panel", "aliases"));
     get("/api/cache").then(renderCaches).catch(guard("cache-panel", "caches"));
     get("/api/config").then(applyConfig).catch(guard("config-panel", "config"));
@@ -949,6 +1185,98 @@
     });
   }
 
+  function setPowerOpen(open) {
+    var btn = $("power-btn");
+    var menu = $("power-menu");
+    if (!btn || !menu) { return; }
+    menu.hidden = !open;
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (!open) {
+      var note = $("power-menu-note");
+      if (note && !note.dataset.sticky) {
+        note.hidden = true;
+        note.textContent = "";
+      }
+    }
+  }
+
+  function waitForUp(timeoutMs) {
+    var start = Date.now();
+    return new Promise(function (resolve, reject) {
+      function ping() {
+        fetch("/health", { headers: { "Accept": "application/json" } })
+          .then(function (r) { if (r.ok) { resolve(); } else { retry(); } })
+          .catch(retry);
+      }
+      function retry() {
+        if (Date.now() - start > timeoutMs) {
+          reject(new Error("The service did not come back in time."));
+        } else {
+          setTimeout(ping, 1000);
+        }
+      }
+      setTimeout(ping, 2000);
+    });
+  }
+
+  function initPowerMenu() {
+    var btn = $("power-btn");
+    var menu = $("power-menu");
+    var item = $("restart-services");
+    var note = $("power-menu-note");
+    if (!btn || !menu || !item) { return; }
+
+    btn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      setPowerOpen(menu.hidden);
+    });
+
+    document.addEventListener("click", function (ev) {
+      if (menu.hidden) { return; }
+      if (ev.target && ev.target.closest && ev.target.closest("#power-wrap")) {
+        return;
+      }
+      setPowerOpen(false);
+    });
+
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && !menu.hidden) { setPowerOpen(false); }
+    });
+
+    item.addEventListener("click", function () {
+      if (item.disabled) { return; }
+      item.disabled = true;
+      item.textContent = "Restart";
+      note.hidden = true;
+      note.textContent = "";
+      note.classList.remove("busy");
+      note.dataset.sticky = "1";
+      send("POST", "/api/restart", {}).then(function (r) {
+        if (r.status === 202 && r.body && r.body.ok) {
+          note.hidden = false;
+          note.classList.add("busy");
+          note.textContent = "Restarting…";
+          return waitForUp(90000).then(function () {
+            window.location.reload();
+          });
+        }
+        var msg = (r.body && (r.body.message || r.body.error)) ||
+                  ("Restart failed (" + r.status + ")");
+        note.hidden = false;
+        note.classList.remove("busy");
+        note.textContent = msg;
+        item.disabled = false;
+        delete note.dataset.sticky;
+      }).catch(function (err) {
+        note.hidden = false;
+        note.classList.remove("busy");
+        note.textContent = err.message || "Restart failed";
+        item.disabled = false;
+        delete note.dataset.sticky;
+      });
+    });
+  }
+
   function init() {
     var saved = null;
     try { saved = localStorage.getItem("streamed-m3u-theme"); } catch (e) { /* private mode */ }
@@ -978,6 +1306,8 @@
       pollAll();
     });
 
+    initPowerMenu();
+
     var rosterSearch = $("roster-search");
     rosterSearch.addEventListener("input", function () {
       state.rosterQuery = this.value.trim();
@@ -985,26 +1315,30 @@
       renderRoster();
     });
 
-    var scopePlaying = $("roster-scope-playing");
-    var scopeAll = $("roster-scope-all");
-    scopePlaying.addEventListener("click", function () {
-      state.rosterScope = "playing";
-      state.rosterLimit = ROSTER_WINDOW;
-      pressGroup([scopePlaying, scopeAll], scopePlaying);
-      renderRoster();
-    });
-    scopeAll.addEventListener("click", function () {
-      state.rosterScope = "all";
-      state.rosterLimit = ROSTER_WINDOW;
-      pressGroup([scopePlaying, scopeAll], scopeAll);
-      if (!state.rosterAll) {
-        $("roster-panel").innerHTML = emptyState("Loading full roster", "Fetching every known channel.");
-        get("/teams?all=1").then(function (d) { state.rosterAll = d; renderRoster(); })
-          .catch(guard("roster-panel", "roster"));
-      } else {
+    var scopeChips = Array.prototype.slice.call(
+      document.querySelectorAll("#roster .chip.roster-scope"));
+    scopeChips.forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        state.rosterScope = chip.getAttribute("data-scope") || "playing";
+        state.rosterLimit = ROSTER_WINDOW;
+        pressGroup(scopeChips, chip);
         renderRoster();
-      }
+      });
     });
+    var groupAdd = $("roster-group-add");
+    var groupRemove = $("roster-group-remove");
+    if (groupAdd) {
+      groupAdd.addEventListener("click", function () {
+        if (!state.rosterGroup) { return; }
+        lineupAction({ op: "add", group: state.rosterGroup });
+      });
+    }
+    if (groupRemove) {
+      groupRemove.addEventListener("click", function () {
+        if (!state.rosterGroup) { return; }
+        lineupAction({ op: "remove", group: state.rosterGroup });
+      });
+    }
 
     var levelChips = Array.prototype.slice.call(
       document.querySelectorAll("#events .chip[data-level]"));
@@ -1067,6 +1401,39 @@
         delete state.errors["overrides." + key];
         renderOverrides();
         renderSaveBar();
+        return;
+      }
+      var stop = target.closest("[data-disconnect]");
+      if (stop) {
+        disconnectStream(stop.getAttribute("data-disconnect"));
+        return;
+      }
+      var cacheRefresh = target.closest("[data-cache-refresh]");
+      if (cacheRefresh) {
+        cacheAction("refresh", cacheRefresh.getAttribute("data-cache-refresh"));
+        return;
+      }
+      var cacheClear = target.closest("[data-cache-clear]");
+      if (cacheClear) {
+        cacheAction("clear", cacheClear.getAttribute("data-cache-clear"));
+        return;
+      }
+      var groupChip = target.closest("[data-roster-group]");
+      if (groupChip) {
+        var gid = groupChip.getAttribute("data-roster-group");
+        state.rosterGroup = state.rosterGroup === gid ? "" : gid;
+        state.rosterLimit = ROSTER_WINDOW;
+        renderRoster();
+        return;
+      }
+      var addSlug = target.closest("[data-lineup-add]");
+      if (addSlug) {
+        lineupAction({ op: "add", slugs: [addSlug.getAttribute("data-lineup-add")] });
+        return;
+      }
+      var removeSlug = target.closest("[data-lineup-remove]");
+      if (removeSlug) {
+        lineupAction({ op: "remove", slugs: [removeSlug.getAttribute("data-lineup-remove")] });
       }
     });
 

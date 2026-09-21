@@ -177,6 +177,59 @@ select:focus-visible {
 .nav-control:hover { background: rgba(255, 255, 255, 0.10); }
 .nav-control:active { transform: scale(0.95); }
 
+.nav-control-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+.nav-control-icon svg { display: block; }
+
+/* Dropdown hangs off the always-black nav onto the page surface. Card
+ * radius + hairline only; DESIGN.md reserves drop-shadows for photography. */
+.power-wrap { position: relative; display: flex; align-items: center; }
+.power-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 168px;
+  background: var(--surface-raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card);
+  padding: var(--s-xs);
+  z-index: 40;
+}
+.power-menu-item {
+  appearance: none;
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-control);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: -0.224px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease;
+}
+.power-menu-item:hover { background: var(--accent-quiet); }
+.power-menu-item:active { transform: scale(0.95); }
+.power-menu-item:disabled { opacity: 0.5; cursor: default; transform: none; }
+.power-menu-note {
+  color: var(--error);
+  font-size: 12px;
+  letter-spacing: -0.12px;
+  margin: 4px 0 0;
+  padding: 0 14px 6px;
+}
+.power-menu-note.busy { color: var(--text-dim); }
+
 .sub-nav {
   position: sticky;
   top: var(--nav-h);
@@ -497,6 +550,16 @@ td.nowrap, th.nowrap { white-space: nowrap; }
 }
 .btn:active { transform: scale(0.95); }
 
+/* Two buttons on a table row, right-aligned. Gap matches the control rhythm. */
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-xs);
+  flex-wrap: nowrap;
+}
+.row-actions .btn { white-space: nowrap; }
+
 .toolbar-count {
   color: var(--text-dim);
   font-size: 12px;
@@ -736,6 +799,58 @@ textarea.field { font-family: var(--f-mono); font-size: 12px; letter-spacing: 0;
 tr.dirty { box-shadow: inset 3px 0 0 var(--accent); }
 
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #ffffff; font-weight: 600; }
+.btn-pill { border-radius: var(--r-pill); padding: 8px 16px; }
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: var(--r-pill);
+  padding: 8px 16px;
+}
+.btn-circle {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  font-size: 22px;
+  font-weight: 400;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+/* Lineup add/remove. --ok / --error are the existing semantic tokens
+ * (Apple system green and red), not a second brand accent. */
+.btn-ok,
+#roster-group-add,
+.btn-circle[data-lineup-add] {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: #1d1d1f;
+}
+[data-theme="light"] .btn-ok,
+[data-theme="light"] #roster-group-add,
+[data-theme="light"] .btn-circle[data-lineup-add] {
+  color: #ffffff;
+}
+#roster-group-remove,
+.btn-circle[data-lineup-remove] {
+  background: var(--error);
+  border-color: var(--error);
+  color: #ffffff;
+}
+/* Cautionary / destructive only. --warn and --error are Apple's system
+ * amber and red; DESIGN.md keeps a single brand accent, and these are not
+ * branding. Ink on amber for contrast on dark; paper on the darker light-
+ * theme amber. */
+.btn-warn { background: var(--warn); border-color: var(--warn); color: #1d1d1f; }
+[data-theme="light"] .btn-warn { color: #ffffff; }
+/* Destructive only. --error is the existing semantic token (Apple system
+ * red); DESIGN.md keeps a single brand accent, and this is not branding. */
+.btn-danger { background: var(--error); border-color: var(--error); color: #ffffff; }
 .btn:disabled { opacity: 0.5; cursor: default; }
 
 .save-bar { display: inline-flex; align-items: center; gap: var(--s-xs); }
