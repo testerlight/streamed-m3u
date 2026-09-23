@@ -106,6 +106,17 @@ check("stream slug from URL",
       sync.stream_team_slug({"url": "http://x/stream?team=boston-red-sox"}) == "boston-red-sox")
 check("stream slug ignores name",
       sync.stream_team_slug({"name": "Boston Red Sox", "url": "http://x/stream?team=other-slug"}) == "other-slug")
+# A composite is addressed by slot, so its slug comes from the tvg-id. Found
+# in Phase 12: without this the Multi-Player channels were never created.
+check("composite stream slug from tvg-id",
+      sync.stream_team_slug({"name": "Multi-Player 1", "tvg_id": "streamed.feed.multi-player-1",
+                             "url": "http://x/stream?multi=1"}) == "multi-player-1")
+check("team= still wins over the tvg-id",
+      sync.stream_team_slug({"tvg_id": "streamed.team.wrong",
+                             "url": "http://x/stream?team=right"}) == "right")
+check("a foreign tvg-id gives no slug",
+      sync.stream_team_slug({"tvg_id": "atwill-1.slot", "url": "http://y/play/1"}) is None)
+check("nothing to go on gives no slug", sync.stream_team_slug({}) is None)
 fake_channels = [
     {"id": 1, "tvg_id": "streamed.team.a", "hidden_from_output": False},
     {"id": 2, "tvg_id": "streamed.team.b", "hidden_from_output": False},

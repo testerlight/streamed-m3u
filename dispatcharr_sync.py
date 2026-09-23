@@ -214,17 +214,31 @@ def refresh_epg(source_id):
 
 
 def stream_team_slug(stream):
-    """Slug from a stream URL's /stream?team= query, never the display name."""
-    url = (stream or {}).get("url") or ""
-    if not url:
-        return None
-    try:
-        qs = parse_qs(urlparse(url).query)
-    except ValueError:
-        return None
-    vals = qs.get("team") or []
-    slug = (vals[0] or "").strip() if vals else ""
-    return slug or None
+    """Roster slug for a stream, never from its display name.
+
+    Normally the /stream?team= query. A multi-view composite is addressed by
+    slot instead (/stream?multi=N), so its slug comes from the tvg-id the
+    playlist gives it, streamed.feed.<slug>. That is the same fallback the
+    visibility pass already uses for channels, and it keeps streamed-m3u the
+    only place a slug is ever derived: the sync reads it, it never rebuilds
+    one from a name or a slot number. Without this the composite channels
+    had no slug, read as "not in the lineup", and were never created.
+    """
+    stream = stream or {}
+    url = stream.get("url") or ""
+    if url:
+        try:
+            qs = parse_qs(urlparse(url).query)
+        except ValueError:
+            qs = {}
+        vals = qs.get("team") or []
+        slug = (vals[0] or "").strip() if vals else ""
+        if slug:
+            return slug
+    tvg = str(stream.get("tvg_id") or "")
+    if tvg.startswith("streamed.") and tvg.count(".") >= 2:
+        return tvg.split(".", 2)[2].strip() or None
+    return None
 
 
 def fetch_lineup_map(base_url=None):
