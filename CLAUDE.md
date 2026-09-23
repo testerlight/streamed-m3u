@@ -7,7 +7,8 @@ Two documents, no overlap between them:
   `python settings.py --markdown`; regenerate it rather than editing by hand.
 - `instructions.md` is the maintainer handover: how the system works
   internally, the TrueNAS SCALE deployment specifics, the settings and auth
-  model, and a numbered list of gotchas (currently 26) covering real bugs
+  model, and a numbered list of gotchas (currently 28, plus 33 multi-view
+  pitfalls in §12) covering real bugs
   already hit here. **Read it before changing `app.py`.** Skipping it risks
   redoing debugging that has already been done.
 
@@ -23,4 +24,5 @@ quality (failover, buffering, startup latency); it is not yet implemented.
 
 Verification runs inside the image, not on the host: see the docstring of
 `tools/check_console.py`. Build to a scratch tag for that; never retag the
-live image (`ix-dispatcharr11-streamed-m3u:latest`) during verification.
+live image (`ix-streamed-m3u-streamed-m3u:latest` since the 2026-09-23 app
+split) during verification.

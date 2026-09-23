@@ -932,6 +932,7 @@ check("and it is still the same healthy process", comp7.alive())
 
 # Twenty changes back to back, the gate's stress case.
 t7 = time.time()
+sent7 = comp7.commands_sent
 FLIPPED = {"primary": 0, "secondary": 100}
 for i in range(20):
     # Carry the flipped mix through, or the first of these would quietly put
@@ -940,7 +941,16 @@ for i in range(20):
                      audio=FLIPPED))
 check("twenty changes in a row are all accepted",
       comp7.commands_failed == 0, comp7.last_command_error)
-check("and take no real time", time.time() - t7 < 20, round(time.time() - t7, 1))
+# Bounded by the frame rate, not by a fixed figure: a command lands on the
+# next frame through the filter, and since the feeders pace the inputs
+# (2026-09-23) that frame arrives in real time - 100 ms at this test's 10 fps,
+# 17 ms in production at 60. The old fixed bound only held because ffmpeg
+# used to race through burst-fed input faster than real time.
+n7 = comp7.commands_sent - sent7
+took7 = time.time() - t7
+check("and take no more than three frames a command",
+      took7 < n7 * 3.0 / F7 + 5, "%d commands in %.1fs, %.0f ms each"
+      % (n7, took7, 1000.0 * took7 / max(n7, 1)))
 check("the encoder is still alive after them", comp7.alive())
 check("and still the same process", comp7.proc.pid == pid7)
 
@@ -1330,6 +1340,24 @@ check("and says nothing was running", body.get("stopped") is False,
       body.get("stopped"))
 r = c.post("/api/multiview/99/stop", json={}, headers=H)
 check("stopping an unknown slot is 404", r.status_code == 404, r.status_code)
+
+section("Stop means stop")
+# Until 2026-09-23 a console Stop was undone within a second: the playing
+# viewer's stream saw its composite end, took it for a crash, and rebuilt it.
+# Stop now holds the slot like Disconnect holds a team stream.
+key = app._multiview_hold_key("1")
+app._release_hold(key)
+r = c.post("/api/multiview/1/stop", json={}, headers=H)
+body = r.get_json() or {}
+check("a stop reports how long the slot is held",
+      body.get("held_seconds") == app.STREAM_DISCONNECT_HOLD, body.get("held_seconds"))
+check("and the hold is set", app._disconnect_held(key))
+r = c.get("/stream?multi=1")
+check("a tune during the hold is refused, not rebuilt",
+      r.status_code == 503 and b"stopped from the console" in r.data,
+      (r.status_code, r.data[:60]))
+c.put("/api/multiview/1", json={"corner": "tr"}, headers=H)
+check("any change to the slot lifts the hold", not app._disconnect_held(key))
 
 shutil.rmtree(DATA, ignore_errors=True)
 print("\n%s" % ("ALL CHECKS PASSED" if not fails else "FAILURES: " + "; ".join(fails)))

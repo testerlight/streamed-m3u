@@ -2558,6 +2558,9 @@ def _multiview_api_update(slot_id: str, payload: dict):
 
     before = multiview.get_slot(slot_id)
     slot, changed, err = _multiview_update(slot_id, changes)
+    if not err:
+        # Somebody is setting this slot up again: they want it to play.
+        _release_hold(_multiview_hold_key(slot_id))
     if err:
         return None, err, 404 if err == "unknown slot" else 500
 
@@ -2586,9 +2589,13 @@ def _multiview_api_stop(slot_id: str):
     if str(slot_id) not in set(_MULTIVIEW_BY_SLUG.values()):
         return None, "unknown slot", 404
     mgr = _mv_manager_instance
+    # The hold first, so a viewer whose composite this ends sees it and stops
+    # rather than rebuilding.
+    _hold_disconnect(_multiview_hold_key(slot_id))
     stopped = bool(mgr and mgr.stop(str(slot_id)))
     snapshot = _multiview_snapshot()
     snapshot["stopped"] = stopped
+    snapshot["held_seconds"] = STREAM_DISCONNECT_HOLD
     return snapshot, None, 200
 
 
@@ -2642,6 +2649,19 @@ def _multiview_body(slot_id: str, slot: dict):
         try:
             for attempt in range(MULTIVIEW_REATTACHES + 1):
                 current = multiview.get_slot(slot_id) or slot
+                # Rebuilding is for a composite that ended by itself or had a
+                # channel changed under it - not for one somebody switched off.
+                # Both of these used to rebuild within a second (2026-09-23):
+                # Stop in the console appeared to do nothing, and clearing a
+                # slot started an encoder with no channels in it.
+                if attempt and not multiview.configured(current):
+                    log.info("Multi-view slot %s was cleared; ending the stream",
+                             slot_id)
+                    return
+                if attempt and _disconnect_held(_multiview_hold_key(slot_id)):
+                    log.info("Multi-view slot %s was stopped from the console; "
+                             "ending the stream", slot_id)
+                    return
                 comp, box["err"] = _mv_manager().start(
                     slot_id, current, max_active=MULTIVIEW_MAX_ACTIVE)
                 box["comp"] = comp
@@ -2759,6 +2779,14 @@ def _multiview_stream(slot_id: str):
         log.info("Multi-view slot %s tuned but not configured", slot_id)
         return Response(
             "Multi-view slot %s has no primary channel selected\n" % slot_id,
+            status=503)
+    # Stopped from the console: refuse reconnects for the hold, exactly as a
+    # disconnected team stream does, or the player simply tunes straight back
+    # in and the stop is undone.
+    if _disconnect_held(_multiview_hold_key(slot_id)):
+        log.info("Multi-view slot %s tuned during a console stop hold", slot_id)
+        return Response(
+            "Multi-view slot %s was stopped from the console\n" % slot_id,
             status=503)
 
     return Response(_multiview_body(slot_id, slot), content_type="video/mp2t",
@@ -3237,6 +3265,15 @@ def _hold_disconnect(key: str) -> None:
                    if exp <= now and k != key]
         for k in expired:
             _disconnect_holds.pop(k, None)
+
+
+def _release_hold(key: str) -> None:
+    with _disconnect_holds_lock:
+        _disconnect_holds.pop(key, None)
+
+
+def _multiview_hold_key(slot_id) -> str:
+    return "multi:%s" % slot_id
 
 
 def _disconnect_held(key: str) -> bool:

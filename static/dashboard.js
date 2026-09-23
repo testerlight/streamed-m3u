@@ -892,9 +892,13 @@
         state.mvWroteAt = Date.now();
         if (r.ok && r.body && r.body.slots) {
           state.mv = r.body;
+          // Stop now means stop: players are dropped and reconnects refused
+          // for the hold, as Disconnect does for a team stream. Changing the
+          // slot here lifts it early.
+          var held = (r.body.held_seconds || 90) + "s, or until you change this slot.";
           state.mvNote = r.body.stopped
-            ? "Encoder stopped. The next tune starts a new one."
-            : "Nothing was running.";
+            ? "Stopped. Players are disconnected and reconnects are refused for " + held
+            : "Nothing was running. Tuning in is refused for " + held;
         } else {
           state.mvError = (r.body && (r.body.message || r.body.error)) ||
                           ("Could not stop it (" + r.status + ").");

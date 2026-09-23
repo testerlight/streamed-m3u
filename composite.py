@@ -29,6 +29,7 @@ process that drains them.
 import errno
 import logging
 import os
+import queue
 import select
 import subprocess
 import threading
@@ -62,6 +63,22 @@ MAX_BACKOFF = 60.0
 # reader can tell a slow download from a dead one. Silence past this is the
 # source having gone away without saying so.
 SOURCE_STALL_TIMEOUT = 15.0
+
+# Pacing (see _Pacer). Behind schedule by less than this, the pacer simply
+# catches up: timestamps come from the schedule, not from arrival, so a late
+# packet written late is still stamped where it belongs, and ffmpeg sorts
+# that out by itself. Restarting the schedule instead - the first version -
+# left a hole in the input every time, and the picture froze for it. Only a
+# real outage, longer than this, starts a new schedule, so a stall cannot
+# leave the composite permanently that far behind live.
+PACE_MAX_BEHIND = 10.0
+PACE_FIRST_CUSHION = 0.5
+# A jump in the stream's own clock bigger than this (either way) is a new
+# timeline - a different source, a splice - not time passing.
+PACE_MAX_JUMP = 5.0
+# Chunks read ahead of the pacer. At 64 KiB and ~8 Mbit/s that is minutes;
+# the backlog the proxy actually sends is two or three segments.
+PACE_QUEUE = 1024
 
 # How long to wait on a reply from the encoder's control socket. Generous
 # for what is a local round trip to a filter graph, because the cost of
@@ -180,6 +197,254 @@ def make_filler(path, width=1920, height=1080, fps=60, seconds=2,
     return path
 
 
+class _Pacer:
+    """Releases an MPEG-TS stream in real time, on one continuous clock.
+
+    Two jobs, both learned the hard way on 2026-09-23 when the first person
+    to watch a composite called it unwatchable.
+
+    **Pacing.** A team stream reaches the feeder the way the proxy delivers
+    it: a whole HLS segment - five seconds of video - in a few milliseconds,
+    then nothing but keepalive padding until the next one. So the feeder reads
+    ahead, and this decides when each packet may be written: at the wall-clock
+    moment its PCR (the program clock every TS carries, at least every 100 ms)
+    says it belongs.
+
+    **Restamping.** Every PCR, PTS and DTS is rewritten to that same moment,
+    measured from an `epoch` both of a composite's feeders share. The encoder
+    used to stamp its inputs by arrival instead (`-use_wallclock_as_timestamps`),
+    because a stream's own clock restarts whenever the source changes or the
+    filler loops. Arrival stamping turned out to starve the main input
+    outright: ffmpeg read 8 seconds of it in 30 while reading the miniplayer
+    in full, and duplicated the rest - measured in isolation, no feeder code
+    involved. Restamping here gives ffmpeg what the arrival clock was meant
+    to: timestamps that never jump backwards, on a timeline the two inputs
+    share, that match real time - so it can use the stream's own.
+
+    feed() takes bytes and returns [(bytes, release_at)], where release_at is
+    a time.time() value, or None for "straight after the previous piece".
+    Null packets - the proxy's keepalive padding - are dropped: they exist to
+    hold an HTTP connection open, and the FIFO needs no such thing.
+    """
+
+    _WRAP = (1 << 33) / 90000.0            # 33-bit clocks wrap every ~26.5 hours
+    # Output timestamps start this far above zero, so a PTS a little before
+    # its PCR (they usually are) never goes negative.
+    BASE = 10.0
+    _NO_HEADER = (0xBC, 0xBE, 0xBF, 0xF0, 0xF1, 0xF2, 0xF8, 0xFF)
+
+    def __init__(self, now=time.time, epoch=None, clock=None):
+        self._now = now
+        self.epoch = epoch
+        # Shared by every pacer one feeder ever uses - filler, then a source,
+        # then a reconnect. Each new timeline starts after the last one ended,
+        # so an input's timestamps never step backwards, whatever cushion each
+        # pacer had at the time.
+        self._clock = clock if clock is not None else {"last": 0.0}
+        self._carry = b""
+        self._pcr_pid = None
+        self._last_pcr = None
+        self._wall0 = None                  # wall time of the anchor PCR
+        self._pcr0 = 0.0                    # that PCR, in seconds
+        self._media = 0.0                   # stream seconds since the anchor
+        self._held = []                     # packets seen before the first PCR
+        self.cushion = PACE_FIRST_CUSHION
+        self.reanchors = 0
+        self.late_reanchors = 0
+
+    # ── clock fields ──────────────────────────────────────────────────────
+    @staticmethod
+    def _pcr_of(pkt):
+        """PCR in seconds, or None. Adaptation field present, PCR flag set."""
+        if not (pkt[3] & 0x20) or pkt[4] < 7 or not (pkt[5] & 0x10):
+            return None
+        b = pkt[6:12]
+        base = (b[0] << 25) | (b[1] << 17) | (b[2] << 9) | (b[3] << 1) | (b[4] >> 7)
+        ext = ((b[4] & 1) << 8) | b[5]
+        return (base * 300 + ext) / 27000000.0
+
+    @staticmethod
+    def _put_pcr(pkt, seconds):
+        ticks = int(round(seconds * 27000000.0)) % ((1 << 33) * 300)
+        base, ext = divmod(ticks, 300)
+        pkt[6] = (base >> 25) & 0xFF
+        pkt[7] = (base >> 17) & 0xFF
+        pkt[8] = (base >> 9) & 0xFF
+        pkt[9] = (base >> 1) & 0xFF
+        pkt[10] = ((base & 1) << 7) | 0x7E | ((ext >> 8) & 1)
+        pkt[11] = ext & 0xFF
+
+    @staticmethod
+    def _get_ts(b):
+        return ((((b[0] >> 1) & 7) << 30) | (b[1] << 22) | ((b[2] >> 1) << 15)
+                | (b[3] << 7) | (b[4] >> 1))
+
+    @staticmethod
+    def _put_ts(pkt, at, ticks):
+        ticks %= (1 << 33)
+        pkt[at] = (pkt[at] & 0xF0) | ((ticks >> 29) & 0x0E) | 1
+        pkt[at + 1] = (ticks >> 22) & 0xFF
+        pkt[at + 2] = ((ticks >> 14) & 0xFE) | 1
+        pkt[at + 3] = (ticks >> 7) & 0xFF
+        pkt[at + 4] = ((ticks << 1) & 0xFE) | 1
+
+    def _renumber(self, pkt, pid):
+        """Continuity counters, continuous per stream for the input's life.
+
+        Every HLS segment starts its counters afresh, and so does every loop
+        of the filler and every reconnect. ffmpeg flags the first packet after
+        each jump as corrupt, and the h264 decoder re-initialises on it and
+        loses frames until it recovers - measured on a looping clip as a four-
+        second hold after every join, and present in production as a
+        "corrupt input packet" at every segment boundary. The bytes arrive
+        over TCP from our own proxy, so there is no loss for the counter to
+        report; renumbering removes a fault that is not there.
+        """
+        cc = self._clock.setdefault("cc", {})
+        if (pkt[3] >> 4) & 1:                       # carries payload
+            n = (cc.get(pid, -1) + 1) & 0x0F
+            cc[pid] = n
+        else:                                       # adaptation only: unchanged
+            n = cc.get(pid, 0)
+        pkt[3] = (pkt[3] & 0xF0) | n
+
+    def _offset(self):
+        """Seconds to add to this timeline's clock to put it on the epoch's."""
+        return (self._wall0 - self.epoch) + self.BASE - self._pcr0
+
+    def _restamp(self, pkt):
+        """Rewrite PCR, PTS and DTS in place onto the shared timeline."""
+        off = self._offset()
+        if self._pcr_of(pkt) is not None:
+            self._put_pcr(pkt, self._pcr_of(pkt) + off)
+        if not (pkt[1] & 0x40) or not ((pkt[3] >> 4) & 1):
+            return
+        at = 4 + (1 + pkt[4] if (pkt[3] >> 4) & 2 else 0)
+        if at + 19 > 188 or pkt[at:at + 3] != b"\x00\x00\x01":
+            return
+        if pkt[at + 3] in self._NO_HEADER:
+            return
+        flags = pkt[at + 7] >> 6
+        shift = int(round(off * 90000.0))
+        if flags & 2:
+            self._put_ts(pkt, at + 9, self._get_ts(pkt[at + 9:at + 14]) + shift)
+        if flags == 3:
+            self._put_ts(pkt, at + 14, self._get_ts(pkt[at + 14:at + 19]) + shift)
+
+    # ── schedule ──────────────────────────────────────────────────────────
+    def _anchor(self, pcr, cushion):
+        now = self._now()
+        last = self._clock["last"]
+        if last <= 0:
+            # The first timeline this input has ever had: a little in hand.
+            self._wall0 = now + cushion
+        elif now - last > PACE_MAX_BEHIND:
+            # A real outage: start again from now rather than carry it forever.
+            self._wall0 = now
+        else:
+            # A later one - the filler looping, a reconnect - carries straight
+            # on from where the last ended, a tenth of a second on so the
+            # frames after its final PCR are not overtaken. Behind schedule or
+            # not: the catch-up rule inside a timeline applies across a join
+            # too. Two earlier versions did not, and both froze the picture -
+            # "now + cushion" left a hole at every two-second filler loop, and
+            # "now, if behind" turned the startup backlog (ffmpeg stops reading
+            # one input while it opens the other) into a four-second jump in
+            # the timestamps at every join, held on screen as a still frame.
+            self._wall0 = last + 0.1
+        self._pcr0 = pcr
+        self._media = 0.0
+        self._last_pcr = pcr
+        self._clock["last"] = self._wall0
+        return self._wall0
+
+    def _release(self, pcr):
+        now = self._now()
+        if self._wall0 is None:
+            if self.epoch is None:
+                self.epoch = now
+            return self._anchor(pcr, self.cushion)
+        d = pcr - self._last_pcr
+        if d < -self._WRAP / 2:
+            d += self._WRAP
+        if d < -0.5 or d > PACE_MAX_JUMP:
+            # A new timeline - a filler loop, a new source. Start its schedule
+            # from now; the restamp then continues on from here.
+            self.reanchors += 1
+            return self._anchor(pcr, self.cushion)
+        self._last_pcr = pcr
+        self._media += max(d, 0.0)
+        target = self._wall0 + self._media
+        if target < now - PACE_MAX_BEHIND:
+            # A real outage, not a hiccup. Start a new schedule from now rather
+            # than carry the whole delay forever.
+            self.reanchors += 1
+            self.late_reanchors += 1
+            return self._anchor(pcr, 0.0)
+        # Behind by less than that - ffmpeg paused reading this input while it
+        # opened the other one, or a segment came in a little late - just
+        # catch up. The stamps are right either way.
+        self._clock["last"] = max(self._clock["last"], target)
+        return target
+
+    def feed(self, data):
+        buf = self._carry + data
+        out, run, i, n = [], [], 0, len(buf)
+        while i + 188 <= n:
+            if buf[i] != 0x47:
+                # Lost sync: find the next place two packets line up. What lies
+                # before it is passed on untouched rather than dropped - ffmpeg
+                # resyncs on its own, and a feeder that silently eats bytes it
+                # does not understand is a feeder nobody can debug.
+                j = buf.find(b"\x47", i + 1)
+                while j != -1 and j + 188 < n and buf[j + 188] != 0x47:
+                    j = buf.find(b"\x47", j + 1)
+                if j == -1:
+                    run.append(buf[i:n])
+                    i = n
+                    break
+                run.append(buf[i:j])
+                i = j
+                if j + 188 > n:
+                    break
+                continue
+            pkt = bytearray(buf[i:i + 188])
+            i += 188
+            pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
+            if pid == 0x1FFF:
+                continue
+            self._renumber(pkt, pid)
+            pcr = self._pcr_of(pkt)
+            if pcr is not None and (self._pcr_pid is None or pid == self._pcr_pid):
+                self._pcr_pid = pid
+                release = self._release(pcr)
+                if self._held:
+                    # PAT, PMT and anything else that preceded the first PCR:
+                    # only now is there a clock to put them on.
+                    for held in self._held:
+                        self._restamp(held)
+                    run = self._held + run
+                    self._held = []
+                if run:
+                    out.append((b"".join(bytes(x) for x in run), None))
+                    run = []
+                self._restamp(pkt)
+                out.append((bytes(pkt), release))
+                continue
+            if self._wall0 is None:
+                self._held.append(pkt)
+                continue
+            self._restamp(pkt)
+            run.append(pkt)
+        if run:
+            out.append((b"".join(bytes(x) for x in run), None))
+        self._carry = buf[i:]
+        return out
+
+
+_END = object()
+
+
 class _FillerSource:
     """Loops a clip at roughly its natural bitrate.
 
@@ -204,9 +469,9 @@ class _FillerSource:
             for off in range(0, len(self._data), step):
                 if self._closed or self._stop.is_set():
                     return
-                chunk = self._data[off:off + step]
-                yield chunk
-                time.sleep(len(chunk) / float(self._rate))
+                # No sleep: the feeder's pacer releases this on the clip's
+                # own clock, and pacing twice only made the two disagree.
+                yield self._data[off:off + step]
 
     def close(self):
         self._closed = True
@@ -280,6 +545,17 @@ class Feeder:
         self.source_errors = 0
         self.reader_gone = False
         self.last_write_at = 0.0
+        # When the live source last produced real data - read side, padding
+        # excluded. Distinct from last_write_at now that writes are paced: a
+        # source that has stalled keeps "writing" its backlog for a while.
+        self.last_data_at = 0.0
+        # The zero of this input's timeline. A composite gives both of its
+        # feeders the same one, so their restamped clocks line up.
+        self.epoch = None
+        self._clock = {"last": 0.0}
+        self._cut = threading.Event()
+        self.pace_reanchors = 0
+        self.pace_late = 0
 
     # ─── Lifecycle ────────────────────────────────────────────────────────
 
@@ -390,6 +666,10 @@ class Feeder:
             "reader_gone": self.reader_gone,
             "idle_seconds": (round(time.time() - self.last_write_at, 1)
                              if self.last_write_at else None),
+            # Times the pacer had to restart its schedule: new timelines, and
+            # of those, the ones caused by the source arriving late.
+            "pace_reanchors": self.pace_reanchors,
+            "pace_late": self.pace_late,
         }
 
     # ─── Sources ──────────────────────────────────────────────────────────
@@ -622,16 +902,27 @@ class Feeder:
         source = _FillerSource(self.filler, self._stop)
         with self._lock:
             self._active = source
+        # The filler loops a two-second clip, so its own clock restarts every
+        # two seconds. Restamped like any source, it is one continuous
+        # timeline to the encoder instead of a loop.
+        if self.epoch is None:
+            self.epoch = time.time()
+        pacer = _Pacer(epoch=self.epoch, clock=self._clock)
         try:
             for chunk in source:
                 if self._stop.is_set() or self._switch.is_set():
                     break
                 if until is not None and time.time() >= until:
                     break
-                if not self._write_all(fd, chunk):
-                    self.reader_gone = True
-                    return
-                self.filler_bytes += len(chunk)
+                for data, release_at in pacer.feed(chunk):
+                    if release_at is not None:
+                        wait = release_at - time.time()
+                        if wait > 0 and self._switch.wait(min(wait, 1.0)):
+                            return
+                    if not self._write_all(fd, data):
+                        self.reader_gone = True
+                        return
+                    self.filler_bytes += len(data)
         finally:
             with self._lock:
                 self._active = None
@@ -659,35 +950,94 @@ class Feeder:
         if abandoned or source is None:
             return not self._stop.is_set()
         self._backoff = 2.0
+        self._cut.clear()
+        # The idle clock starts when the source does. Left at zero it read as
+        # "nothing for 1.8 billion seconds" and the watchdog cut a source that
+        # had simply not produced its first byte yet.
+        self.last_data_at = time.time()
         with self._lock:
             self._active = source
 
+        # Read ahead on its own thread; release on the stream's own clock on
+        # this one. Two threads because the two waits are unrelated: the
+        # proxy delivers a segment in a burst and then goes quiet for five
+        # seconds, and the FIFO must be fed steadily through that quiet.
+        chunks = queue.Queue(maxsize=PACE_QUEUE)
+
+        def _read():
+            try:
+                for chunk in source:
+                    if self._stop.is_set() or self._switch.is_set() or self._cut.is_set():
+                        return
+                    if chunk.count(b"\x47\x1f\xff") * 188 < len(chunk):
+                        self.last_data_at = time.time()
+                    while True:
+                        try:
+                            chunks.put(chunk, timeout=WRITE_POLL)
+                            break
+                        except queue.Full:
+                            if self._stop.is_set() or self._switch.is_set() or self._cut.is_set():
+                                return
+            except Exception as e:                  # noqa: BLE001
+                chunks.put(e)
+            finally:
+                chunks.put(_END)
+
+        threading.Thread(target=_read, daemon=True,
+                         name="mvread-%s-%s" % (self.slot_id, self.role)).start()
+        if self.epoch is None:
+            self.epoch = time.time()
+        pacer = _Pacer(epoch=self.epoch, clock=self._clock)
         try:
-            for chunk in source:
+            while True:
                 if self._stop.is_set():
                     return False
                 if self._switch.is_set():
                     return True
-                self.carried_source = True
-                if not self._write_all(fd, chunk):
-                    # The reader went away. Nothing this feeder does will
-                    # help; the supervisor owns restarting the encoder.
-                    self.reader_gone = True
-                    log.warning("Multi-view slot %s %s: reader closed %s",
-                                self.slot_id, self.role, self.fifo_path)
-                    return False
-        except Exception as e:
-            # A stop or a switch closes the socket under the read on purpose;
-            # that is the mechanism, not a fault, and must not be counted as
-            # a source error or logged as one.
-            if self._stop.is_set() or self._switch.is_set():
-                log.debug("Multi-view slot %s %s: %s closed for a change",
-                          self.slot_id, self.role, slug)
-            else:
-                self.source_errors += 1
-                log.warning("Multi-view slot %s %s: source %s ended (%s)",
-                            self.slot_id, self.role, slug, e)
+                if self._cut.is_set():
+                    # The watchdog cut a stalled source. The reader may still
+                    # be stuck inside a read that closing the socket did not
+                    # interrupt; it is a daemon and is simply left behind,
+                    # which is what makes the cut take effect now rather than
+                    # whenever that read returns.
+                    return True
+                try:
+                    item = chunks.get(timeout=WRITE_POLL)
+                except queue.Empty:
+                    continue
+                if item is _END:
+                    return True
+                if isinstance(item, Exception):
+                    if not (self._stop.is_set() or self._switch.is_set() or self._cut.is_set()):
+                        self.source_errors += 1
+                        log.warning("Multi-view slot %s %s: source %s ended (%s)",
+                                    self.slot_id, self.role, slug, item)
+                    return True
+                for data, release_at in pacer.feed(item):
+                    if release_at is not None:
+                        # In short steps, so a stop, a switch or a cut is
+                        # honoured within half a second of the schedule.
+                        while True:
+                            wait = release_at - time.time()
+                            if wait <= 0:
+                                break
+                            if self._switch.wait(min(wait, 0.5)):
+                                return True
+                            if self._stop.is_set():
+                                return False
+                            if self._cut.is_set():
+                                return True
+                    self.carried_source = True
+                    if not self._write_all(fd, data):
+                        # The reader went away. Nothing this feeder does will
+                        # help; the supervisor owns restarting the encoder.
+                        self.reader_gone = True
+                        log.warning("Multi-view slot %s %s: reader closed %s",
+                                    self.slot_id, self.role, self.fifo_path)
+                        return False
         finally:
+            self.pace_reanchors += pacer.reanchors
+            self.pace_late += pacer.late_reanchors
             with self._lock:
                 self._active = None
             close = getattr(source, "close", None)
@@ -696,7 +1046,6 @@ class Feeder:
                     close()
                 except Exception:
                     pass
-        return True
 
     def live_source_idle(self):
         """Seconds since a *live* source last produced. None if on filler.
@@ -709,7 +1058,9 @@ class Feeder:
             source = self._active
         if source is None or isinstance(source, _FillerSource):
             return None
-        return time.time() - self.last_write_at
+        # Read side, padding excluded: with paced writes, a stalled source
+        # keeps writing its backlog for seconds after it stops producing.
+        return time.time() - self.last_data_at
 
     def quiet_for(self):
         """Seconds since this feeder wrote a byte, whatever it was doing."""
@@ -731,7 +1082,11 @@ class Feeder:
         self.stalls += 1
         log.warning("Multi-view slot %s %s: %s has produced nothing for %.0fs,"
                     " cutting it", self.slot_id, self.role, self._current,
-                    time.time() - self.last_write_at)
+                    time.time() - self.last_data_at)
+        # The flag is what makes the cut stick. Closing the socket alone did
+        # not always interrupt the read, and the watchdog then re-cut the
+        # same source every two seconds for a minute (2026-09-23).
+        self._cut.set()
         self._close_active()
 
     def _close_active(self):
@@ -930,8 +1285,7 @@ def build_filter(slot, width, height, fps, control=None):
 def build_command(slot, primary_fifo, secondary_fifo, *, width, height, fps,
                   encoder, qp, render_node, ffmpeg="ffmpeg", control=None):
     """Full argv for one composite."""
-    args = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostdin",
-            "-fflags", "+genpts"]
+    args = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostdin"]
     if encoder == "vaapi":
         # Named explicitly, and reused by both inputs and the filter graph.
         # Letting each input create its own device leaves ffmpeg picking one
@@ -943,13 +1297,15 @@ def build_command(slot, primary_fifo, secondary_fifo, *, width, height, fps,
         if encoder == "vaapi":
             args += ["-hwaccel", "vaapi", "-hwaccel_device", "va",
                      "-hwaccel_output_format", "vaapi"]
-        # Wallclock timestamps, not the stream's own. Each input is a live
-        # feed whose internal clock restarts every time the source changes or
-        # the filler loops; replaying those values gives "DTS out of order"
-        # and corrupt-packet complaints. Arrival time is the only clock that
-        # is continuous across a switch.
-        args += ["-use_wallclock_as_timestamps", "1",
-                 "-thread_queue_size", "1024", "-f", "mpegts", "-i", fifo]
+        # The streams' own timestamps. They used to be replaced with arrival
+        # time (-use_wallclock_as_timestamps), because a feed's clock restarts
+        # whenever the source changes or the filler loops - and that starved
+        # the main input: ffmpeg read 8s of it in 30 and duplicated the rest,
+        # which is most of why the first person to watch this called it
+        # unwatchable. The feeders now restamp every packet onto one
+        # continuous, real-time timeline shared by both inputs (_Pacer), which
+        # is what the arrival clock was standing in for.
+        args += ["-thread_queue_size", "1024", "-f", "mpegts", "-i", fifo]
 
     if encoder == "vaapi":
         graph = build_filter(slot, width, height, fps, control=control)
@@ -985,6 +1341,9 @@ class Composite:
         self.feeders = SlotFeeders(slot_id, fifo_dir, base_url)
         self.feeders.primary.filler = filler
         self.feeders.secondary.filler = filler
+        # One zero for both inputs' restamped clocks, so the overlay pairs
+        # frames that belong to the same moment.
+        self.feeders.primary.epoch = self.feeders.secondary.epoch = time.time()
 
         self.proc = None
         self.started_at = None

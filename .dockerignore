@@ -30,7 +30,10 @@ tools/check_render.py
 tools/check_multiview.py
 tools/check_ffmpeg.py
 tools/check_reorder.py
+tools/check_pacing.py
 tools/live_multiview_ui.py
+tools/soak_multiview.py
+tools/multiview_api.py
 _shots/
 
 # Stale compose. The real one is the deployment's own.
