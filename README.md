@@ -25,6 +25,42 @@ an ordinary channel to Dispatcharr and to every player, and the arrangement is
 the channel's own rather than per viewer. It needs an Intel iGPU to be cheap;
 see [Multi-player](#multi-player).
 
+## TL;DR setup
+
+The short version. [Quick start](#quick-start) below has the detail behind
+each step.
+
+1. Take `docker-compose.yml` and `.env.example` from this repository, copy
+   `.env.example` to `.env`, and fill in as many of the variables as you can:
+   at least `WIREGUARD_PRIVATE_KEY`, `WIREGUARD_ADDRESSES`,
+   `DISPATCHARR_USER`, `DISPATCHARR_PASS`, and `CONSOLE_PASSWORD` (without
+   it the dashboard in step 10 is read-only).
+2. Use the published image: set `STREAMED_M3U_IMAGE=testerlight/streamed-m3u:latest`
+   in `.env`.
+3. Spin up the containers: `docker compose up -d`.
+4. Spin up Dispatcharr. The compose file starts it for you; if you already
+   run your own, use that one.
+5. In Dispatcharr's **M3U & EPG Manager**, add:
+   - an **M3U** account with the URL `http://<IP>:8787/playlist-teams.m3u`,
+     named `streamed.pk teams`
+   - an **EPG** source with the URL `http://<IP>:8787/epg.xml`, named
+     `streamed.pk teams EPG`
+
+   Use exactly those names (or whatever you set as `M3U_ACCOUNT_NAME` and
+   `EPG_SOURCE_NAME`): the sync container finds them by name.
+6. Go back to Dispatcharr's home screen, click the **M3U** and **EPG**
+   buttons at the top of the screen, and copy both links.
+7. Open Jellyfin.
+8. In **Dashboard → Live TV**, paste the M3U link as a **Tuner Device** and
+   the EPG link as a **Guide Data Provider** (XMLTV).
+9. No need to customize anything in those settings. Just add the links.
+10. Open the dashboard at `http://<IP>:8787`, sign in, and choose the
+    channels you want on your lineup.
+
+If channels time out before they start playing, set Dispatcharr's channel
+init grace period to `60` seconds ([Quick start](#quick-start), step 3). For
+a richer sports guide, see [Better guide with Teamarr](#better-guide-with-teamarr-optional).
+
 ## Requirements
 
 - Docker with Compose v2, on `linux/amd64`. The image bundles a Playwright
@@ -89,6 +125,124 @@ docker compose -f docker-compose.novpn.yml up -d
 
 The service publishes port 8787 itself. Dispatcharr URLs become
 `http://streamed-m3u:8787/playlist-teams.m3u` and `http://streamed-m3u:8787/epg.xml`.
+
+## Better guide with Teamarr (optional)
+
+The guide streamed-m3u publishes is deliberately plain: the fixture's title
+while a game is on, `No game scheduled` otherwise. For the major leagues,
+**[Teamarr](https://github.com/Pharaoh-Labs/teamarr)**
+([docs](https://pharaoh-labs.github.io/teamarr/)) builds a much richer one
+from ESPN and other providers: pregame, live and postgame blocks, "next
+game" text between games, records, venues, and team logos. It is a separate
+project and a separate container. Nothing here depends on it, and nothing
+changes unless you set it up.
+
+It fits streamed-m3u because it can run **guide-only**: it publishes one
+XMLTV schedule per team, and you point your existing channels at it. Your
+channels, numbers and streams stay exactly as they are. Teams Teamarr does
+not cover (soccer, college, feeds, racing series, event slots, Multi-Player)
+keep the streamed-m3u guide.
+
+### Set it up
+
+1. Add Teamarr to your compose file:
+   ```yaml
+   teamarr:
+     image: ghcr.io/pharaoh-labs/teamarr:latest
+     container_name: teamarr
+     restart: unless-stopped
+     ports:
+       - 9195:9195
+     volumes:
+       - ${CONFIG_DIR:-./config}/teamarr:/app/data
+     environment:
+       - TZ=America/New_York
+       - DRY_RUN=true
+   ```
+   `DRY_RUN=true` makes Teamarr log any change it would make in Dispatcharr
+   instead of making it. A guide-only setup never needs one.
+2. Run `docker compose up -d teamarr` and open `http://<IP>:9195`. Skip the
+   Dispatcharr connection if the setup asks for it; guide-only does not need
+   it. Set the **EPG timezone** in Settings.
+3. In **EPG → Team EPG → Add Team**, import the teams you want. Keep the
+   default channel ids (`PhiladelphiaEagles.nfl`). Do not reformat them to
+   match streamed-m3u's `streamed.team.*` ids: two guide sources carrying
+   the same id make it unpredictable which one a new channel gets linked to.
+4. Leave **Managed Channel**, **Event Groups** and channel numbering off.
+   Those are the features that create channels in Dispatcharr, and you would
+   end up with a second copy of every team.
+5. On the Teamarr dashboard, click **Generate**, then copy the **XMLTV URL**
+   (`http://<IP>:9195/api/v1/epg/xmltv`).
+6. In Dispatcharr's **M3U & EPG Manager**, add an **EPG** source: type XMLTV,
+   that URL, named `Teamarr`. Refresh it.
+7. Point each team's channel at its Teamarr entry: the channel's **edit**
+   (pencil) button → **EPG** → pick the Teamarr entry → save. Then, if you
+   want Teamarr's team logos, select those channels, open the bulk editor,
+   and click **Set Logos from EPG**.
+
+   > In that same bulk editor, do **not** use **Set TVG-IDs from EPG** or
+   > **Set Names from EPG**. The first replaces the `streamed.team.*` ids
+   > that the sync and `reorder_channels.py` use to recognise every channel;
+   > the second renames your channels to whatever the guide calls them.
+8. In Jellyfin, **Dashboard → Live TV → Refresh Guide Data**.
+
+Jellyfin keeps a channel's logo once it has one, so channels that already
+had a logo keep showing it after step 7. Delete the channel's image
+(**Edit Images → Primary**) and refresh the guide again. If a logo still
+comes back old, Jellyfin is reusing its cached copy of the guide: delete
+the files in Jellyfin's `cache/xmltv/` folder and refresh once more.
+
+**To undo it,** delete the `Teamarr` EPG source in Dispatcharr. Those
+channels are left with no guide, and the sync container reattaches the
+streamed-m3u guide on its next cycle (within `SYNC_INTERVAL`).
+
+### Keeping the Teamarr guide current
+
+Teamarr rebuilds its guide on its own schedule (every 15 minutes by
+default), but Dispatcharr only re-reads it when that source refreshes.
+The sync container refreshes **only** the streamed-m3u guide. You have two
+ways to keep up:
+
+**The simple way (no code).** In Dispatcharr, edit the `Teamarr` EPG source
+and set its **refresh interval**. One hour is fine for most people.
+
+**Every sync cycle.** To have the sync container re-import Teamarr along
+with its own guide, every `SYNC_INTERVAL`:
+
+1. Copy the script out of the image, next to your compose file:
+   ```sh
+   docker cp streamed-m3u-sync:/app/dispatcharr_sync.py ./dispatcharr_sync.py
+   ```
+2. In `run_cycle()`, find these two lines:
+   ```python
+       refresh_epg(source_id)
+       link_epg_data(source_id)
+   ```
+   and add this straight after them:
+   ```python
+       # Also re-import the Teamarr guide. Refresh only: never link from it.
+       try:
+           r = session.get(f"{DISPATCHARR_URL}/api/epg/sources/", timeout=10)
+           r.raise_for_status()
+           for src in r.json():
+               if src.get("name") == "Teamarr":
+                   refresh_epg(src["id"])
+       except Exception as e:
+           log.warning("Could not refresh the Teamarr guide: %s", e)
+   ```
+   Leave `link_epg_data()` alone. It only ever repairs channels with **no**
+   guide, which is why it does not undo step 7 above.
+3. Mount your copy over the image's, in the `streamed-m3u-sync` service:
+   ```yaml
+       volumes:
+         - ./dispatcharr_sync.py:/app/dispatcharr_sync.py:ro
+   ```
+4. Restart just the sync: `docker compose up -d streamed-m3u-sync`. Its log
+   now shows `EPG import triggered for source <n>` twice per cycle.
+
+A mounted copy stays exactly as you left it when the image updates, so it
+also misses any fixes to the sync. After pulling a new image, repeat steps 1
+and 2 on the new file.
 
 ## Configuration
 
