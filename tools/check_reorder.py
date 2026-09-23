@@ -92,6 +92,33 @@ only_one = chans + MULTI[:1]
 check("with only one slot present it still lands on 65",
       numbers(only_one, blocks)[-1] == 65)
 
+print("\n=== hidden rows ===")
+# Dispatcharr keeps a number on every hidden row. A plan that leaves them out
+# hands those numbers out again; this one puts them after everything visible.
+HIDDEN = [channel(2000 + k, "Hidden %d" % k, "streamed.team.hidden-%d" % k, num)
+          for k, num in enumerate([65, 67, 80, 90, 1500])]
+# A hidden team that a block names must not take a slot in that block.
+mlb_hidden = channel(3000, "Arizona Diamondbacks (hidden twin)",
+                     "streamed.team.hidden-twin", 1)
+ordered, ranges, found = r.plan_order(chans + MULTI, blocks, HIDDEN + [mlb_hidden])
+num = {c["id"]: i + 1 for i, c in enumerate(ordered)}
+visible_n = len(chans) + len(MULTI)
+check("visible numbering is unchanged by hidden rows",
+      all(num[c["id"]] == with_[c["id"]] for c in chans + MULTI))
+check("hidden rows come after everything visible",
+      all(num[c["id"]] > visible_n for c in HIDDEN + [mlb_hidden]),
+      sorted(num[c["id"]] for c in HIDDEN + [mlb_hidden]))
+check("in their existing order",
+      [c["id"] for c in sorted(HIDDEN + [mlb_hidden], key=lambda c: num[c["id"]])]
+      == [c["id"] for c in sorted(HIDDEN + [mlb_hidden], key=lambda c: c["channel_number"])])
+check("so no number is ever shared", len(set(num.values())) == len(num))
+check("and every channel is in the plan, as the assign endpoint requires",
+      len(ordered) == len(chans) + len(MULTI) + len(HIDDEN) + 1)
+check("the printout names the hidden range",
+      ("hidden", visible_n + 1, visible_n + len(HIDDEN) + 1) in ranges, ranges[-1])
+check("a hidden row is not double-counted if it also appears visible",
+      len(r.plan_order(chans, blocks, chans[:3])[0]) == len(chans))
+
 print("\n=== the example file is a dump, not a hand edit ===")
 example = json.load(open(os.path.join(HERE, "channel_order.example.json")))
 check("channel_order.example.json equals --dump-config", example == r.DEFAULT_CONFIG)

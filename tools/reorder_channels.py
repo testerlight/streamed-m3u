@@ -31,6 +31,14 @@ list of channel ids and assigns sequential numbers from `starting_number`.
 The list must contain EVERY channel; a partial list renumbers only those and
 leaves duplicates behind.
 
+That includes hidden channels. Dispatcharr's channel list omits them unless
+asked (`visibility_filter=all`), yet every hidden row keeps its number - on
+this box 1,337 of them, from the streamed-m3u lineup's exclusions. Planning
+only the visible ones would hand out numbers hidden rows still hold, and the
+duplicate would surface the day a channel is un-hidden. So hidden rows are
+fetched too and placed after everything visible, in their existing order:
+they take no number a person can see, and none is ever shared.
+
 Usage:
     python3 reorder_channels.py --dry-run             # preview, change nothing
     python3 reorder_channels.py                       # apply
@@ -179,8 +187,14 @@ def expand_blocks(blocks):
     return out
 
 
-def plan_order(chans, blocks):
+def plan_order(chans, blocks, hidden=()):
     """Decide the new order. Pure: no network, no output.
+
+    `chans` are the visible channels, which the blocks are matched against;
+    `hidden` are the rest, appended after everything visible in their
+    existing order (see the module docstring for why they must be there at
+    all). A hidden channel never claims a block slot, so hiding a team never
+    shifts the numbers of the teams around it.
 
     Returns (ordered, ranges, found) where `ordered` is every channel in its
     new position, `ranges` is [(label, first, last)] for the printout, and
@@ -214,8 +228,18 @@ def plan_order(chans, blocks):
     ordered += rest
     found.append(("other", len(rest), 0))
 
-    assert len(ordered) == len(chans), "plan size mismatch"
-    assert len({c["id"] for c in ordered}) == len(chans), "duplicate in plan"
+    visible_ids = {c["id"] for c in chans}
+    tail = [c for c in hidden if c["id"] not in visible_ids]
+    tail.sort(key=lambda c: (c.get("channel_number")
+                             if c.get("channel_number") is not None else 1e9))
+    if tail:
+        ranges.append(("hidden", len(ordered) + 1, len(ordered) + len(tail)))
+        found.append(("hidden", len(tail), 0))
+    ordered += tail
+
+    total = len(chans) + len(tail)
+    assert len(ordered) == total, "plan size mismatch"
+    assert len({c["id"] for c in ordered}) == total, "duplicate in plan"
     return ordered, ranges, found
 
 
@@ -312,12 +336,19 @@ def main():
         sys.exit(0 if do_revert(s, args.revert) else 1)
 
     chans = paged(s, "/api/channels/channels/")
-    print("Fetched %d channels" % len(chans))
+    everything = paged(s, "/api/channels/channels/", visibility_filter="all")
+    visible_ids = {c["id"] for c in chans}
+    hidden = [c for c in everything if c["id"] not in visible_ids]
+    print("Fetched %d channels (%d visible, %d hidden)"
+          % (len(everything), len(chans), len(hidden)))
 
-    ordered, ranges, found = plan_order(chans, blocks)
+    ordered, ranges, found = plan_order(chans, blocks, hidden)
     for label, present, missing in found:
         if label == "other":
             print("  %-12s %3d channels (relative order preserved)" % (label, present))
+        elif label == "hidden":
+            print("  %-12s %3d channels (after everything visible, order preserved)"
+                  % (label, present))
         else:
             print("  %-12s %3d channels%s" % (
                 label, present,
@@ -332,7 +363,7 @@ def main():
         print("\nDry run - nothing changed.")
         return
 
-    print("\nBackup: %s" % save_backup(chans))
+    print("\nBackup: %s" % save_backup(everything))
     if not apply_order(s, [c["id"] for c in ordered]):
         sys.exit("assign failed - channel numbers may be unchanged; check above")
     print("Done.")

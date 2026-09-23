@@ -72,8 +72,11 @@ Then:
    The built-in order is MLB, NFL, NFL RedZone, NFL Network, the two
    Multi-Player channels when multi-view is on, then everything else. Print it
    with `--dump-config`, edit the JSON, and pass it back with `--config` for
-   your own order. Every run also closes gaps and pulls in channels created
-   since the last one, so check the dry-run's ranges before applying.
+   your own order. Every run numbers **every** channel, hidden ones included:
+   channels hidden by the lineup keep a number in Dispatcharr, so the reorder
+   moves them after everything visible rather than letting a visible channel
+   share one. Each run also pulls in channels created since the last, so check
+   the dry-run's ranges before applying.
 6. Point Jellyfin (or your player) at Dispatcharr's M3U and XMLTV outputs.
 
 ### Without a VPN

@@ -222,6 +222,14 @@ docker compose -p ix-dispatcharr11 -f $R build streamed-m3u
 docker compose -p ix-dispatcharr11 -f $R up -d --no-deps streamed-m3u streamed-m3u-sync
 ```
 
+When the **app config** changes as well as the code (a device, a volume,
+new environment), build first and update second, so there is one outage
+rather than two: `docker compose ... build streamed-m3u streamed-m3u-sync`
+against the current rendered file, then `midclt call -j app.update`. The
+update recreates every service, and because the tag now exists it uses the
+image just built instead of building. Before running it, check nothing in
+the project's container names was started by hand (gotcha #27).
+
 Check `active_streams` in `/stream/status` first; a restart kills every
 playing channel (gotcha #21). Verify with the harness before any of this:
 
@@ -399,11 +407,15 @@ everything else from 65 on, keeping its existing relative order. With
 multi-view enabled, **Multi-Player 1 and 2 take 65-66** and everything else
 starts at 67 instead (§12b). Until those channels exist the block is inert.
 
-Every run also **compacts**: channels Dispatcharr created since the last run
-were numbered at the end (1460 and up, on this box), and any gaps left by
-deleted channels close. So a run can move more channels than the change you
-made to the order - check the dry-run's ranges, not just the block you
-touched.
+Every run numbers **every** channel, hidden ones included. The channels the
+lineup hides still exist in Dispatcharr and still hold numbers (1,337 on this
+box) - Dispatcharr's list simply omits them unless asked. The reorder fetches
+them with `visibility_filter=all` and puts them after everything visible, in
+their existing order, so no visible channel ever shares a number with a
+hidden one. Until 2026-09-23 it did not, and a run would have created 51 such
+duplicates. Channels created since the last run (numbered at the end by
+Dispatcharr) are pulled in too, so a run can move more than the block you
+touched - check the dry-run's ranges.
 
 - Idempotent and re-runnable. Every apply first writes a timestamped
   `channel_number_backup_*.json`; undo with `--revert <that-file>`.
@@ -430,7 +442,8 @@ curl -s "http://$IP:8787/teams?alias=1" | jq '.seen_count, .unseen_count'
 curl -s http://$IP:8787/playlist-teams.m3u | grep -c '#EXTINF'
 curl -s http://$IP:8787/epg.xml | head -5    # valid XML
 curl -s http://$IP:8787/teams?all=1 | jq '[.roster | to_entries[] | select(.value.in_lineup==false)] | length'
-# This box: 0 (no lineup.json => implicit-all). New install: non-majors.
+# This box: 1336 (lineup.json, policy "all" with an exclude list, since
+# 2026-09-20). New install: the non-majors. No lineup.json at all: 0.
 
 # The two NFL feeds resolve, and RedZone kept its pinned slug:
 curl -s "http://$IP:8787/teams?team=NFL%20RedZone" | jq '.slug, .roster.kind'
@@ -440,7 +453,11 @@ curl -s "http://$IP:8787/teams?team=NFL%20Network" | jq '.slug, .roster.kind'
 
 Then confirm, in order:
 
-1. Dispatcharr channel count matches the playlist's `#EXTINF` count
+1. Dispatcharr's visible streamed channels match the **lineup** members
+   (`in_lineup: true`), not the playlist's `#EXTINF` count - the playlist
+   carries every roster entry and the sync creates only what the lineup
+   allows. This box, 2026-09-23: 1459 entries, 123 lineup channels, plus 4
+   AtWill channels from the sibling project in the same Dispatcharr
 2. **Every channel has EPG data attached** (see gotcha #4 if not)
 3. The playlist shows exactly as many `group-title="Favorites"` lines as you
    have pre-warm *teams* (feeds must not appear there — gotcha #11)
@@ -774,7 +791,32 @@ policy is implicit-all and every slug reports `in_lineup: true`. + / − on
 `GET /api/channels/channels/` uses `visibility_filter=active` unless you
 pass `all`. Sync must list with `visibility_filter=all` or a − then +
 creates a second channel (new number) and leaves the original hidden.
-Retrieve-by-id still reaches a hidden row; the list does not.
+Retrieve-by-id still reaches a hidden row; the list does not. A hidden row
+keeps its channel number, so anything that renumbers must list with `all`
+too: `reorder_channels.py` does since 2026-09-23 (it plans the hidden rows
+after everything visible). Before that it planned visible rows only, and the
+"gaps" its dry-run showed at 65, 67 and 80-90 were hidden channels, not
+drift.
+
+**27. A hand-started container with a project service's name breaks
+`app.update` half-way.** The middleware's `down` removes only containers
+carrying the project's compose labels. A container started with plain
+`docker run --name atwill` (as happened on 2026-09-21 during atwill work)
+survives it, and the `up` then fails on `Conflict. The container name
+"/atwill" is already in use` - **after** everything else has been removed and
+recreated but before it is started. gluetun, Dispatcharr and the sync
+containers sit in `Created`, streamed-m3u is gone, and TrueNAS shows the app
+`DEPLOYING` indefinitely. Before any `app.update`:
+
+```bash
+docker ps -a --filter name='^(gluetun|dispatcharr|streamed-m3u|streamed-m3u-sync|atwill|atwill-sync)$' \
+  --format '{{.Names}} {{.Label "com.docker.compose.project"}}'
+```
+
+Every name must show `ix-dispatcharr11`. If one does not, move it aside first
+(`docker rename`, then stop). To recover after the fact without touching the
+stray, start the project's own services directly:
+`docker compose -p ix-dispatcharr11 -f <rendered> up -d --no-deps <services>`.
 
 ## 8. Endpoint reference
 
@@ -881,7 +923,8 @@ back. If stable numbers matter to you from day one, bring `teams.json`.
 Two fixtures composited into the one MPEG-TS stream a channel can carry: a
 primary filling the frame, an optional secondary in a miniplayer corner. The
 full plan, the measurements behind it and the phase gates are in
-`docs/internal/PENDING_multiview.md`. **Phases 0-10 are done**: a configured
+`docs/internal/PENDING_multiview.md`. **Phases 0-11 are done, and it is
+deployed dark** (commit `6d54d20`, 2026-09-23): a configured
 slot plays, survives being tuned, and can be changed while it plays. Two
 feeders fill two FIFOs, ffmpeg composites them, and the result is served as
 one MPEG-TS - with the response committed before anything resolves and the gap
@@ -889,11 +932,12 @@ padded with null packets. Corner, size and the mixer move on the running
 encoder over ZMQ; a channel change rebuilds it without breaking the stream.
 The console has a **Multi-player** section driving all of it over
 `/api/multiview`, and the numbering block is ready (§12b). What remains is
-deployment: the rebuild, the Dispatcharr-side checks, the soak, and one
-reorder once the channels exist.
+Phase 12: enable, check the Dispatcharr side, one reorder once the channels
+exist, and the soak.
 
 **It is off unless `MULTIVIEW_ENABLE=1`**, and off means nothing is seeded,
-nothing is written under `/data` and no log line is emitted. Verified by
+nothing is written under `/data`, and the only trace in the log is a
+`0 multi-view` count on the existing seeding summary line. Verified by
 diffing `/health`, the playlist, `/epg.xml` and the console HTML against a
 build from before the feature existed: identical apart from the generation
 timestamp each carries anyway.
@@ -1013,8 +1057,9 @@ ids change with it (`multi-player-N` is derived from the name), so the order
 needs `--config` with the new ids.
 
 `tools/check_reorder.py` proves the numbering offline in a second: the block
-is inert without the channels, lands on 65-66 with them, and shifts
-everything else by two and nothing else.
+is inert without the channels, lands on 65-66 with them, shifts everything
+else by two and nothing else, and puts hidden rows after everything visible
+so no number is ever shared (gotcha #26).
 
 ### 12c. Pitfalls
 
