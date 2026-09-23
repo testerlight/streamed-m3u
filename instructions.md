@@ -68,6 +68,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
 | `tools/reorder_channels.py` | Channel numbering. `--dump-config` prints the built-in order as editable JSON. |
 | `tools/channel_order.example.json` | Generated: exactly `reorder_channels.py --dump-config`. Regenerate it, do not edit it; `check_reorder.py` fails if it drifts. |
+| `tools/check_pacing.py` | Does a composite play at real speed when its inputs arrive in production-shaped bursts? Frame-numbered picture, read back per output frame. `MODE=smooth`/`filler`, `SECONDARY=none`. About a minute; run it after any change to the feeders or the ffmpeg argv. #34-#38. |
 | `tools/check_reorder.py` | Offline proof of the numbering. Pure planner, synthetic channel list, no Dispatcharr. §12b. |
 | `tools/soak_multiview.py` | Run on the **host**. Plays a Multi-Player channel through Dispatcharr's proxy (as Jellyfin does), optionally with an ordinary channel alongside and every control stepped, and reports gaps, Dispatcharr's unhealthy/switch counts, encoder exits, CPU and GPU. No Dispatcharr login. |
 | `tools/multiview_api.py` | Console-API helper piped into the running container (`docker exec -i streamed-m3u python - get` / `put '<json>'` / `stop`), so the console password never leaves it. Used by the soak. |
@@ -1064,10 +1065,15 @@ In order, when a player tunes a configured slot:
    clip; after that, never (#20). A per-feeder watchdog cuts a source that
    goes quiet for `SOURCE_STALL_TIMEOUT` (15s), because one silent input
    freezes the whole picture (#17).
+   Each feeder **reads ahead on its own thread and writes through a
+   `_Pacer`**, which releases the stream at the speed its own PCR says,
+   rewrites every PCR, PTS and DTS onto one real-time timeline shared by
+   both inputs, and renumbers continuity counters so segment joins, filler
+   loops and reconnects look like one stream (#34-#37).
 4. **ffmpeg composites.** VAAPI decode, software `scale` / `overlay` /
    `volume` / `amix` (the only filters that obey live commands, #2),
-   `h264_vaapi` at CQP (#1), 1080p60, MPEG-TS on stdout.
-   `-use_wallclock_as_timestamps 1` on both inputs (#14).
+   `h264_vaapi` at CQP (#1), 1080p60, MPEG-TS on stdout. It reads the
+   streams' own timestamps, which the feeders have made continuous (#14).
 5. **Changes arrive through `PUT /api/multiview/<n>`**, are merged into the
    stored slot (#24), and then either go to the running encoder over ZMQ -
    corner, size and mix, with no break in the picture - or, for a channel
@@ -1082,7 +1088,12 @@ In order, when a player tunes a configured slot:
 Measured on this box: first picture **1.7-2.9s** with both sides warm, 13-27s
 cold, ~50s worst case; about **1.4 cores** at live pace for one 1080p60
 composite; output **0.5-1.3 Mbit/s** at `qp=23` depending on how much the
-pictures move. Through Dispatcharr in production (2026-09-23, 12 minutes,
+pictures move. After the pacing fix (2026-09-23, production, NFL Network +
+Tennis Channel): exactly **1.0s of video per wall-clock second**, a 0.1s
+swing against the real clock, **every frame of the main picture a new
+one**, and the container's CPU a steady ~1.1 cores (±0.2) where it had
+swung 0-1.8 in a five-second saw-tooth. Earlier, through Dispatcharr in
+production (2026-09-23, 12 minutes,
 every control exercised, an ordinary channel playing alongside): first byte
 at the player **6-10s** with both sides warm, **~2.5 Mbit/s** out, the
 container at 0.68 core mean and 1.86 peak (Chromium pre-warm and the other
@@ -1195,10 +1206,16 @@ whole cold extraction before its reader appears. Anything that gives up on a
 timer while waiting for a reader will leave that input unfed for the life of
 the composite.
 
-**14. `-use_wallclock_as_timestamps 1` is load-bearing on both inputs.** Every
-source switch and every filler loop restarts that stream's own clock; replay
-those values and the demuxer reports `DTS out of order` and corrupt packets.
-Arrival time is the only clock that stays continuous across a switch.
+**14. Do not stamp the inputs by arrival (`-use_wallclock_as_timestamps`).**
+This pitfall used to say the opposite, and that advice made the composite
+unwatchable (2026-09-23). The problem it solved is real - every source
+switch, reconnect and filler loop restarts that stream's own clock, and
+replaying those values gives `DTS out of order` - but arrival stamping
+caused two worse ones: it turned burst delivery into a slideshow (#34), and
+it starved the main input outright (#35). The feeders now restamp every
+packet onto one continuous real-time timeline instead (`_Pacer`), which is
+the continuity arrival time was standing in for, and ffmpeg reads the
+streams' own clocks.
 
 **15. One composite at a time, and never one without an audience.**
 `MULTIVIEW_MAX_ACTIVE` is enforced by refusing the second, not by queueing it,
@@ -1371,3 +1388,72 @@ same upstream stream, so a hiccup there lands on both and looks exactly like
 the composite starving its neighbour. The first production run made that
 mistake, and its one gap on the ordinary channel cannot be attributed
 either way.
+
+**34. A team stream arrives a segment at a time, so the feeders pace it.**
+The proxy hands over a whole HLS segment - about five seconds of video,
+~4 MB - in 10-20 ms, then nothing but keepalive padding for 4.5-5s, every
+time (measured). A composite fed that directly gets five seconds of video
+as one instant: the first person to watch it called it unwatchable, and
+the container's CPU swung 0-180% of a core in a five-second rhythm. Each
+feeder now reads ahead on its own thread and releases on the stream's PCR.
+Nothing in Phases 0-11 caught this, because the harnesses' synthetic
+sources arrive smoothly and the live checks measured bytes, not motion.
+`tools/check_pacing.py` reproduces the real delivery and reads a frame
+number back out of every output frame: 2% of frames advanced normally
+before, 100% after.
+
+**35. Arrival stamping starves the main input, whatever the feeders do.**
+With `-use_wallclock_as_timestamps` on both inputs, ffmpeg read 8 seconds
+of the main input in 30 while reading the miniplayer in full, and its
+`fps` stage duplicated 942 frames to fill the gap - reproduced with the
+bare argv and plain FIFO writers, no feeder code at all. Remove the flag
+and both inputs are read at full speed. This is the other half of what was
+seen as jitter, and why #14 was reversed rather than worked around.
+
+**36. Renumber continuity counters; nothing upstream is lossy.** Every HLS
+segment, filler loop and reconnect restarts its counters. ffmpeg flags the
+first packet after each jump as corrupt, and the h264 decoder re-initialises
+and loses frames - production logged a "corrupt input packet" at every
+segment boundary. The bytes come over TCP from our own proxy, so the
+pacer renumbers per stream for the input's life and the fault disappears.
+
+**37. A new timeline continues the last one, behind schedule or not.** When
+a filler loop restarts or a source reconnects, the pacer starts the new
+timeline straight after the previous one ended. Two earlier versions froze
+the picture: starting from "now + cushion" left a hole at every two-second
+filler loop, and starting from "now if behind" turned the startup backlog -
+ffmpeg stops reading one input for ~5s while it opens the other - into a
+four-second timestamp jump at every join. Only an outage longer than
+`PACE_MAX_BEHIND` (10s) starts a fresh schedule.
+
+**38. Judge motion on the main picture, never on whole frames.** The first
+production measurement of the jitter counted 93% of frames as new pictures
+and looked healthy - because the *miniplayer* was moving. The main picture,
+in a region clear of the miniplayer, was 67% new with freezes of two
+seconds. Measure a crop of the main picture, or better, a picture that
+numbers its own frames.
+
+**39. Stop holds the slot; a cleared slot ends its stream.** A playing
+viewer's stream re-attaches when its composite ends (#21) - which, until
+2026-09-23, included a composite ended by the console's Stop, so Stop was
+undone within a second, and clearing a slot rebuilt an encoder with no
+channels in it. Stop now sets the same hold Disconnect uses for a team
+stream (`STREAM_DISCONNECT_HOLD`, 90s): viewers are dropped, reconnects are
+refused, and any change to the slot from the console lifts the hold.
+
+**40. Backpressure is not a stall.** When nobody reads a composite's output -
+the viewer has left and the reaper has not yet stopped it - ffmpeg stops
+reading its inputs, the feeders' queues fill, and every idle clock stops.
+The watchdogs took that for dead sources and "cut" them every two seconds
+for a minute. A reader held back by a full queue now counts as fed, and a
+writer blocked on a full FIFO is not "quiet": in both cases the encoder is
+the one not reading, and cutting an input cannot help. The encoder's output
+watchdog and the idle reaper own that case. `check_pacing.py MODE=noreader`
+- 6 false cuts before, 0 after.
+
+**41. A channel change stops the composite; it does not start another.**
+The viewer's stream re-attaches within a second and builds the new one
+from the stored slot, or ends if the slot was cleared (#39). `Manager.apply`
+used to start one too, which raced the viewer when there was one and, when
+there was not, built an encoder nobody would read - clearing an idle slot
+started one with no channels in it.

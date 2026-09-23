@@ -215,8 +215,21 @@ def reader():
         captured.append((time.time() - t_start, chunk))
 
 
-threading.Thread(target=reader, daemon=True).start()
+# MODE=noreader: nobody reads the output - an idle composite waiting for its
+# reaper. Backpressure then fills every queue; that must not be taken for a
+# stalled source (it was, every two seconds, until 2026-09-23).
+NOREADER = os.environ.get("MODE") == "noreader"
+if not NOREADER:
+    threading.Thread(target=reader, daemon=True).start()
 time.sleep(RUN)
+if NOREADER:
+    st = comp.feeders.stats()
+    cuts = st["primary"]["stalls"] + st["secondary"]["stalls"]
+    check("an unread composite is not mistaken for stalled sources", cuts == 0,
+          "%d cuts" % cuts)
+    comp.stop()
+    print("\n%s" % ("PACING OK" if not fails else "PACING FAILED: " + "; ".join(fails)))
+    sys.exit(1 if fails else 0)
 stop.set()
 comp.stop()
 time.sleep(1)

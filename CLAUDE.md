@@ -7,7 +7,7 @@ Two documents, no overlap between them:
   `python settings.py --markdown`; regenerate it rather than editing by hand.
 - `instructions.md` is the maintainer handover: how the system works
   internally, the TrueNAS SCALE deployment specifics, the settings and auth
-  model, and a numbered list of gotchas (currently 28, plus 33 multi-view
+  model, and a numbered list of gotchas (currently 28, plus 41 multi-view
   pitfalls in §12) covering real bugs
   already hit here. **Read it before changing `app.py`.** Skipping it risks
   redoing debugging that has already been done.

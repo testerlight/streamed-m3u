@@ -549,6 +549,7 @@ class Feeder:
         # excluded. Distinct from last_write_at now that writes are paced: a
         # source that has stalled keeps "writing" its backlog for a while.
         self.last_data_at = 0.0
+        self._write_blocked_since = 0.0
         # The zero of this input's timeline. A composite gives both of its
         # feeders the same one, so their restamped clocks line up.
         self.epoch = None
@@ -978,6 +979,11 @@ class Feeder:
                         except queue.Full:
                             if self._stop.is_set() or self._switch.is_set() or self._cut.is_set():
                                 return
+                            # Held back, not starved: the queue is full because
+                            # the encoder is not reading. Without this the
+                            # watchdog took backpressure for a dead source and
+                            # "cut" it every two seconds (2026-09-23).
+                            self.last_data_at = time.time()
             except Exception as e:                  # noqa: BLE001
                 chunks.put(e)
             finally:
@@ -1063,8 +1069,15 @@ class Feeder:
         return time.time() - self.last_data_at
 
     def quiet_for(self):
-        """Seconds since this feeder wrote a byte, whatever it was doing."""
-        if not self.last_write_at:
+        """Seconds since this feeder wrote a byte, whatever it was doing.
+
+        None while it is blocked writing: then the encoder is the one not
+        reading, and cutting this input cannot help - an idle composite
+        waiting for its reaper, or ffmpeg held up by the *other* input, whose
+        own watchdog deals with it. The encoder's output watchdog owns a
+        frozen encoder.
+        """
+        if not self.last_write_at or self._write_blocked_since:
             return None
         return time.time() - self.last_write_at
 
@@ -1116,7 +1129,12 @@ class Feeder:
             except (OSError, ValueError):
                 return False
             if not writable:
+                # The encoder is not reading this input. Not this feeder's
+                # stall - see quiet_for().
+                if not self._write_blocked_since:
+                    self._write_blocked_since = time.time()
                 continue
+            self._write_blocked_since = 0.0
             try:
                 written = os.write(fd, view)
             except BlockingIOError:
@@ -1783,10 +1801,15 @@ class Manager:
         changed = comp.apply(slot)
         changed["running"] = True
         if changed.get("restart"):
+            # Stop only. A viewer's stream re-attaches within a second and
+            # builds the new composite from the stored slot - and ends
+            # instead if the slot was cleared. Starting one here as well
+            # was redundant with a viewer and wrong without one: clearing
+            # an idle slot started an encoder with no channels and nobody
+            # to read it (2026-09-23).
             log.info("Multi-view slot %s: %s changed, rebuilding the encoder",
                      slot_id, " and ".join(changed["sources"]))
             self.stop(slot_id)
-            self.start(slot_id, slot, max_active=max_active)
         return changed
 
     def stop(self, slot_id):

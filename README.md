@@ -143,7 +143,10 @@ Three things are worth knowing before using it:
   afterwards is quick: about eight seconds, against half a minute cold.
 
 The corner, the size and the mixer are applied to a picture that is already
-playing. Changing either channel is not — see Limitations.
+playing. Changing either channel is not — see Limitations. **Stop**, in the
+status strip, disconnects anyone watching and refuses reconnects for 90
+seconds (`STREAM_DISCONNECT_HOLD`), or until you change the slot, exactly as
+Disconnect does for an ordinary stream.
 
 Without `CONSOLE_PASSWORD` the section is shown but every control is inert,
 the same as the rest of the console.

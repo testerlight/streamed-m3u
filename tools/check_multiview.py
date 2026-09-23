@@ -670,6 +670,19 @@ check("the old teardown removed only its own",
 check("and the new encoder survived it", compB.alive(), compB.exit_code)
 mgrR.stop_all()
 
+section("a channel change stops, the viewer rebuilds")
+# Manager.apply used to stop *and start* on a channel change. With a viewer
+# that raced its re-attach; without one it built an encoder nobody would read
+# - clearing an idle slot started one with no channels at all (2026-09-23).
+mgrC = composite.Manager(**dict(MVDEFAULTS, idle_timeout=60))
+compC, _errC = mgrC.start("1", idle_slot, max_active=1)
+changedC = mgrC.apply("1", dict(idle_slot, primary=PRIMARY), max_active=1)
+check("a channel change on a running composite asks for a rebuild",
+      changedC.get("restart") is True, changedC)
+check("and leaves nothing running for the viewer to collide with",
+      mgrC.get("1") is None, mgrC.get("1"))
+mgrC.stop_all()
+
 # ─── Multi-view, Phase 6: startup padding ─────────────────────────────────────
 # A composite cannot start inside a tuner's patience, so the route commits the
 # response first and pads the gap with null packets. These checks go through
