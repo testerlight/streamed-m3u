@@ -27,6 +27,17 @@
     rosterLimit: ROSTER_WINDOW,
     lineup: null,
     lineupBusy: false,
+    mv: null,               // last /api/multiview payload
+    mvSlot: "",             // which slot tab is open
+    mvPicker: "",           // "primary" | "secondary" | "" when no list is open
+    mvQuery: "",
+    mvScope: "playing",     // same two scopes the roster offers
+    mvBusy: false,          // a write is in flight
+    mvQueued: null,         // what arrived while it was
+    mvWroteAt: 0,           // when the last write landed
+    mvFocusSearch: false,   // the picker was just opened by a click
+    mvNote: "",
+    mvError: "",
     configQuery: "",
     configCustomOnly: false,
     teams: null,
@@ -366,6 +377,534 @@
           again.disabled = false;
           again.textContent = "Disconnect";
         }
+      });
+  }
+
+  /* ── Multi-player ─────────────────────────────────────────────────────── */
+  /* The section is rendered server-side only when the feature is on, so every
+   * function here begins by asking whether the panel exists and does nothing
+   * when it does not.
+   *
+   * Writes are optimistic for corner, size and the mixer: the local copy moves
+   * and re-renders at once, then the request goes. Waiting for the poll would
+   * put up to five seconds between a click and the miniplayer moving, and
+   * those three are exactly the changes the encoder applies live. A channel
+   * change is not optimistic — the server decides whether the slot is
+   * playable, and it answers immediately because the warm it kicks off runs
+   * on its own thread.
+   */
+
+  var MV_OPTIONS = 60;
+
+  function mvOn() { return !!$("mv-panel"); }
+
+  function mvSlot() {
+    var slots = (state.mv && state.mv.slots) || [];
+    for (var i = 0; i < slots.length; i++) {
+      if (slots[i].id === state.mvSlot) { return slots[i]; }
+    }
+    return slots[0] || null;
+  }
+
+  /* A poll must never move a control out from under the pointer or wipe a
+   * half-typed search. Same discipline the configuration panel uses. */
+  function mvHolding() {
+    var a = document.activeElement;
+    if (!a || typeof a.closest !== "function") { return false; }
+    if (!a.closest("#multiview")) { return false; }
+    return a.tagName === "INPUT" || a.tagName === "TEXTAREA";
+  }
+
+  /* `issuedAt` is when the poll was sent. A poll that was already in flight
+   * when a write landed carries the state from before it, and applying it
+   * would put the old value back on screen until the next tick - a click
+   * that visibly undoes itself. Older than the last write, so discard it. */
+  function applyMultiview(d, issuedAt) {
+    if (issuedAt && state.mvWroteAt && issuedAt < state.mvWroteAt) { return; }
+    state.mv = d;
+    if (!state.mvSlot && d && (d.slots || []).length) { state.mvSlot = d.slots[0].id; }
+    if (!mvOn() || state.mvBusy || mvHolding()) { return; }
+    renderMultiview();
+  }
+
+  function mvGeometry() {
+    var g = (state.mv && state.mv.geometry) || {};
+    return {
+      width: g.width || 1920,
+      height: g.height || 1080,
+      margin: g.margin === undefined ? 32 : g.margin,
+      fractions: g.fractions || { small: 0.22, medium: 0.30, large: 0.40 }
+    };
+  }
+
+  function mvSideBadges(side) {
+    var out = [];
+    if (!side.slug) { return out; }
+    out.push(side.warm ? '<span class="badge ok">Warm</span>'
+                       : '<span class="badge default">Cold</span>');
+    if (side.silent) { out.push('<span class="badge warn">No audio</span>'); }
+    if (!side.playing) { out.push('<span class="badge default">No source listed</span>'); }
+    return out;
+  }
+
+  /* The stage is a diagram of the composite, drawn from the encoder's own
+   * geometry rather than from a second set of numbers kept in step by hand. */
+  function mvStage(slot) {
+    var g = mvGeometry();
+    var ratio = g.width + " / " + g.height;
+    var pri = slot.primary || {};
+    var sec = slot.secondary || {};
+    var frac = g.fractions[slot.size] || g.fractions.medium || 0.3;
+    var mx = (g.margin / g.width) * 100;
+    var my = (g.margin / g.height) * 100;
+    var corner = slot.corner || "br";
+    var pos = (corner.charAt(0) === "t" ? "top:" : "bottom:") + my.toFixed(3) + "%;" +
+              (corner.charAt(1) === "l" ? "left:" : "right:") + mx.toFixed(3) + "%";
+
+    var mini = "";
+    if (sec.slug) {
+      mini = '<div class="mv-mini" style="aspect-ratio:' + ratio +
+        ";width:" + (frac * 100).toFixed(2) + "%;" + pos + '">' +
+        '<div class="mv-face">' +
+          '<span class="mv-role">Miniplayer</span>' +
+          '<span class="mv-name">' + esc(sec.name) + "</span>" +
+        "</div></div>";
+    }
+
+    var face = pri.slug
+      ? '<div class="mv-face">' +
+          '<span class="mv-role">Main picture</span>' +
+          '<span class="mv-name">' + esc(pri.name) + "</span>" +
+          (pri.match ? '<span class="mv-sub">' + esc(pri.match) + "</span>" : "") +
+        "</div>"
+      : '<div class="mv-face">' +
+          '<span class="mv-role">Nothing chosen</span>' +
+          '<span class="mv-sub">Pick a main picture. Until then this channel refuses to play, ' +
+          'exactly like a team with no fixture on.</span>' +
+        "</div>";
+
+    return '<div class="mv-stage' + (pri.slug ? "" : " is-idle") +
+      '" style="aspect-ratio:' + ratio + '">' + face + mini + "</div>" +
+      '<p class="mv-stage-note">' + esc(slot.name) + " · " +
+      '<code class="inline">' + esc(slot.url) + "</code> · " +
+      g.width + "x" + g.height + ', layout and sound are the channel\u2019s, ' +
+      "so every viewer sees this arrangement.</p>";
+  }
+
+  function mvSide(slot, role) {
+    var side = slot[role] || {};
+    var secondary = role === "secondary";
+    var locked = secondary && !(slot.primary || {}).slug;
+    var can = editing() && !state.mvBusy;
+    var open = state.mvPicker === role;
+    var meta = [];
+
+    if (side.slug) {
+      if (side.match) { meta.push("<span>" + esc(side.match) + "</span>"); }
+      meta = meta.concat(mvSideBadges(side));
+      if (side.status) { meta.push('<span class="mono">' + esc(side.status) + "</span>"); }
+    } else if (locked) {
+      meta.push("<span>Choose a main picture first — a miniplayer has nothing to sit on without one.</span>");
+    } else if (secondary) {
+      meta.push("<span>Optional. Leave it empty to run the main picture alone.</span>");
+    }
+
+    return '<div class="mv-side' + (locked ? " is-locked" : "") + '">' +
+      '<div class="mv-side-head">' +
+        '<span class="mv-side-role">' + (secondary ? "Miniplayer" : "Main picture") + "</span>" +
+        '<span class="mv-side-name' + (side.slug ? "" : " is-empty") + '">' +
+          esc(side.slug ? side.name : "Not set") + "</span>" +
+        '<span class="mv-side-actions">' +
+          '<button type="button" class="btn" data-mv-open="' + role + '"' +
+            (can && !locked ? "" : " disabled") + ">" +
+            (open ? "Close" : (side.slug ? "Change" : "Choose")) + "</button>" +
+          (side.slug
+            ? '<button type="button" class="btn" data-mv-clear="' + role + '"' +
+              (can ? "" : " disabled") + ">Clear</button>"
+            : "") +
+        "</span>" +
+      "</div>" +
+      (meta.length ? '<div class="mv-side-meta">' + meta.join("") + "</div>" : "") +
+      (open ? mvPicker(role) : "") +
+      "</div>";
+  }
+
+  function mvPicker(role) {
+    return '<div class="mv-picker">' +
+      '<div class="toolbar">' +
+        '<input type="search" class="search" id="mv-search" data-mv-search="1" ' +
+          'placeholder="Search channels" value="" autocomplete="off">' +
+        '<button type="button" class="chip" data-mv-scope="playing" aria-pressed="' +
+          (state.mvScope === "playing" ? "true" : "false") + '">Resolvable now</button>' +
+        '<button type="button" class="chip" data-mv-scope="all" aria-pressed="' +
+          (state.mvScope === "all" ? "true" : "false") + '">Full roster</button>' +
+      "</div>" +
+      '<div class="mv-picker-list" id="mv-picker-list" data-mv-role="' + role + '">' +
+        mvOptions(role) +
+      "</div></div>";
+  }
+
+  /* Candidates come from the same two sources the roster offers, so a channel
+   * findable there is findable here and under the same name. */
+  function mvCandidates() {
+    var entries = [];
+    if (state.mvScope === "all") {
+      var all = (state.rosterAll && state.rosterAll.roster) || null;
+      if (!all) { return null; }
+      entries = Object.keys(all).map(function (slug) {
+        var v = all[slug] || {};
+        return { slug: slug, name: v.name || slug, match: "",
+                 sport: v.sport || "", kind: v.kind || "team" };
+      });
+    } else {
+      if (!state.teams) { return null; }
+      entries = (state.teams.teams || []).map(function (t) {
+        return { slug: t.slug, name: t.team, match: t.match,
+                 sport: t.sport || "", kind: t.kind || "team" };
+      });
+    }
+    return entries;
+  }
+
+  function mvOptions(role) {
+    var slot = mvSlot();
+    if (!slot) { return ""; }
+    var other = role === "primary" ? (slot.secondary || {}).slug : (slot.primary || {}).slug;
+    var entries = mvCandidates();
+    if (entries === null) {
+      return '<p class="mv-picker-empty">Loading channels.</p>';
+    }
+    var q = state.mvQuery.toLowerCase();
+    entries = entries.filter(function (e) {
+      // The same channel cannot be shown against itself; the server drops it
+      // anyway, and offering it would look like a bug rather than a rule.
+      if (e.slug === other) { return false; }
+      // Nor can a multi-player channel feed one: that is a composite of a
+      // composite, and the server refuses it.
+      if (e.kind === "multi") { return false; }
+      if (!q) { return true; }
+      return [e.name, e.match, e.slug, e.sport].join(" ").toLowerCase().indexOf(q) >= 0;
+    });
+    entries.sort(function (a, b) { return String(a.name).localeCompare(b.name); });
+    if (!entries.length) {
+      return '<p class="mv-picker-empty">No channel matches that.</p>';
+    }
+    var more = entries.length - MV_OPTIONS;
+    return entries.slice(0, MV_OPTIONS).map(function (e) {
+      return '<button type="button" class="mv-option" data-mv-pick="' +
+        esc(role + ":" + e.slug) + '">' + esc(e.name) +
+        (e.match ? '<span class="mv-option-sub">' + esc(e.match) + "</span>"
+                 : '<span class="mv-option-sub mono">' + esc(e.slug) + "</span>") +
+        "</button>";
+    }).join("") + (more > 0
+      ? '<p class="mv-picker-empty">' + num(more) + " more. Narrow the search.</p>"
+      : "");
+  }
+
+  function mvCornerGrid(slot) {
+    var can = editing() && !state.mvBusy;
+    var order = ["tl", "tr", "bl", "br"];
+    var place = { tl: "top:0;left:0", tr: "top:0;right:0",
+                  bl: "bottom:0;left:0", br: "bottom:0;right:0" };
+    var label = { tl: "Top left", tr: "Top right", bl: "Bottom left", br: "Bottom right" };
+    return '<div class="mv-corner-grid">' + order.map(function (k) {
+      return '<button type="button" class="mv-corner" data-mv-corner="' + k +
+        '" aria-pressed="' + (slot.corner === k ? "true" : "false") +
+        '" aria-label="' + label[k] + '" title="' + label[k] + '"' +
+        (can ? "" : " disabled") + ">" +
+        '<span class="mv-corner-box"><span class="mv-corner-dot" style="' +
+          place[k] + '"></span></span></button>';
+    }).join("") + "</div>";
+  }
+
+  function mvSizeChips(slot) {
+    var can = editing() && !state.mvBusy;
+    var sizes = (state.mv && state.mv.sizes) || ["small", "medium", "large"];
+    return sizes.map(function (k) {
+      return '<button type="button" class="chip" data-mv-size="' + esc(k) +
+        '" aria-pressed="' + (slot.size === k ? "true" : "false") + '"' +
+        (can ? "" : " disabled") + ">" +
+        esc(k.charAt(0).toUpperCase() + k.slice(1)) + "</button>";
+    }).join("");
+  }
+
+  function mvMixerRow(slot, role) {
+    var side = slot[role] || {};
+    var gain = ((slot.audio || {})[role]);
+    if (gain === undefined || gain === null) { gain = role === "primary" ? 100 : 0; }
+    var can = editing() && !state.mvBusy && !!side.slug;
+    return '<div class="mv-mixer-row">' +
+      '<span class="mv-mixer-name">' +
+        esc(side.slug ? side.name : (role === "primary" ? "Main picture" : "Miniplayer")) +
+      "</span>" +
+      '<input type="range" class="mv-slider" min="0" max="100" step="5" ' +
+        'data-mv-gain="' + role + '" value="' + gain + '" ' +
+        'style="--fill:' + gain + '%" aria-label="' +
+        (role === "primary" ? "Main picture volume" : "Miniplayer volume") + '"' +
+        (can ? "" : " disabled") + ">" +
+      '<span class="mv-mixer-value" data-mv-gain-value="' + role + '">' +
+        (gain === 0 ? "Muted" : gain + "%") + "</span>" +
+      "</div>";
+  }
+
+  function mvStatus(slot) {
+    var run = slot.running;
+    var facts;
+    if (run) {
+      facts = [
+        "<span><b>" + esc(run.mbit_per_s === null ? "n/a" : run.mbit_per_s + " Mbit/s") + "</b> out</span>",
+        "<span><b>" + num(run.viewers) + "</b> " + (run.viewers === 1 ? "viewer" : "viewers") + "</span>",
+        "<span>up <b>" + dur(run.uptime_seconds) + "</b></span>",
+        "<span>" + esc(run.encoder || "") + "</span>",
+        "<span>picture after <b>" +
+          (run.startup_seconds === null ? "n/a" : run.startup_seconds + "s") + "</b></span>"
+      ];
+      if (run.commands_failed) {
+        facts.push('<span class="badge warn">' + num(run.commands_failed) + " live changes missed</span>");
+      }
+    } else if (slot.configured) {
+      facts = ["<span>Ready. The encoder starts when a player tunes the channel.</span>"];
+    } else {
+      facts = ["<span>Idle. This channel refuses to play until a main picture is chosen.</span>"];
+    }
+    return '<div class="mv-status">' +
+      '<span class="status-label"><span class="dot ' +
+        (run ? "live" : (slot.configured ? "ok" : "")) + '"></span>' +
+        (run ? "On air" : (slot.configured ? "Configured" : "Not configured")) + "</span>" +
+      '<div class="mv-facts">' + facts.join("") + "</div>" +
+      (run ? '<span class="mv-status-actions">' +
+        '<button type="button" class="btn btn-danger" data-mv-stop="1"' +
+        (state.mvBusy ? " disabled" : "") + ">Stop</button></span>" : "") +
+      "</div>";
+  }
+
+  function renderMvTabs() {
+    var host = $("mv-tabs");
+    if (!host || !state.mv) { return; }
+    var slots = state.mv.slots || [];
+    host.innerHTML = slots.map(function (s) {
+      return '<button type="button" class="chip" data-mv-tab="' + esc(s.id) +
+        '" aria-pressed="' + (s.id === state.mvSlot ? "true" : "false") + '">' +
+        esc(s.name) + (s.running ? " · on air" : "") + "</button>";
+    }).join("") +
+      '<span class="toolbar-count">' +
+      num(state.mv.running || 0) + " of " + num(state.mv.max_active || 1) +
+      " encoder" + ((state.mv.max_active || 1) === 1 ? "" : "s") + " in use</span>";
+  }
+
+  function renderMultiview() {
+    var host = $("mv-panel");
+    if (!host) { return; }
+    var d = state.mv;
+    if (!d || !d.enabled) {
+      host.innerHTML = emptyState("Multi-player is off",
+        "Set MULTIVIEW_ENABLE=1 and restart to use it.");
+      return;
+    }
+    var slot = mvSlot();
+    if (!slot) {
+      host.innerHTML = emptyState("No slots",
+        "MULTIVIEW_SLOTS is zero, so there is no channel to configure.");
+      return;
+    }
+    state.mvSlot = slot.id;
+    renderMvTabs();
+
+    var notes = "";
+    if (state.mvError) {
+      notes = '<p class="mv-note is-error">' + esc(state.mvError) + "</p>";
+    } else if (state.config && !editing()) {
+      // Only once the configuration has arrived: until then "not editable"
+      // means "not known yet", and guessing gets it wrong in the one second
+      // after a reload - it would tell a signed-in operator to set a
+      // password they have already set.
+      notes = '<p class="mv-note">' +
+        (state.config.auth && state.config.auth.enabled
+          ? "Read-only until you sign in."
+          : "Read-only. Set CONSOLE_PASSWORD to change what is showing.") + "</p>";
+    } else if (state.mvNote) {
+      notes = '<p class="mv-note">' + esc(state.mvNote) + "</p>";
+    }
+
+    host.innerHTML =
+      '<div class="mv-grid">' +
+        "<div>" + mvStage(slot) + mvStatus(slot) + notes + "</div>" +
+        "<div>" +
+          mvSide(slot, "primary") +
+          mvSide(slot, "secondary") +
+          '<div class="mv-controls">' +
+            "<div>" +
+              '<div class="mv-control">' +
+                '<div class="mv-control-label">Miniplayer corner</div>' +
+                mvCornerGrid(slot) +
+              "</div>" +
+            "</div>" +
+            "<div>" +
+              '<div class="mv-control">' +
+                '<div class="mv-control-label">Miniplayer size</div>' +
+                '<div class="toolbar" style="margin-bottom:0">' + mvSizeChips(slot) + "</div>" +
+              "</div>" +
+              '<div class="mv-control">' +
+                '<div class="mv-control-label">Sound</div>' +
+                mvMixerRow(slot, "primary") +
+                mvMixerRow(slot, "secondary") +
+              "</div>" +
+            "</div>" +
+          "</div>" +
+        "</div>" +
+      "</div>";
+
+    if (state.mvPicker) {
+      var box = $("mv-search");
+      if (box) {
+        box.value = state.mvQuery;
+        if (state.mvFocusSearch) {
+          state.mvFocusSearch = false;
+          box.focus();
+        }
+      }
+    }
+  }
+
+  /* Typing must not re-render the panel around the input it is typed into,
+   * so the search only replaces the list. */
+  function renderMvList() {
+    var list = $("mv-picker-list");
+    if (!list) { return; }
+    list.innerHTML = mvOptions(list.getAttribute("data-mv-role") || "primary");
+  }
+
+  function mvGainPreview(el) {
+    var role = el.getAttribute("data-mv-gain");
+    var value = parseInt(el.value, 10);
+    el.style.setProperty("--fill", value + "%");
+    var label = document.querySelector('[data-mv-gain-value="' + role + '"]');
+    if (label) { label.textContent = value === 0 ? "Muted" : value + "%"; }
+  }
+
+  function mvChangeNote(changed) {
+    if (!changed) { return ""; }
+    if (changed.rebuilt) {
+      return "Channel changed. The picture is rebuilt, so anyone watching re-buffers for a few seconds.";
+    }
+    if ((changed.warming || []).length) {
+      return "Resolving " + changed.warming.join(" and ") + " now, so the first tune is quick.";
+    }
+    if (changed.layout || changed.audio) {
+      return changed.running
+        ? "Applied to the picture that is already playing."
+        : "Stored. It takes effect when the channel is tuned.";
+    }
+    return "";
+  }
+
+  /* Re-rendering replaces the control that is being used, so a render that
+   * would land on a focused input waits for the next poll instead. The value
+   * on screen is already right: mvGainPreview keeps the slider and its label
+   * in step while it travels. */
+  function mvRefresh() {
+    if (mvHolding()) { return; }
+    renderMultiview();
+  }
+
+  function mvMerge(into, extra) {
+    Object.keys(extra).forEach(function (k) {
+      if (k === "audio") {
+        into.audio = into.audio || {};
+        Object.keys(extra.audio).forEach(function (g) { into.audio[g] = extra.audio[g]; });
+      } else {
+        into[k] = extra[k];
+      }
+    });
+    return into;
+  }
+
+  function mvApplyLocal(slot, changes) {
+    Object.keys(changes).forEach(function (k) {
+      if (k === "audio") {
+        var mixed = {};
+        Object.keys(slot.audio || {}).forEach(function (g) { mixed[g] = slot.audio[g]; });
+        Object.keys(changes.audio).forEach(function (g) { mixed[g] = changes.audio[g]; });
+        slot.audio = mixed;
+      } else {
+        slot[k] = changes[k];
+      }
+    });
+  }
+
+  function mvWrite(changes, optimistic) {
+    var slot = mvSlot();
+    if (!slot || !editing()) { return; }
+    if (state.mvBusy) {
+      /* A slider sends a value per step, and a keyboard sends one per press.
+       * Dropping what arrives mid-flight would leave the service holding an
+       * early value and the next poll would snap the control back to it, so
+       * they are merged and the last thing asked for is the thing that
+       * lands. */
+      state.mvQueued = mvMerge(state.mvQueued || {}, changes);
+      if (optimistic) { mvApplyLocal(slot, changes); mvRefresh(); }
+      return;
+    }
+    state.mvBusy = true;
+    state.mvError = "";
+    state.mvNote = "";
+    if (optimistic) {
+      mvApplyLocal(slot, changes);
+      mvRefresh();
+    }
+    send("PUT", "/api/multiview/" + encodeURIComponent(slot.id), changes)
+      .then(function (r) {
+        state.mvBusy = false;
+        state.mvWroteAt = Date.now();
+        if (r.ok && r.body && r.body.slots) {
+          state.mv = r.body;
+          state.mvNote = mvChangeNote(r.body.changed);
+        } else {
+          state.mvError = (r.body && (r.body.message || r.body.error)) ||
+                          ("The change was refused (" + r.status + ").");
+        }
+        mvDrain() || mvRefresh();
+      })
+      .catch(function (err) {
+        state.mvBusy = false;
+        state.mvError = err.message;
+        mvDrain() || mvRefresh();
+      });
+  }
+
+  /* Send whatever arrived while the last write was in flight. */
+  function mvDrain() {
+    if (!state.mvQueued) { return false; }
+    var queued = state.mvQueued;
+    state.mvQueued = null;
+    mvWrite(queued, false);
+    return true;
+  }
+
+  function mvStop() {
+    var slot = mvSlot();
+    if (!slot || state.mvBusy) { return; }
+    state.mvBusy = true;
+    state.mvError = "";
+    send("POST", "/api/multiview/" + encodeURIComponent(slot.id) + "/stop", {})
+      .then(function (r) {
+        state.mvBusy = false;
+        state.mvWroteAt = Date.now();
+        if (r.ok && r.body && r.body.slots) {
+          state.mv = r.body;
+          state.mvNote = r.body.stopped
+            ? "Encoder stopped. The next tune starts a new one."
+            : "Nothing was running.";
+        } else {
+          state.mvError = (r.body && (r.body.message || r.body.error)) ||
+                          ("Could not stop it (" + r.status + ").");
+        }
+        renderMultiview();
+      })
+      .catch(function (err) {
+        state.mvBusy = false;
+        state.mvError = err.message;
+        renderMultiview();
       });
   }
 
@@ -1087,6 +1626,11 @@
 
   function applyConfig(d) {
     state.config = d;
+    // Editability is only known once this arrives, and the multi-player
+    // section is drawn from it: which controls are live, and whether to say
+    // why they are not. Before the early return, because unsaved settings
+    // edits have nothing to do with that section.
+    if (mvOn() && !state.mvBusy && !mvHolding()) { renderMultiview(); }
     if (pendingCount() || configFocused()) { renderSaveBar(); return; }
     renderConfig();
     renderOverrides();
@@ -1142,15 +1686,27 @@
     });
     get("/stream/status").then(renderStreams).catch(guard("streams-panel", "streams"));
     get("/prewarm").then(renderPrewarm).catch(guard("prewarm-panel", "prewarm"));
+    if (mvOn()) {
+      var mvAt = Date.now();
+      get("/api/multiview")
+        .then(function (d) { applyMultiview(d, mvAt); })
+        .catch(guard("mv-panel", "multiview"));
+    }
     get("/api/events?limit=200&level=" + encodeURIComponent(state.eventLevel))
       .then(renderEvents).catch(guard("events-panel", "events"));
   }
 
   function pollSlow() {
-    get("/teams").then(function (d) { state.teams = d; renderRoster(); })
-      .catch(guard("roster-panel", "roster"));
-    get("/teams?all=1").then(function (d) { state.rosterAll = d; renderRoster(); })
-      .catch(guard("roster-panel", "roster"));
+    get("/teams").then(function (d) {
+      state.teams = d;
+      renderRoster();
+      if (state.mvPicker && !mvHolding()) { renderMvList(); }
+    }).catch(guard("roster-panel", "roster"));
+    get("/teams?all=1").then(function (d) {
+      state.rosterAll = d;
+      renderRoster();
+      if (state.mvPicker && !mvHolding()) { renderMvList(); }
+    }).catch(guard("roster-panel", "roster"));
     get("/api/lineup").then(function (d) { state.lineup = d; renderRosterGroups(); renderRoster(); })
       .catch(function () { /* gated when signed out; roster still renders */ });
     get("/teams?alias=1").then(renderAliases).catch(guard("alias-panel", "aliases"));
@@ -1376,11 +1932,25 @@
       if (!t || typeof t.getAttribute !== "function") { return; }
       if (t.hasAttribute("data-env")) { onFieldChange(t); }
       else if (t.hasAttribute("data-override")) { onOverrideChange(t); }
+      else if (t.hasAttribute("data-mv-search")) {
+        state.mvQuery = t.value.trim();
+        renderMvList();
+      } else if (t.hasAttribute("data-mv-gain")) {
+        // Live feedback while dragging; the write waits for the release, so
+        // one drag is one command to the encoder rather than twenty.
+        mvGainPreview(t);
+      }
     });
     document.addEventListener("change", function (ev) {
       var t = ev.target;
-      if (t && typeof t.getAttribute === "function" && t.hasAttribute("data-env") &&
+      if (!t || typeof t.getAttribute !== "function") { return; }
+      if (t.hasAttribute("data-env") &&
           (t.type === "checkbox" || t.tagName === "SELECT")) { onFieldChange(t); }
+      else if (t.hasAttribute("data-mv-gain")) {
+        var gain = {};
+        gain[t.getAttribute("data-mv-gain")] = parseInt(t.value, 10);
+        mvWrite({ audio: gain }, true);
+      }
     });
     document.addEventListener("click", function (ev) {
       var target = ev.target;
@@ -1403,6 +1973,61 @@
         renderSaveBar();
         return;
       }
+      var mvTab = target.closest("[data-mv-tab]");
+      if (mvTab) {
+        state.mvSlot = mvTab.getAttribute("data-mv-tab");
+        state.mvPicker = "";
+        state.mvQuery = "";
+        state.mvNote = "";
+        state.mvError = "";
+        renderMultiview();
+        return;
+      }
+      var mvOpen = target.closest("[data-mv-open]");
+      if (mvOpen) {
+        var role = mvOpen.getAttribute("data-mv-open");
+        state.mvPicker = state.mvPicker === role ? "" : role;
+        state.mvQuery = "";
+        state.mvFocusSearch = !!state.mvPicker;
+        renderMultiview();
+        return;
+      }
+      var mvScope = target.closest("[data-mv-scope]");
+      if (mvScope) {
+        state.mvScope = mvScope.getAttribute("data-mv-scope");
+        pressGroup(Array.prototype.slice.call(
+          document.querySelectorAll("#multiview [data-mv-scope]")), mvScope);
+        renderMvList();
+        return;
+      }
+      var mvPick = target.closest("[data-mv-pick]");
+      if (mvPick) {
+        var parts = mvPick.getAttribute("data-mv-pick").split(":");
+        var pickChange = {};
+        pickChange[parts[0]] = parts[1];
+        state.mvPicker = "";
+        state.mvQuery = "";
+        mvWrite(pickChange, false);
+        return;
+      }
+      var mvClear = target.closest("[data-mv-clear]");
+      if (mvClear) {
+        var clearChange = {};
+        clearChange[mvClear.getAttribute("data-mv-clear")] = "";
+        mvWrite(clearChange, false);
+        return;
+      }
+      var mvCorner = target.closest("[data-mv-corner]");
+      if (mvCorner) {
+        mvWrite({ corner: mvCorner.getAttribute("data-mv-corner") }, true);
+        return;
+      }
+      var mvSize = target.closest("[data-mv-size]");
+      if (mvSize) {
+        mvWrite({ size: mvSize.getAttribute("data-mv-size") }, true);
+        return;
+      }
+      if (target.closest("[data-mv-stop]")) { mvStop(); return; }
       var stop = target.closest("[data-disconnect]");
       if (stop) {
         disconnectStream(stop.getAttribute("data-disconnect"));

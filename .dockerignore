@@ -23,9 +23,14 @@ extract_stream_old.py
 intercept_jw.py
 test_stealth.py
 
-# Verification harness, run against the built image rather than shipped in it
+# Verification harness, run against the built image rather than shipped in it.
+# Every one is bind-mounted into a scratch container; none belongs in a layer.
 tools/check_console.py
 tools/check_render.py
+tools/check_multiview.py
+tools/check_ffmpeg.py
+tools/check_reorder.py
+tools/live_multiview_ui.py
 _shots/
 
 # Stale compose. The real one is the deployment's own.
@@ -41,9 +46,10 @@ docs/
 # Agent tooling
 .claude/
 
-# Python and editor noise
-__pycache__/
-*.py[cod]
+# Python and editor noise. The ** matters: a bare __pycache__/ matches only
+# at the top of the context, and tools/__pycache__ was shipping.
+**/__pycache__/
+**/*.py[cod]
 .venv/
 venv/
 .DS_Store

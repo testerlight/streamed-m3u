@@ -17,6 +17,14 @@ stream URL from the embed page, the segments are fetched with a browser TLS
 fingerprint, and the result is re-served as a plain MPEG-TS stream. Cold start
 is 13 to 45 seconds; favourites kept warm in the background start in about 5.
 
+**Optional: multi-view.** With `MULTIVIEW_ENABLE=1` you also get two
+**Multi-Player** channels, each carrying two fixtures at once: one filling the
+frame, the other in a miniplayer you place and size from the console, with a
+mixer for which one you hear. The picture is composited on the server, so it is
+an ordinary channel to Dispatcharr and to every player, and the arrangement is
+the channel's own rather than per viewer. It needs an Intel iGPU to be cheap;
+see [Multi-player](#multi-player).
+
 ## Requirements
 
 - Docker with Compose v2, on `linux/amd64`. The image bundles a Playwright
@@ -24,7 +32,13 @@ is 13 to 45 seconds; favourites kept warm in the background start in about 5.
 - A WireGuard VPN subscription for the `gluetun` sidecar (AirVPN by default;
   any provider gluetun supports works). Optional: see the no-VPN variant.
 - Dispatcharr, run from the same compose file or already on your network.
-- About 1.5 GB of disk for the image and a little RAM headroom for Chromium.
+- About 1.7 GB of disk for the image and a little RAM headroom for Chromium.
+  The image bundles ffmpeg and the Intel VAAPI runtime.
+- For multi-view only: an Intel iGPU, with its render node passed to the
+  container (`/dev/dri/renderD128`; uncomment `devices:` in the compose file).
+  One 1080p60 composite costs about 1.4 CPU cores even with the GPU encoding,
+  because the scaling and overlay run in software. Without a GPU,
+  `MULTIVIEW_ENCODER=cpu` works, at a much higher CPU cost.
 
 ## Quick start
 
@@ -55,9 +69,11 @@ Then:
    docker exec streamed-m3u-sync python tools/reorder_channels.py --dry-run
    docker exec streamed-m3u-sync python tools/reorder_channels.py
    ```
-   The built-in order is MLB, NFL, NFL RedZone, NFL Network, then everything
-   else. Print it with `--dump-config`, edit the JSON, and pass it back with
-   `--config` for your own order.
+   The built-in order is MLB, NFL, NFL RedZone, NFL Network, the two
+   Multi-Player channels when multi-view is on, then everything else. Print it
+   with `--dump-config`, edit the JSON, and pass it back with `--config` for
+   your own order. Every run also closes gaps and pulls in channels created
+   since the last one, so check the dry-run's ranges before applying.
 6. Point Jellyfin (or your player) at Dispatcharr's M3U and XMLTV outputs.
 
 ### Without a VPN
@@ -104,6 +120,39 @@ The **Overrides** section lets you extend the built-in tables: extra league
 names for away-side resolution, and alias maps for feeds and series. These are
 additions only. A built-in entry cannot be removed from the console.
 
+### Multi-player
+
+With `MULTIVIEW_ENABLE=1` the console gains a **Multi-player** section between
+Active streams and Pre-warm, one tab per slot. Choose a channel for the main
+picture and, optionally, a second one for the miniplayer, then set the corner
+it sits in, how large it is, and how the two are mixed. A stage diagram shows
+the arrangement as the encoder will build it.
+
+Three things are worth knowing before using it:
+
+- **The layout and the mix belong to the channel, not to the viewer.** The
+  picture is composited server-side and sent as one stream, so everyone
+  watching sees the same arrangement and hears the same mix.
+- **Nothing plays until a main picture is chosen.** An unconfigured slot
+  refuses to tune, exactly like a team with no fixture on, and the miniplayer
+  cannot be chosen first — it is defined relative to a main picture.
+- **Picking a channel starts resolving it immediately**, so tuning shortly
+  afterwards is quick: about eight seconds, against half a minute cold.
+
+The corner, the size and the mixer are applied to a picture that is already
+playing. Changing either channel is not — see Limitations.
+
+Without `CONSOLE_PASSWORD` the section is shown but every control is inert,
+the same as the rest of the console.
+
+To turn it on: pass the render node to the container (see Requirements), set
+`MULTIVIEW_ENABLE=1` in the console or the environment, and restart. The
+channels appear on Dispatcharr's next sync. To number them, run the reorder
+(Quick start, step 5): they take **65-66**, after NFL Network, and every
+channel from 65 on moves down two, once. `MULTIVIEW_ENABLE=0` and a restart
+turns it off again: the channels leave the playlist, and Dispatcharr keeps
+its copies (the sync never deletes a channel) but tuning one fails.
+
 ### Addresses
 
 Playlist URLs are built from the address each request arrives on, so on a
@@ -144,8 +193,22 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `POOL_SLOTS` | `4` | next-refresh | Shared channels for one-off events. Lowering it never removes existing channels. |
 | `POOL_NAME` | `Live Event` | restart | Display name for the shared event slots. Renaming mints new channels; the old ones stay. |
 | `FAVOURITES_GROUP` | `Favorites` | live | Group title favourites are filed under in the playlist. |
+| **Multi-view** | | | |
+| `MULTIVIEW_ENABLE` | `off` | restart | Composite channels carrying two fixtures at once. Off means no slots are created and nothing can start an encoder. |
+| `MULTIVIEW_SLOTS` | `2` | restart | Composite channels to create. Each is a permanent shelf; only MULTIVIEW_MAX_ACTIVE of them may run at once. |
+| `MULTIVIEW_NAME` | `Multi-Player` | restart | Display name for the composite slots. Renaming mints new channels; the old ones stay. |
+| `MULTIVIEW_MAX_ACTIVE` | `1` | live | Composites allowed to run at once. One encode costs roughly a third of a four-core box, so raising this needs headroom to spare. |
+| `MULTIVIEW_ENCODER` | `vaapi` | restart | Encoder for the composite. vaapi uses the Intel iGPU and needs the render node passed in; cpu is the fallback and is much more expensive. |
+| `MULTIVIEW_QP` | `23` | live | Composite quality, lower is better. A quantiser rather than a bitrate because the Intel driver here offers no other rate control. |
+| `MULTIVIEW_IDLE_TIMEOUT` | `60` | live | Seconds with no viewer before a composite shuts down. An encoder must never outlive its audience. |
+| `MULTIVIEW_START_TIMEOUT` | `90` | live | Seconds a cold composite may pad the wire before it is given up on. Both sources resolve one after the other, so this is several times one channel's cascade budget rather than comparable to it. |
+| `MULTIVIEW_REATTACHES` | `8` | live | How many times one viewing may rebuild its encoder before the stream ends. Changing either channel costs one, and so does a source that dies; needing more than a few means something is wrong. |
+| `MULTIVIEW_FILE` | `/data/multiview.json` | env only | Which fixtures each composite slot points at. |
+| `MULTIVIEW_RENDER_NODE` | `/dev/dri/renderD128` | env only | Render node used by the vaapi encoder. The container also needs the host's render group, or opening this fails as 'no VA display found'. |
+| `MULTIVIEW_FIFO_DIR` | `/dev/shm/streamed-m3u` | env only | Where the pipes carrying each composite's two inputs are created. Holds no state; a tmpfs is the right home for it. |
 | **Pre-warm** | | | |
 | `PREWARM_INTERVAL` | `60` | live | How often the pre-warm loop looks for work. |
+| `PREWARM_MAX_ENTRIES` | `12` | live | Ceiling on the warm list, favourites and multi-view sources together. Warming is serial at 20-25s per entry, so twelve is already a five-minute cycle; multi-view sources are kept when it has to cut. |
 | `PREWARM_MARGIN` | `120` | live | Re-warm once a cached entry drops below this much remaining TTL. |
 | `PREWARM_WINDOW_BEFORE` | `20` | live | Minutes before kickoff that a fixture becomes eligible for warming. |
 | `PREWARM_WINDOW_AFTER` | `300` | live | Minutes after kickoff that a fixture stays eligible for warming. |
@@ -186,6 +249,7 @@ Everything persistent lives in `/data` (mounted from `${CONFIG_DIR}/streamed-m3u
 | `lineup.json` | Which roster slugs Jellyfin can see. Missing means every slug is visible. This box has the file (`policy: all`) after the first −. A new install seeds MLB / NFL / NHL / NBA only. |
 | `lineup.json.bak` | The previous lineup save. Same recovery as the roster. |
 | `settings.json` | Settings written by the console. Same `.bak` protection. |
+| `multiview.json` | Which fixtures each composite slot points at. Only written when `MULTIVIEW_ENABLE` is on and a slot has been configured. Same `.bak` protection; losing it costs a re-pick, nothing more. |
 | `extract_cache.json` | Resolved stream URLs, so a restart does not need to re-resolve everything. |
 | `.secret_key` | Session signing key for console logins. |
 
@@ -211,10 +275,14 @@ filtered; visibility is `hidden_from_output` in Dispatcharr.
 | `/playlist-teams.m3u` | The playlist Dispatcharr subscribes to. Always the full roster. |
 | `/epg.xml` | XMLTV guide |
 | `/stream?team=<slug>` | Resolve and proxy a team's current fixture |
+| `/stream?multi=<n>` | Composite slot `n`, when `MULTIVIEW_ENABLE` is on |
 | `/health` | Machine-readable status |
 | `/teams`, `/teams?all=1`, `/teams?alias=1`, `/teams?team=<name>` | Roster diagnostics, including `in_lineup` |
 | `GET /api/lineup` | Jellyfin lineup policy, counts and groups |
 | `PUT /api/lineup` | Add or remove slugs or a group (session and CSRF) |
+| `GET /api/multiview` | Multi-view slots, their layout, and whether each side is warm. Carries no CDN URLs. |
+| `PUT /api/multiview/<n>` | Change a slot: any of primary, secondary, corner, size, audio (session and CSRF). Picking a channel starts resolving it immediately. |
+| `POST /api/multiview/<n>/stop` | Stop one slot's encoder (session and CSRF) |
 | `/prewarm` | Pre-warm state per favourite |
 | `/stream/status` | Active streams with throughput |
 | `/api/overview`, `/api/config`, `/api/cache`, `/api/events` | Console data |
@@ -225,6 +293,10 @@ filtered; visibility is `hidden_from_output` in Dispatcharr.
 
 - No mid-stream failover. If a source dies during playback the stream ends and
   the player reconnects, which resolves again from scratch.
+- Changing a multi-view slot's channel rebuilds its encoder, so the picture
+  re-buffers for a few seconds. The corner, the size and the mixer change
+  instantly; the channels cannot, because ffmpeg cannot be handed a different
+  stream on an input it has already started decoding.
 - Programme durations are estimated per sport; the upstream catalog publishes
   no end times.
 - The roster only grows. A team seen once keeps its channel.

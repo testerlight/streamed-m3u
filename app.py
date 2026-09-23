@@ -42,6 +42,7 @@ import shutil
 import subprocess
 import threading
 import json
+import queue
 import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -59,7 +60,9 @@ from flask import Flask, Response, jsonify, request, has_request_context
 import auth
 import dashboard
 import dockerctl
+import composite
 import lineup
+import multiview
 import settings as _settings
 
 # Compose interpolation and uncommented .env lines hand us VAR="" for unset
@@ -151,6 +154,13 @@ PREWARM_TEAMS = [t.strip() for t in os.getenv(
     "PREWARM_TEAMS", "").split(",") if t.strip()]
 # How often to look for work. Cheap when nothing is playing.
 PREWARM_INTERVAL      = int(os.getenv("PREWARM_INTERVAL", "60"))
+# Ceiling on the whole warm list, favourites and multi-view sources together.
+# Warming is serial by design - one Chromium at a time is what keeps peak
+# memory predictable here - and a candidate costs 20-25s, so a list of twelve
+# is already a five-minute cycle. Multi-view sources are kept ahead of
+# favourites when it has to cut, because a slot is an explicit choice somebody
+# made a moment ago rather than a standing preference.
+PREWARM_MAX_ENTRIES   = int(os.getenv("PREWARM_MAX_ENTRIES", "12"))
 # Re-warm once a cached entry has less than this many seconds of TTL left.
 PREWARM_MARGIN        = int(os.getenv("PREWARM_MARGIN", "120"))
 # Only warm inside a match's plausible live window (minutes around start).
@@ -294,6 +304,51 @@ FEED_SLUG_OVERRIDES = {
 # Shared slots for true one-offs. Fixed count, so nothing accumulates.
 POOL_SLOTS = int(os.getenv("POOL_SLOTS", "4"))
 POOL_NAME  = os.getenv("POOL_NAME", "Live Event")
+
+# Multi-view: two fixtures composited into the single stream a channel can
+# carry, with the second in a miniplayer corner. Off by default, and off
+# means off - no slot is seeded, no channel is emitted and no encoder can
+# start, so a build with this unset behaves exactly as it did before.
+# The plan, the measurements behind these defaults and the reason the
+# composite uses software overlay live in docs/internal/PENDING_multiview.md.
+MULTIVIEW_ENABLE       = os.getenv("MULTIVIEW_ENABLE", "0") == "1"
+MULTIVIEW_SLOTS        = int(os.getenv("MULTIVIEW_SLOTS", "2"))
+MULTIVIEW_NAME         = os.getenv("MULTIVIEW_NAME", "Multi-Player")
+# One composite is about a third of this box. Raising it needs headroom that
+# has been measured, not assumed.
+MULTIVIEW_MAX_ACTIVE   = int(os.getenv("MULTIVIEW_MAX_ACTIVE", "1"))
+MULTIVIEW_ENCODER      = os.getenv("MULTIVIEW_ENCODER", "vaapi")
+# A quantiser, not a bitrate: the Intel driver in this image supports CQP and
+# nothing else, so -b:v is not an option that exists here.
+MULTIVIEW_QP           = int(os.getenv("MULTIVIEW_QP", "23"))
+MULTIVIEW_IDLE_TIMEOUT = int(os.getenv("MULTIVIEW_IDLE_TIMEOUT", "60"))
+# How long a cold tune may sit on padding before the slot is given up on and
+# torn down. A composite start is two resolutions end to end - ffmpeg opens
+# its inputs sequentially, so the second source cannot begin until the first
+# has been probed - which is why this is several times a single channel's
+# cascade budget rather than comparable to it. Without a ceiling a slot whose
+# encoder never produces a frame would pad a tuner forever, which looks
+# healthy from every angle except the screen.
+MULTIVIEW_START_TIMEOUT = int(os.getenv("MULTIVIEW_START_TIMEOUT", "90"))
+# How many times one viewing may rebuild its encoder before the stream is
+# allowed to end. A change of channel costs one; so does a source that dies.
+# A slot that needs more than this is not re-buffering, it is broken, and
+# ending lets the tuner start again cleanly rather than padding for ever.
+MULTIVIEW_REATTACHES = int(os.getenv("MULTIVIEW_REATTACHES", "8"))
+MULTIVIEW_FILE         = os.getenv("MULTIVIEW_FILE", "/data/multiview.json")
+MULTIVIEW_RENDER_NODE  = os.getenv("MULTIVIEW_RENDER_NODE", "/dev/dri/renderD128")
+# FIFOs carrying each composite's two inputs. Not under /data: these hold no
+# state worth keeping and a stale one left by a killed process is a hazard,
+# not a record. /dev/shm is tmpfs in every container that has it.
+MULTIVIEW_FIFO_DIR     = os.getenv(
+    "MULTIVIEW_FIFO_DIR",
+    "/dev/shm/streamed-m3u" if os.path.isdir("/dev/shm") else "/tmp/streamed-m3u")
+# Output profile. 60 fps because both sides of a composite are sport and
+# halving the rate is most visible on exactly the panning and tracking shots
+# the feature exists to watch; measured at ~1.4 of this box's 4 cores.
+MULTIVIEW_WIDTH        = int(os.getenv("MULTIVIEW_WIDTH", "1920"))
+MULTIVIEW_HEIGHT       = int(os.getenv("MULTIVIEW_HEIGHT", "1080"))
+MULTIVIEW_FPS          = int(os.getenv("MULTIVIEW_FPS", "60"))
 
 # EPG window. Backfill covers matches already in progress so they still
 # appear in the guide rather than vanishing at first pitch.
@@ -1119,6 +1174,39 @@ def _feed_slug(display: str) -> str:
 # It is a no-op for team names - no team slug is in FEED_SLUG_OVERRIDES.
 _PREWARM_SLUGS = frozenset(
     s for s in (_feed_slug(t) for t in PREWARM_TEAMS) if s)
+
+
+def _multiview_name(index: int) -> str:
+    """Display name for composite slot `index` (0-based)."""
+    return "%s %d" % (MULTIVIEW_NAME, index + 1)
+
+
+def _multiview_slug(index: int) -> str:
+    """Permanent slug for composite slot `index` (0-based).
+
+    The one derivation site, deliberately. A feed slug that was computed two
+    different ways once cost hours of "not playing" with no error anywhere
+    (see instructions.md gotcha #12), and the fix was not to be careful in
+    five places but to have one place. Everything that needs a composite slug
+    - seeding, the playlist, the guide, the stream route and the roster
+    lookup - calls this.
+
+    Routed through _feed_slug rather than _slugify so these slots can be
+    pinned in FEED_SLUG_OVERRIDES later if a rename is ever needed. A slot's
+    slug is a live Dispatcharr channel's address once created, so it has to
+    survive MULTIVIEW_NAME changing.
+    """
+    return _feed_slug(_multiview_name(index))
+
+
+# slug -> slot id ("1", "2", ...). Defined here, after _settings.apply has
+# run, for the same reason as _PREWARM_SLUGS: it is derived from constants
+# the settings file may have overlaid. Empty when the feature is off, which
+# is what keeps every call site below inert without its own guard.
+_MULTIVIEW_BY_SLUG = ({_multiview_slug(i): str(i + 1)
+                       for i in range(MULTIVIEW_SLOTS)}
+                      if MULTIVIEW_ENABLE else {})
+_MULTIVIEW_SLUGS = frozenset(_MULTIVIEW_BY_SLUG)
 _ALIAS_SLUGS = frozenset(
     s for s in (_slugify(t) for t in MAJOR_LEAGUE_TEAMS + EXTRA_ALIAS_TEAMS)
     if s)
@@ -1136,6 +1224,7 @@ _KIND_GROUPS = (
     ("kind:feed", "feed", "Stations"),
     ("kind:series", "series", "Racing"),
     ("kind:pool", "pool", "Events"),
+    ("kind:multi", "multi", "Multi-view"),
 )
 
 
@@ -1328,7 +1417,7 @@ def _entry_view(slug: str, entry: dict, doc=None) -> dict:
 
 
 def _group_id_of(kind: str, sport: str, league):
-    if kind in ("feed", "series", "pool"):
+    if kind in ("feed", "series", "pool", "multi"):
         return "kind:" + kind
     if league:
         return league
@@ -1500,6 +1589,7 @@ def _seed_favourites():
                 for n in SERIES_CHANNELS}
     nonteam |= {_slugify("%s %d" % (POOL_NAME, i + 1))
                 for i in range(POOL_SLOTS)}
+    nonteam |= _MULTIVIEW_SLUGS
     seeded = 0
     skipped = 0
     with _team_lock:
@@ -1544,9 +1634,19 @@ def _seed_nonteam():
         name = "%s %d" % (POOL_NAME, i + 1)
         if _roster_touch(_slugify(name), name, "", "", now_iso, kind="pool"):
             seeded += 1
+    # Composite slots are shelves like the pool slots, and exist whether or
+    # not anything is configured on them - a channel has to exist before
+    # Dispatcharr will number it or bind guide data to it.
+    for i in range(len(_MULTIVIEW_BY_SLUG)):
+        name = _multiview_name(i)
+        if _roster_touch(_multiview_slug(i), name, "", "", now_iso,
+                         kind="multi"):
+            seeded += 1
     _save_team_roster()
-    log.info("Non-team channels seeded: %d new (%d series, %d feeds, %d pool)",
-             seeded, len(SERIES_CHANNELS), len(FEED_CHANNELS), POOL_SLOTS)
+    log.info("Non-team channels seeded: %d new (%d series, %d feeds, %d pool, "
+             "%d multi-view)",
+             seeded, len(SERIES_CHANNELS), len(FEED_CHANNELS), POOL_SLOTS,
+             len(_MULTIVIEW_BY_SLUG))
 
 
 def _save_team_roster():
@@ -1993,41 +2093,48 @@ def _set_prewarm(slug, name, status, entry, embed_url=None, label=None):
             st.pop("label", None)
 
 
-def _prewarm_pass(favs):
+# One Chromium at a time, whoever asked. The loop and an on-demand warm from
+# the console both go through here, so a selection made while a pass is
+# running queues behind it instead of doubling peak memory.
+_warm_gate = threading.Lock()
+
+
+def _prewarm_one(slug, name, force=False):
+    """Warm one slug. Returns the status string it ended up with."""
     now = time.time()
-    for slug, name in favs:
-        with _team_lock:
-            entry = _team_map.get(slug)
-            entry = dict(entry) if entry else None
+    with _team_lock:
+        entry = _team_map.get(slug)
+        entry = dict(entry) if entry else None
 
-        if not entry or not entry.get("streams"):
-            _set_prewarm(slug, name, "not playing", entry)
-            continue
+    if not entry or not entry.get("streams"):
+        _set_prewarm(slug, name, "not playing", entry)
+        return "not playing"
 
-        started = entry.get("starts")
-        if started:
-            age_min = (now * 1000 - started) / 60000.0
-            if not (-PREWARM_WINDOW_BEFORE <= age_min <= PREWARM_WINDOW_AFTER):
-                _set_prewarm(slug, name,
-                             "outside window (%+.0f min)" % age_min, entry)
-                continue
+    started = entry.get("starts")
+    if started and not force:
+        age_min = (now * 1000 - started) / 60000.0
+        if not (-PREWARM_WINDOW_BEFORE <= age_min <= PREWARM_WINDOW_AFTER):
+            status = "outside window (%+.0f min)" % age_min
+            _set_prewarm(slug, name, status, entry)
+            return status
 
-        # Skip if what we warmed last time still has plenty of TTL left.
-        with _prewarm_lock:
-            current = (_prewarm_state.get(slug) or {}).get("embed_url")
-        if current:
-            with _extract_cache_lock:
-                cached = _extract_cache.get(current)
-            if cached and (now - cached["ts"]) < (EXTRACT_CACHE_TTL - PREWARM_MARGIN):
-                continue
+    # Skip if what we warmed last time still has plenty of TTL left.
+    with _prewarm_lock:
+        current = (_prewarm_state.get(slug) or {}).get("embed_url")
+    if current:
+        with _extract_cache_lock:
+            cached = _extract_cache.get(current)
+        if cached and (now - cached["ts"]) < (EXTRACT_CACHE_TTL - PREWARM_MARGIN):
+            return "already warm"
 
-        # Warm the first candidate that fully validates, so slot 1 at click
-        # time is known-good rather than merely cached.
-        details = []
-        warm_order = entry["streams"]
-        if REQUIRE_AUDIO:
-            warm_order = sorted(warm_order,
-                                key=lambda c: _known_silent(c["embed_url"]))
+    # Warm the first candidate that fully validates, so slot 1 at click
+    # time is known-good rather than merely cached.
+    details = []
+    warm_order = entry["streams"]
+    if REQUIRE_AUDIO:
+        warm_order = sorted(warm_order,
+                            key=lambda c: _known_silent(c["embed_url"]))
+    with _warm_gate:
         for cand in warm_order[:CASCADE_MAX_ATTEMPTS]:
             label = "%s%s-%s" % (cand["source"], cand["stream_no"],
                                  "HD" if cand["hd"] else "SD")
@@ -2039,11 +2146,16 @@ def _prewarm_pass(favs):
                          entry.get("match_title", "?"))
                 _set_prewarm(slug, name, "warm:%s" % label, entry,
                              embed_url=cand["embed_url"], label=label)
-                break
-        else:
-            log.warning("Pre-warm found no working stream for %s: %s",
-                        slug, ", ".join(details))
-            _set_prewarm(slug, name, "no working stream", entry)
+                return "warm:%s" % label
+    log.warning("Pre-warm found no working stream for %s: %s",
+                slug, ", ".join(details))
+    _set_prewarm(slug, name, "no working stream", entry)
+    return "no working stream"
+
+
+def _prewarm_pass(favs):
+    for slug, name in favs:
+        _prewarm_one(slug, name)
 
 
 def prewarm_loop():
@@ -2054,21 +2166,90 @@ def prewarm_loop():
     each other. Serial by design - one Chromium at a time keeps peak memory
     predictable on a box that has little headroom.
     """
-    if not PREWARM_TEAMS:
+    if not PREWARM_TEAMS and not MULTIVIEW_ENABLE:
         log.info("Pre-warm disabled (no PREWARM_TEAMS set)")
         return
-    # _feed_slug, not _slugify: the list may name a feed whose slug is pinned
-    # (see FEED_SLUG_OVERRIDES). Slugging it naively yields a key that is not
-    # in _team_map, and the pass reports "not playing" forever with no error.
-    favs = [(_feed_slug(t), t) for t in PREWARM_TEAMS]
-    log.info("Pre-warm active for %d team(s): %s",
-             len(favs), ", ".join(s for s, _ in favs))
+    log.info("Pre-warm active: %d favourite(s)%s, at most %d per pass",
+             len(PREWARM_TEAMS),
+             " plus whatever the multi-view slots point at"
+             if MULTIVIEW_ENABLE else "", PREWARM_MAX_ENTRIES)
     while True:
         try:
-            _prewarm_pass(favs)
+            _prewarm_pass(_warm_list())
         except Exception:
             log.exception("Pre-warm pass failed")
         time.sleep(PREWARM_INTERVAL)
+
+
+def _warm_list():
+    """Who to keep hot this pass, multi-view first and capped.
+
+    A configured slot is warmed whether or not anyone is watching it: the
+    point is that tuning it is quick, and a cold composite is two cold
+    extractions end to end - measured at up to 50s in Phase 6. Favourites
+    fill whatever room is left.
+    """
+    targets = []
+    seen = set()
+    for slug in _multiview_slugs_in_use():
+        if slug not in seen:
+            seen.add(slug)
+            with _team_lock:
+                entry = _team_roster.get(slug) or {}
+            targets.append((slug, entry.get("name") or slug))
+    # _feed_slug, not _slugify: the list may name a feed whose slug is pinned
+    # (see FEED_SLUG_OVERRIDES). Slugging it naively yields a key that is not
+    # in _team_map, and the pass reports "not playing" forever with no error.
+    for name in PREWARM_TEAMS:
+        slug = _feed_slug(name)
+        if slug and slug not in seen:
+            seen.add(slug)
+            targets.append((slug, name))
+    if len(targets) > PREWARM_MAX_ENTRIES:
+        log.info("Pre-warm list trimmed from %d to %d",
+                 len(targets), PREWARM_MAX_ENTRIES)
+    return targets[:PREWARM_MAX_ENTRIES]
+
+
+def _multiview_slugs_in_use():
+    """Every channel the configured slots point at, in slot order."""
+    if not MULTIVIEW_ENABLE:
+        return []
+    out = []
+    for i in range(MULTIVIEW_SLOTS):
+        slot = multiview.get_slot(str(i + 1))
+        for role in ("primary", "secondary"):
+            slug = (slot or {}).get(role)
+            if slug:
+                out.append(slug)
+    return out
+
+
+def _warm_now(slugs):
+    """Kick a warm for freshly selected channels, off the request thread.
+
+    The load-bearing half of the console: a selection that only records a
+    preference leaves the next tune paying a full cold cascade on both sides.
+    Starting the resolve the moment it is picked is what makes clicking a
+    channel and then tuning it feel like changing channel rather than like
+    booting something.
+    """
+    slugs = [s for s in slugs if s]
+    if not slugs:
+        return
+
+    def _run():
+        for slug in slugs:
+            with _team_lock:
+                entry = _team_roster.get(slug) or {}
+            try:
+                status = _prewarm_one(slug, entry.get("name") or slug,
+                                      force=True)
+                log.info("Warmed %s on selection: %s", slug, status)
+            except Exception:
+                log.exception("Warming %s on selection failed", slug)
+
+    threading.Thread(target=_run, daemon=True, name="mvwarm").start()
 
 
 # ─── Background refresh ───────────────────────────────────────────────────────
@@ -2108,6 +2289,483 @@ def playlist():
                     headers={"Content-Disposition": 'inline; filename="streamed.m3u"'})
 
 
+_mv_manager_lock = threading.Lock()
+_mv_manager_instance = None
+
+
+def _mv_manager():
+    """The composite manager, built on first use.
+
+    Lazy because building it generates the black filler clip, which costs an
+    ffmpeg run - pointless on a service where nobody ever tunes a composite,
+    and impossible to do at import time before settings have been applied.
+    """
+    global _mv_manager_instance
+    with _mv_manager_lock:
+        if _mv_manager_instance is None:
+            filler = composite.make_filler(
+                os.path.join(MULTIVIEW_FIFO_DIR, "filler.ts"),
+                width=MULTIVIEW_WIDTH, height=MULTIVIEW_HEIGHT,
+                fps=MULTIVIEW_FPS)
+            _mv_manager_instance = composite.Manager(
+                # The stored document is the authority. A change written by
+                # anything - the console, a restore, an operator with an
+                # editor - reaches a playing encoder within a reaper tick,
+                # so "persisted" and "on screen" cannot drift apart.
+                reconcile=_multiview_stored,
+                fifo_dir=MULTIVIEW_FIFO_DIR,
+                base_url="http://127.0.0.1:%d" % PORT,
+                filler=filler,
+                width=MULTIVIEW_WIDTH, height=MULTIVIEW_HEIGHT,
+                fps=MULTIVIEW_FPS, encoder=MULTIVIEW_ENCODER,
+                qp=MULTIVIEW_QP, render_node=MULTIVIEW_RENDER_NODE,
+                idle_timeout=MULTIVIEW_IDLE_TIMEOUT)
+        return _mv_manager_instance
+
+
+# Composite chunks buffered between the encoder and the client. Small on
+# purpose: a deep queue would drain ffmpeg's pipe faster than the client can
+# take it and turn a slow viewer into unbounded memory. Four chunks is a
+# quarter of a megabyte, enough to ride out a scheduling hiccup and nothing
+# like enough to hide a stall.
+_MULTIVIEW_PIPE_DEPTH = 4
+
+
+_mv_file_mtime = 0.0
+
+
+def _multiview_stored(slot_id: str):
+    """The slot as stored, re-reading the file if it has changed.
+
+    The reconciler's window on the document. A stat per reaper tick, and a
+    parse only when something actually wrote — which makes the file on disk
+    the authority rather than this process's copy of it. That matters here:
+    the sync container is a separate process, a restore is a file copy, and
+    an operator with an editor is a perfectly reasonable way to fix a slot at
+    two in the morning. All three now reach a playing encoder.
+    """
+    global _mv_file_mtime
+    try:
+        mtime = os.path.getmtime(MULTIVIEW_FILE)
+    except OSError:
+        mtime = 0.0
+    if mtime and mtime != _mv_file_mtime:
+        _mv_file_mtime = mtime
+        with _team_lock:
+            known = set(_team_roster)
+        multiview.reload(MULTIVIEW_FILE, MULTIVIEW_SLOTS, known)
+    return multiview.get_slot(slot_id)
+
+
+def _multiview_update(slot_id: str, changes: dict):
+    """Change a slot: validate, persist, and move a running composite.
+
+    The single place a multi-view slot is written, so the stored document and
+    a playing encoder cannot disagree. Order matters - persist first, then
+    command - because a change that survives a restart but never reached the
+    picture is a confusing bug, while one that reached the picture and was
+    lost on restart is a maddening one.
+
+    Returns (slot, changed, error). `changed` is None when nothing is playing.
+    """
+    slot_id = str(slot_id)
+    if slot_id not in set(_MULTIVIEW_BY_SLUG.values()):
+        return None, None, "unknown slot"
+    with _team_lock:
+        known = set(_team_roster)
+    try:
+        # merge_slot, not set_slot: callers send the one thing that changed.
+        slot = multiview.merge_slot(slot_id, changes, path=MULTIVIEW_FILE,
+                                    slots=MULTIVIEW_SLOTS, known=known)
+    except Exception as e:                                # noqa: BLE001
+        log.exception("Multi-view slot %s could not be saved", slot_id)
+        return None, None, str(e)
+
+    global _mv_file_mtime
+    try:
+        _mv_file_mtime = os.path.getmtime(MULTIVIEW_FILE)
+    except OSError:
+        pass
+
+    changed = _mv_manager().apply(slot_id, slot,
+                                  max_active=MULTIVIEW_MAX_ACTIVE)
+    if changed.get("running"):
+        log.info("Multi-view slot %s changed live: %s", slot_id,
+                 ", ".join(filter(None, [
+                     "sources " + "+".join(changed["sources"])
+                     if changed["sources"] else "",
+                     "layout" if changed["layout"] else "",
+                     "mix" if changed["audio"] else ""])) or "nothing")
+    return slot, changed, None
+
+
+# ─── Console providers ────────────────────────────────────────────────────
+# dashboard.py owns no multi-view state; these three are the whole coupling.
+# None of them ever returns a resolved CDN URL: those carry signing tokens,
+# and a console that is readable without a password must not hand them out.
+# `/stream/status` is where an authorised operator sees URLs, and it is gated.
+
+def _source_view(slug: str) -> dict:
+    """What the console needs to know about one side of a slot."""
+    if not slug:
+        return {"slug": "", "name": "", "kind": "", "warm": False,
+                "status": "", "playing": False, "silent": False, "match": ""}
+    with _team_lock:
+        entry = dict(_team_roster.get(slug) or {})
+        live = dict(_team_map.get(slug) or {})
+    with _prewarm_lock:
+        warm = dict(_prewarm_state.get(slug) or {})
+    embed = warm.get("embed_url")
+    fresh = False
+    if embed:
+        with _extract_cache_lock:
+            cached = _extract_cache.get(embed)
+        fresh = bool(cached and (time.time() - cached["ts"]) < EXTRACT_CACHE_TTL)
+    return {
+        "slug": slug,
+        "name": entry.get("name") or slug,
+        "kind": entry.get("kind") or "team",
+        # Warm means "clicking this will not cost a cold extraction", which
+        # is the only thing the badge is really claiming.
+        "warm": fresh,
+        "status": warm.get("status") or "",
+        "checked_at": warm.get("checked_at") or "",
+        "playing": bool(live.get("streams")),
+        "match": live.get("match_title") or warm.get("match") or "",
+        # Gotcha #19: some sources carry no audio at all. Worth a badge -
+        # picking one for the side you want to hear is a wasted choice.
+        "silent": bool(embed and _known_silent(embed)),
+    }
+
+
+def _composite_view(comp) -> dict:
+    """A running composite, with nothing in it that needs gating."""
+    st = comp.stats()
+    return {
+        "alive": st["alive"],
+        "uptime_seconds": st["uptime_seconds"],
+        "startup_seconds": st["startup_seconds"],
+        "viewers": st["viewers"],
+        "mbit_per_s": st["mbit_per_s"],
+        "output": st["output"],
+        "encoder": st["encoder"],
+        "commands_sent": st["commands_sent"],
+        "commands_failed": st["commands_failed"],
+        "needs_resend": st["needs_resend"],
+        "inputs": {role: {"slug": i["slug"], "stalls": i["stalls"],
+                          "source_errors": i["source_errors"],
+                          "idle_seconds": i["idle_seconds"]}
+                   for role, i in st["inputs"].items()},
+    }
+
+
+def _multiview_snapshot() -> dict:
+    """GET /api/multiview payload."""
+    if not MULTIVIEW_ENABLE:
+        return {"enabled": False, "slots": []}
+    mgr = _mv_manager_instance
+    slots = []
+    for i in range(MULTIVIEW_SLOTS):
+        sid = str(i + 1)
+        slot = multiview.get_slot(sid)
+        comp = mgr.get(sid) if mgr else None
+        slots.append({
+            "id": sid,
+            "name": _multiview_name(i),
+            "url": "/stream?multi=%s" % sid,
+            "primary": _source_view(slot.get("primary") or ""),
+            "secondary": _source_view(slot.get("secondary") or ""),
+            "corner": slot.get("corner"),
+            "size": slot.get("size"),
+            "audio": slot.get("audio"),
+            "updated": slot.get("updated") or "",
+            "configured": multiview.configured(slot),
+            "running": _composite_view(comp) if comp and comp.alive() else None,
+        })
+    return {
+        "enabled": True,
+        "slots": slots,
+        "corners": list(multiview.CORNERS),
+        "sizes": sorted(multiview.SIZES, key=lambda k: multiview.SIZES[k]),
+        "max_active": MULTIVIEW_MAX_ACTIVE,
+        "running": sum(1 for s in slots if s["running"]),
+        # The console draws a diagram of where the miniplayer sits. It is
+        # drawn from the encoder's own numbers rather than a second copy of
+        # them, so the picture and the picture's description cannot drift.
+        "geometry": {
+            "width": MULTIVIEW_WIDTH,
+            "height": MULTIVIEW_HEIGHT,
+            "margin": composite.CORNER_MARGIN,
+            "fractions": dict(composite.SIZE_FRACTION),
+        },
+        # So the console can say "nothing will play until you pick a primary"
+        # rather than leaving the rule to be discovered.
+        "rules": {
+            "secondary_needs_primary": True,
+            "same_channel_twice": False,
+        },
+    }
+
+
+def _multiview_api_update(slot_id: str, payload: dict):
+    """PUT /api/multiview/<slot>. Returns (snapshot, error, status)."""
+    if not MULTIVIEW_ENABLE:
+        return None, "multiview_disabled", 404
+    if not isinstance(payload, dict):
+        return None, "expected_json", 400
+
+    changes = {}
+    for key in ("primary", "secondary", "corner", "size"):
+        if key in payload:
+            value = payload[key]
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                return None, "%s must be a string" % key, 400
+            changes[key] = value.strip()
+    if "audio" in payload:
+        audio = payload["audio"]
+        if not isinstance(audio, dict):
+            return None, "audio must be an object", 400
+        clean = {}
+        for key in ("primary", "secondary"):
+            if key in audio:
+                try:
+                    clean[key] = int(audio[key])
+                except (TypeError, ValueError):
+                    return None, "audio.%s must be a number" % key, 400
+        changes["audio"] = clean
+    if not changes:
+        return None, "nothing to change", 400
+
+    # A slug that is not in the roster would be dropped silently by
+    # normalisation, which looks like the write not working. Say so instead.
+    with _team_lock:
+        known = {slug: (entry or {}).get("kind") or "team"
+                 for slug, entry in _team_roster.items()}
+    for key in ("primary", "secondary"):
+        if not changes.get(key):
+            continue
+        if changes[key] not in known:
+            return None, "unknown channel '%s'" % changes[key], 400
+        # A multi-player channel is itself a composite. Pointing one at
+        # another asks the encoder to consume its own output through a tuner
+        # that will not exist until something tunes it - a loop that would
+        # look like a hang rather than a mistake.
+        if known[changes[key]] == "multi":
+            return None, ("'%s' is a multi-player channel and cannot be a "
+                          "source for one" % changes[key]), 400
+
+    before = multiview.get_slot(slot_id)
+    slot, changed, err = _multiview_update(slot_id, changes)
+    if err:
+        return None, err, 404 if err == "unknown slot" else 500
+
+    # The load-bearing bit: a channel that was just picked starts resolving
+    # now, not at the next pre-warm tick and certainly not at tune time.
+    picked = [slot.get(role) for role in ("primary", "secondary")
+              if slot.get(role) and slot.get(role) != before.get(role)]
+    _warm_now(picked)
+
+    snapshot = _multiview_snapshot()
+    snapshot["changed"] = {
+        "sources": (changed or {}).get("sources") or [],
+        "layout": bool((changed or {}).get("layout")),
+        "audio": bool((changed or {}).get("audio")),
+        "rebuilt": bool((changed or {}).get("restart")),
+        "running": bool((changed or {}).get("running")),
+        "warming": picked,
+    }
+    return snapshot, None, 200
+
+
+def _multiview_api_stop(slot_id: str):
+    """POST /api/multiview/<slot>/stop. Returns (snapshot, error, status)."""
+    if not MULTIVIEW_ENABLE:
+        return None, "multiview_disabled", 404
+    if str(slot_id) not in set(_MULTIVIEW_BY_SLUG.values()):
+        return None, "unknown slot", 404
+    mgr = _mv_manager_instance
+    stopped = bool(mgr and mgr.stop(str(slot_id)))
+    snapshot = _multiview_snapshot()
+    snapshot["stopped"] = stopped
+    return snapshot, None, 200
+
+
+def _multiview_body(slot_id: str, slot: dict):
+    """Yield the composite, padding the wire until there is one.
+
+    A composite cannot start in the time a tuner will wait. Two sources have
+    to resolve - and because ffmpeg opens its inputs sequentially the second
+    cannot even begin until the first has been probed - so a cold slot is
+    tens of seconds from its first frame. Nothing about that is unhealthy, but
+    downstream it is indistinguishable from a dead source.
+
+    So the response is committed before any of it happens and the gap is
+    filled with TS null packets, exactly as the segment loop does for a slow
+    chunk. **The padding must never leave a gap longer than ~10s**: Dispatcharr
+    grants 60s of grace only while its buffer is still empty, and the first
+    padding byte ends that - from then on the budget is CONNECTION_TIMEOUT,
+    which is 10s. Raising STREAM_KEEPALIVE_INTERVAL above about 8s would
+    therefore break multi-view in a way that looks like a source fault.
+
+    The cost of committing early is that a failure can no longer be reported:
+    the status line is long gone by the time we know. A slot that cannot start
+    pads briefly and then ends the stream, which Dispatcharr treats as a
+    source that went away - the same shape as any other mid-stream failure,
+    and one it already knows how to handle.
+    """
+    stop = threading.Event()
+    box = {"comp": None, "err": None}
+    chunks = queue.Queue(maxsize=_MULTIVIEW_PIPE_DEPTH)
+
+    def _offer(chunk):
+        """Hand a chunk to the client, unless the client has gone."""
+        while not stop.is_set():
+            try:
+                chunks.put(chunk, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _pump():
+        """Start the composite and move its bytes, off the request thread.
+
+        Loops, because a composite does not last as long as a viewing does.
+        Changing either channel rebuilds the encoder - a different stream
+        cannot be spliced onto an input ffmpeg has already probed - and so
+        does a picture that has frozen. Re-attaching here is what turns that
+        from "the channel died" into "it re-buffered": the HTTP response is
+        never broken, and the gap goes out as padding like any other.
+        """
+        try:
+            for attempt in range(MULTIVIEW_REATTACHES + 1):
+                current = multiview.get_slot(slot_id) or slot
+                comp, box["err"] = _mv_manager().start(
+                    slot_id, current, max_active=MULTIVIEW_MAX_ACTIVE)
+                box["comp"] = comp
+                if comp is None:
+                    log.warning("Multi-view slot %s refused: %s",
+                                slot_id, box["err"])
+                    return
+                log.info("Multi-view slot %s streaming (%s)%s", slot_id,
+                         " + ".join(multiview.sources(current)),
+                         "" if not attempt else " [rebuild %d]" % attempt)
+                for chunk in comp.read(stop):
+                    if not _offer(chunk):
+                        return
+                if stop.is_set():
+                    return
+                # The composite ended without us asking. Give the rebuild a
+                # moment to be created rather than racing it.
+                log.info("Multi-view slot %s: encoder gone, re-attaching",
+                         slot_id)
+                time.sleep(1.0)
+            log.warning("Multi-view slot %s: rebuilt %d times, giving up",
+                        slot_id, MULTIVIEW_REATTACHES)
+        except Exception as e:
+            box["err"] = str(e)
+            log.exception("Multi-view slot %s failed to start", slot_id)
+        finally:
+            try:
+                chunks.put_nowait(None)
+            except queue.Full:
+                pass
+
+    worker = threading.Thread(target=_pump, daemon=True,
+                              name="mvserve-%s" % slot_id)
+    worker.start()
+
+    # With keepalives switched off there is nothing to pad with, so just wait
+    # on the queue; the poll still has to be short enough to notice the worker
+    # going away.
+    poll = STREAM_KEEPALIVE_INTERVAL if STREAM_KEEPALIVE_INTERVAL > 0 else 1.0
+    began = time.time()
+    playing = False
+    padded = 0
+    try:
+        # One packet straight away, before anything has been asked of the
+        # sources, so the wire is never silent even for the first interval.
+        # It starts the health clock deliberately: from the first buffered
+        # byte the downstream budget is CONNECTION_TIMEOUT rather than the
+        # 60s init grace, and a cadence we control is worth more than a grace
+        # period we do not.
+        if STREAM_KEEPALIVE_INTERVAL > 0:
+            padded += 1
+            yield TS_NULL_PACKET
+        while True:
+            try:
+                item = chunks.get(timeout=poll)
+            except queue.Empty:
+                if not worker.is_alive():
+                    break
+                if time.time() - began > MULTIVIEW_START_TIMEOUT:
+                    # Padded the whole budget and never saw a frame. Tear the
+                    # slot down rather than leave a wedged encoder for the next
+                    # tune to inherit; the reaper would not touch it, because
+                    # from its point of view it is being watched.
+                    log.warning("Multi-view slot %s produced nothing in %ds, "
+                                "giving up", slot_id, MULTIVIEW_START_TIMEOUT)
+                    _mv_manager().stop(slot_id)
+                    break
+                if STREAM_KEEPALIVE_INTERVAL > 0:
+                    # Padding, not data: deliberately not counted in the
+                    # composite's bytes_out, so "is it actually producing?"
+                    # stays an answerable question.
+                    padded += 1
+                    yield TS_NULL_PACKET
+                continue
+            if item is None:
+                break
+            if not playing:
+                playing = True
+            began = time.time()     # the budget is per picture, not per tune
+            yield item
+    finally:
+        stop.set()
+        comp = box["comp"]
+        log.info("Multi-view slot %s stream ended after %.0fs "
+                 "(%d keepalive packets, first frame %s)",
+                 slot_id, time.time() - began, padded,
+                 ("%.1fs" % (comp.first_byte_at - comp.started_at))
+                 if comp is not None and comp.first_byte_at else "never")
+
+
+def _multiview_stream(slot_id: str):
+    """Serve composite slot `slot_id`.
+
+    Mirrors the shapes a team channel already returns, so Dispatcharr and
+    Jellyfin see nothing new: 404 for a slot that does not exist, 503 for one
+    with nothing on it. An unconfigured slot is the exact analogue of a team
+    with no fixture today - the channel is real, there is simply nothing to
+    play - so it answers the same way rather than inventing an error.
+
+    Everything decided here is decided from memory, so the status line is
+    still honest and still immediate. Anything that can block - building the
+    filler, starting the encoder, resolving either source - happens inside
+    _multiview_body once the response is already on its way.
+    """
+    if not MULTIVIEW_ENABLE:
+        return Response("Multi-view is not enabled\n", status=404)
+
+    slot_id = str(slot_id)
+    if slot_id not in set(_MULTIVIEW_BY_SLUG.values()):
+        log.info("Unknown multi-view slot requested: %s", slot_id)
+        return Response("Unknown multi-view slot '%s'\n" % slot_id, status=404)
+
+    slot = multiview.get_slot(slot_id)
+    if not multiview.configured(slot):
+        log.info("Multi-view slot %s tuned but not configured", slot_id)
+        return Response(
+            "Multi-view slot %s has no primary channel selected\n" % slot_id,
+            status=503)
+
+    return Response(_multiview_body(slot_id, slot), content_type="video/mp2t",
+                    direct_passthrough=True,
+                    headers={"Cache-Control": "no-cache, no-store"})
+
+
 @app.route("/stream", methods=["GET", "HEAD"])
 def stream_proxy():
     """
@@ -2119,12 +2777,16 @@ def stream_proxy():
     embed_url = request.args.get("url", "").strip()
     team_arg  = request.args.get("team", "").strip()
     slot_arg  = request.args.get("slot", "").strip()
-    if not embed_url and not team_arg:
-        return Response("Missing 'url' or 'team' parameter", status=400)
+    multi_arg = request.args.get("multi", "").strip()
+    if not embed_url and not team_arg and not multi_arg:
+        return Response("Missing 'url', 'team' or 'multi' parameter", status=400)
 
     # Dispatcharr sends HEAD to validate — respond immediately, no browser needed
     if request.method == "HEAD":
         return Response(status=200, headers={"Content-Type": "video/mp2t"})
+
+    if multi_arg:
+        return _multiview_stream(multi_arg)
 
     hold_key = _stream_hold_key(team_arg, embed_url)
     if _disconnect_held(hold_key):
@@ -2533,6 +3195,11 @@ def stream_proxy():
             "prefix_stripped":   0,
             "prefix_bytes":      0,
             "hold_key":          hold_key,
+            # Set when this stream is feeding a composite rather than a
+            # viewer, as "<slot>/<role>". Sent as a header rather than a
+            # query parameter so the URL - and with it the operator
+            # disconnect-hold key - stays identical to a normal viewer's.
+            "multiview":         request.headers.get("X-Multiview-Slot") or None,
             "stop":              stop,
         }
 
@@ -2635,13 +3302,23 @@ def stream_status():
             "mbit_per_s":       round(s["bytes_sent"] * 8 / 1e6 / elapsed, 2)
                                 if elapsed > 0 else None,
             "last_segment_ago": round(now - last_seg, 1) if last_seg else None,
+            # Set when this stream is one leg of a composite rather than a
+            # viewer, as "<slot>/<role>".
+            "multiview":        s.get("multiview"),
         })
+
+    composites = _mv_manager_instance.stats() if _mv_manager_instance else []
 
     return jsonify({
         "active_streams":   len(output),
+        # Encoders, not viewers. A composite's own two input legs appear in
+        # `streams` above, tagged, so both halves are visible at once.
+        "composites":       composites,
         "segment_timeout":  SEGMENT_TIMEOUT,
         "segment_retries":  SEGMENT_RETRIES,
         "keepalive_interval": STREAM_KEEPALIVE_INTERVAL,
+        "multiview_start_timeout": MULTIVIEW_START_TIMEOUT,
+        "multiview_reattaches": MULTIVIEW_REATTACHES,
         "streams":          output,
     })
 
@@ -2780,6 +3457,23 @@ def _match_duration_s(sport: str) -> int:
                                   EPG_DEFAULT_MINUTES) * 60
 
 
+def _multiview_title(slot: dict, roster: dict) -> str:
+    """Guide title for a composite slot: what it is actually showing.
+
+    Display names, not slugs - this is the line a viewer reads in Jellyfin.
+    """
+    def nice(s):
+        return (roster.get(s) or {}).get("name") or s
+
+    primary = (slot or {}).get("primary")
+    if not primary:
+        return "Multi-view not configured"
+    secondary = slot.get("secondary")
+    if secondary:
+        return "%s + %s" % (nice(primary), nice(secondary))
+    return nice(primary)
+
+
 def build_epg() -> str:
     """XMLTV guide, one channel per team.
 
@@ -2809,6 +3503,30 @@ def build_epg() -> str:
 
     for slug in sorted(roster):
         chan = _channel_id(slug, roster[slug])
+
+        # A composite slot has no fixtures of its own - it shows whatever two
+        # channels the console pointed it at, for as long as they are pointed
+        # there. One programme across the whole window, named for the pairing,
+        # so the guide row says what is on instead of "No game scheduled"
+        # while it is playing. Gotcha #4 makes this load-bearing: a channel
+        # created with no guide entry stays blank forever.
+        mv_id = _MULTIVIEW_BY_SLUG.get(slug)
+        if mv_id is not None:
+            slot = multiview.get_slot(mv_id)
+            out.append('  <programme start="%s" stop="%s" channel="%s">'
+                       % (_xmltv_time(win_start), _xmltv_time(win_end), chan))
+            out.append("    <title>%s</title>"
+                       % _xml_escape(_multiview_title(slot, roster)))
+            if multiview.configured(slot):
+                out.append("    <desc>%s</desc>"
+                           % _xml_escape("Multi-view — two channels at once"))
+                out.append("    <category>Sports</category>")
+                programmes += 1
+            else:
+                filler += 1
+            out.append("  </programme>")
+            continue
+
         rows = []
         for r in sched.get(slug, []):
             start = r["starts"] / 1000.0
@@ -2897,6 +3615,8 @@ def build_team_m3u() -> tuple[str, int]:
             group = "Live Feeds"
         elif kind == "pool":
             group = "Live Events"
+        elif kind == "multi":
+            group = "Multi-view"
         else:
             group = _sport_display(entry.get("sport"))
 
@@ -2910,7 +3630,14 @@ def build_team_m3u() -> tuple[str, int]:
         lines.append(
             '#EXTINF:-1 tvg-id="%s" tvg-name="%s" %sgroup-title="%s",%s'
             % (_channel_id(slug, entry), name, logo_attr, group, name))
-        lines.append("%s/stream?team=%s" % (base, quote(slug, safe="")))
+        # A composite slot is addressed by slot number, not by slug: what it
+        # shows is two fixtures chosen in the console, and neither belongs in
+        # the URL for the same reason a match id does not.
+        mv_id = _MULTIVIEW_BY_SLUG.get(slug)
+        if mv_id is not None:
+            lines.append("%s/stream?multi=%s" % (base, quote(mv_id, safe="")))
+        else:
+            lines.append("%s/stream?team=%s" % (base, quote(slug, safe="")))
         count += 1
 
     log.info("Team playlist built: %d channels", count)
@@ -3156,6 +3883,9 @@ dashboard.register_dashboard(
     restart_services=dockerctl.restart_services,
     lineup_view=_lineup_snapshot,
     lineup_update=_lineup_apply,
+    multiview_view=_multiview_snapshot,
+    multiview_update=_multiview_api_update,
+    multiview_stop=_multiview_api_stop,
 )
 
 
@@ -3170,6 +3900,23 @@ if __name__ == "__main__":
     lineup.reload(LINEUP_FILE)
     _seed_favourites()
     _seed_nonteam()
+    # Only when enabled: with the feature off nothing should touch /data or
+    # hold state for it, so a disabled build is indistinguishable from one
+    # that predates multi-view entirely.
+    #
+    # After _seed_nonteam, not before. A slot may point at a feed or a series,
+    # and those entries are created there - validating against the roster a
+    # moment earlier would drop a perfectly good RedZone slot on first boot
+    # for the crime of being read too soon.
+    if MULTIVIEW_ENABLE:
+        with _team_lock:
+            _known = set(_team_roster)
+        _doc = multiview.reload(MULTIVIEW_FILE, MULTIVIEW_SLOTS, _known)
+        log.info("Multi-view enabled: %d slot(s), %d configured, encoder=%s",
+                 MULTIVIEW_SLOTS,
+                 sum(1 for s in (_doc.get("slots") or {}).values()
+                     if multiview.configured(s)),
+                 MULTIVIEW_ENCODER)
     time.sleep(STARTUP_DELAY)
     threading.Thread(target=refresh_loop, daemon=True).start()
     threading.Thread(target=_evict_extract_cache, daemon=True).start()

@@ -125,9 +125,64 @@ SCHEMA = [
     _s("FAVOURITES_GROUP", "FAVOURITES_GROUP", "Channels", "live", "str",
        "Group title favourites are filed under in the playlist."),
 
+    # Multi-view. Off by default: the image carries ffmpeg either way, but no
+    # slot is seeded and no encoder can start until this is on.
+    _s("MULTIVIEW_ENABLE", "MULTIVIEW_ENABLE", "Multi-view", "restart", "bool",
+       "Composite channels carrying two fixtures at once. Off means no slots "
+       "are created and nothing can start an encoder."),
+    _s("MULTIVIEW_SLOTS", "MULTIVIEW_SLOTS", "Multi-view", "restart", "int",
+       "Composite channels to create. Each is a permanent shelf; only "
+       "MULTIVIEW_MAX_ACTIVE of them may run at once.",
+       min=0, max=4),
+    _s("MULTIVIEW_NAME", "MULTIVIEW_NAME", "Multi-view", "restart", "str",
+       "Display name for the composite slots. Renaming mints new channels; "
+       "the old ones stay."),
+    _s("MULTIVIEW_MAX_ACTIVE", "MULTIVIEW_MAX_ACTIVE", "Multi-view", "live", "int",
+       "Composites allowed to run at once. One encode costs roughly a third "
+       "of a four-core box, so raising this needs headroom to spare.",
+       min=1, max=4),
+    _s("MULTIVIEW_ENCODER", "MULTIVIEW_ENCODER", "Multi-view", "restart", "choice",
+       "Encoder for the composite. vaapi uses the Intel iGPU and needs the "
+       "render node passed in; cpu is the fallback and is much more expensive.",
+       choices=("vaapi", "cpu")),
+    _s("MULTIVIEW_QP", "MULTIVIEW_QP", "Multi-view", "live", "int",
+       "Composite quality, lower is better. A quantiser rather than a bitrate "
+       "because the Intel driver here offers no other rate control.",
+       min=1, max=51),
+    _s("MULTIVIEW_IDLE_TIMEOUT", "MULTIVIEW_IDLE_TIMEOUT", "Multi-view", "live", "int",
+       "Seconds with no viewer before a composite shuts down. An encoder must "
+       "never outlive its audience.",
+       min=5, max=3600),
+    _s("MULTIVIEW_START_TIMEOUT", "MULTIVIEW_START_TIMEOUT", "Multi-view", "live", "int",
+       "Seconds a cold composite may pad the wire before it is given up on. "
+       "Both sources resolve one after the other, so this is several times "
+       "one channel's cascade budget rather than comparable to it.",
+       min=10, max=600),
+    _s("MULTIVIEW_REATTACHES", "MULTIVIEW_REATTACHES", "Multi-view", "live", "int",
+       "How many times one viewing may rebuild its encoder before the stream "
+       "ends. Changing either channel costs one, and so does a source that "
+       "dies; needing more than a few means something is wrong.",
+       min=0, max=50),
+    _s("MULTIVIEW_FILE", "MULTIVIEW_FILE", "Multi-view", "restart", "str",
+       "Which fixtures each composite slot points at.",
+       editable=False),
+    _s("MULTIVIEW_RENDER_NODE", "MULTIVIEW_RENDER_NODE", "Multi-view", "restart", "str",
+       "Render node used by the vaapi encoder. The container also needs the "
+       "host's render group, or opening this fails as 'no VA display found'.",
+       editable=False),
+    _s("MULTIVIEW_FIFO_DIR", "MULTIVIEW_FIFO_DIR", "Multi-view", "restart", "str",
+       "Where the pipes carrying each composite's two inputs are created. "
+       "Holds no state; a tmpfs is the right home for it.",
+       editable=False),
+
     # Pre-warm
     _s("PREWARM_INTERVAL", "PREWARM_INTERVAL", "Pre-warm", "live", "int",
        "How often the pre-warm loop looks for work.", min=10, max=3600),
+    _s("PREWARM_MAX_ENTRIES", "PREWARM_MAX_ENTRIES", "Pre-warm", "live", "int",
+       "Ceiling on the warm list, favourites and multi-view sources together. "
+       "Warming is serial at 20-25s per entry, so twelve is already a "
+       "five-minute cycle; multi-view sources are kept when it has to cut.",
+       min=1, max=40),
     _s("PREWARM_MARGIN", "PREWARM_MARGIN", "Pre-warm", "live", "int",
        "Re-warm once a cached entry drops below this much remaining TTL.", min=0, max=86400),
     _s("PREWARM_WINDOW_BEFORE", "PREWARM_WINDOW_BEFORE", "Pre-warm", "live", "int",
@@ -194,7 +249,7 @@ SCHEMA = [
        "Logo cache size cap.", min=0, max=100000),
 ]
 
-GROUP_ORDER = ["Service", "Upstream", "Channels", "Pre-warm",
+GROUP_ORDER = ["Service", "Upstream", "Channels", "Multi-view", "Pre-warm",
                "Resolution", "Playback", "Guide", "Logos"]
 
 BY_ENV   = {s.env: s for s in SCHEMA}
@@ -370,6 +425,11 @@ def validate(changes: dict, overrides: dict, effective: dict):
     if eff.get("PREWARM_MARGIN") is not None and eff.get("EXTRACT_CACHE_TTL") is not None \
             and eff["PREWARM_MARGIN"] > eff["EXTRACT_CACHE_TTL"]:
         cross.append("PREWARM_MARGIN cannot exceed EXTRACT_CACHE_TTL")
+    # More active composites than slots would be silently unreachable: a slot
+    # is what a viewer tunes, so the cap only means anything below the count.
+    if eff.get("MULTIVIEW_MAX_ACTIVE") is not None and eff.get("MULTIVIEW_SLOTS") is not None \
+            and eff["MULTIVIEW_SLOTS"] > 0 and eff["MULTIVIEW_MAX_ACTIVE"] > eff["MULTIVIEW_SLOTS"]:
+        cross.append("MULTIVIEW_MAX_ACTIVE cannot exceed MULTIVIEW_SLOTS")
     if cross:
         errors["_cross"] = cross
     return clean, clean_ov, errors

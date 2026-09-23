@@ -19,6 +19,19 @@ stay usable from curl. The endpoints here cover what had no endpoint at all:
   PUT /api/settings   Validate, save and apply a change. Needs a signed-in
                       session and a CSRF token. See settings.py for the
                       precedence rules and auth.py for the guards.
+  GET /api/multiview  Multi-view slots: what each points at, how the
+                      miniplayer is arranged, whether each side is warm, and
+                      the encoder if one is running. Gated with the rest of
+                      the console when a password is set, and carries no CDN
+                      URLs in any case - so unlike /stream/status it needs no
+                      guard of its own and stays safe to render.
+  PUT /api/multiview/<slot>
+                      Change one slot - any subset of primary, secondary,
+                      corner, size, audio. Session + CSRF. Picking a channel
+                      also starts resolving it immediately.
+  POST /api/multiview/<slot>/stop
+                      Stop the encoder for one slot. Same operator gate as
+                      disconnect.
   GET /api/cache      Extraction cache contents plus logo and no-audio stats.
   POST /api/cache/extract/refresh
                       Force a new Chromium extract for one cached embed URL.
@@ -89,6 +102,9 @@ _clear_extract = None
 _restart_services = None
 _lineup_view = None
 _lineup_update = None
+_multiview_view = None
+_multiview_update = None
+_multiview_stop = None
 
 
 # ─── Event ring buffer ────────────────────────────────────────────────────────
@@ -159,12 +175,18 @@ EVENTS = _EventBuffer()
 
 @bp.route("/")
 def console():
+    # The multi-view section is omitted from the markup entirely when the
+    # feature is off, rather than hidden by script: a console built with
+    # MULTIVIEW_ENABLE=0 then renders byte-for-byte what it rendered before
+    # the feature existed, which is the rollout's central promise.
+    view = _multiview_view() if _multiview_view else None
     return render_template(
         "dashboard.html",
         version=VERSION,
         auth_enabled=auth.enabled(),
         logged_in=auth.logged_in(),
         csrf_token=auth.csrf_token(),
+        multiview_enabled=bool(view and view.get("enabled")),
     )
 
 
@@ -216,6 +238,52 @@ def api_lineup_put():
     if _lineup_update is None:
         return jsonify({"ok": False, "error": "unavailable"}), 503
     data, err, status = _lineup_update(payload)
+    if err:
+        return jsonify({"ok": False, "error": err}), status
+    return jsonify({"ok": True, **data})
+
+
+@bp.route("/api/multiview")
+def api_multiview_get():
+    """Slot configuration and live state. No CDN URLs, by construction.
+
+    Resolved URLs carry signing tokens, which is why `/stream/status` refuses
+    even a read without a session. This endpoint inherits the console-wide
+    gate like everything else on the blueprint, and on top of that simply
+    never contains such a URL - so there is nothing here to leak if the gate
+    is ever relaxed, and nothing to redact before rendering it.
+    """
+    if _multiview_view is None:
+        return jsonify({"enabled": False, "slots": []})
+    return jsonify(_multiview_view())
+
+
+@bp.route("/api/multiview/<slot_id>", methods=["PUT"])
+def api_multiview_put(slot_id):
+    """Change one slot. Same write gate as PUT /api/settings."""
+    denied = auth.require_write()
+    if denied:
+        return denied
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "expected_json"}), 400
+    if _multiview_update is None:
+        return jsonify({"ok": False, "error": "unavailable"}), 503
+    data, err, status = _multiview_update(slot_id, payload)
+    if err:
+        return jsonify({"ok": False, "error": err}), status
+    return jsonify({"ok": True, **data})
+
+
+@bp.route("/api/multiview/<slot_id>/stop", methods=["POST"])
+def api_multiview_stop(slot_id):
+    """Stop one slot's encoder. Same operator gate as disconnect."""
+    denied = _require_operator()
+    if denied:
+        return denied
+    if _multiview_stop is None:
+        return jsonify({"ok": False, "error": "unavailable"}), 503
+    data, err, status = _multiview_stop(slot_id)
     if err:
         return jsonify({"ok": False, "error": err}), status
     return jsonify({"ok": True, **data})
@@ -398,6 +466,8 @@ def register_dashboard(flask_app, *, runtime, caches, config_values,
                        refresh_extract=None, clear_extract=None,
                        restart_services=None,
                        lineup_view=None, lineup_update=None,
+                       multiview_view=None, multiview_update=None,
+                       multiview_stop=None,
                        capture_logs=True):
     """Attach the console to a Flask app.
 
@@ -409,11 +479,14 @@ def register_dashboard(flask_app, *, runtime, caches, config_values,
     refresh_extract / clear_extract are embed_url -> status string, used by
     the extract-cache buttons on the Caches panel. restart_services is a
     zero-argument callable used by POST /api/restart; it must not kill
-    PID 1 when the verification harness is running.
+    PID 1 when the verification harness is running. multiview_view /
+    multiview_update / multiview_stop are the multi-view coupling; the view is
+    deliberately URL-free, so the read endpoint needs no gate of its own.
     """
     global _runtime_provider, _caches_provider, _config_provider
     global _apply_settings, _stop_stream, _refresh_extract, _clear_extract
     global _restart_services, _lineup_view, _lineup_update
+    global _multiview_view, _multiview_update, _multiview_stop
     _runtime_provider = runtime
     _caches_provider = caches
     _config_provider = config_values
@@ -424,6 +497,9 @@ def register_dashboard(flask_app, *, runtime, caches, config_values,
     _restart_services = restart_services
     _lineup_view = lineup_view
     _lineup_update = lineup_update
+    _multiview_view = multiview_view
+    _multiview_update = multiview_update
+    _multiview_stop = multiview_stop
 
     if capture_logs:
         root = logging.getLogger()

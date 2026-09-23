@@ -9,8 +9,8 @@ leaves everything else alone, in whatever relative order it already has.
 Safe to run repeatedly - it is idempotent, and re-running after new channels
 appear simply folds them into the right block.
 
-The built-in order (MLB, NFL, NFL RedZone, NFL Network, then everything else)
-is one operator's preference. Supply your own with --config, starting from
+The built-in order (MLB, NFL, NFL RedZone, NFL Network, Multi-view, then
+everything else) is one operator's preference. Supply your own with --config, starting from
 `--dump-config`, which prints the built-in order as editable JSON:
 
     {"blocks": [{"label": "MLB", "teams": ["Arizona Diamondbacks", ...]},
@@ -96,6 +96,13 @@ DEFAULT_CONFIG = {
         # as "NFL RedZone" (see FEED_SLUG_OVERRIDES in app.py).
         {"label": "NFL RedZone", "tvg_ids": ["streamed.feed.nfl-vs-redzone"]},
         {"label": "NFL Network", "tvg_ids": ["streamed.feed.nfl-network"]},
+        # The multi-view composite channels. They exist only while
+        # MULTIVIEW_ENABLE=1 on streamed-m3u, and until then this block is
+        # inert: it matches nothing and every other number stays where it is.
+        # The ids assume the defaults, MULTIVIEW_NAME=Multi-Player and
+        # MULTIVIEW_SLOTS=2; change either and this list needs --config.
+        {"label": "Multi-view", "tvg_ids": ["streamed.feed.multi-player-1",
+                                            "streamed.feed.multi-player-2"]},
     ],
     "pending_blocks": [
         {"label": "NHL", "teams": [
@@ -170,6 +177,46 @@ def expand_blocks(blocks):
         ids += list(b.get("tvg_ids", []))
         out.append((b["label"], ids))
     return out
+
+
+def plan_order(chans, blocks):
+    """Decide the new order. Pure: no network, no output.
+
+    Returns (ordered, ranges, found) where `ordered` is every channel in its
+    new position, `ranges` is [(label, first, last)] for the printout, and
+    `found` is [(label, present, missing)] per block. Kept apart from main()
+    so the numbering can be checked against a channel list that does not
+    exist yet - which is the only way to preview a block before a deploy
+    creates its channels.
+    """
+    by_tvg = {}
+    for c in chans:
+        if c.get("tvg_id"):
+            by_tvg.setdefault(c["tvg_id"], c)
+
+    ordered, claimed, ranges, found = [], set(), [], []
+    for label, tvg_ids in blocks:
+        block = [by_tvg[t] for t in tvg_ids
+                 if t in by_tvg and by_tvg[t]["id"] not in claimed]
+        block.sort(key=lambda c: (c.get("name") or "").lower())
+        for c in block:
+            claimed.add(c["id"])
+        if block:
+            ranges.append((label, len(ordered) + 1, len(ordered) + len(block)))
+        ordered += block
+        found.append((label, len(block), len(tvg_ids) - len(block)))
+
+    rest = [c for c in chans if c["id"] not in claimed]
+    rest.sort(key=lambda c: (c.get("channel_number")
+                             if c.get("channel_number") is not None else 1e9))
+    if rest:
+        ranges.append(("other", len(ordered) + 1, len(ordered) + len(rest)))
+    ordered += rest
+    found.append(("other", len(rest), 0))
+
+    assert len(ordered) == len(chans), "plan size mismatch"
+    assert len({c["id"] for c in ordered}) == len(chans), "duplicate in plan"
+    return ordered, ranges, found
 
 
 def connect():
@@ -265,37 +312,16 @@ def main():
         sys.exit(0 if do_revert(s, args.revert) else 1)
 
     chans = paged(s, "/api/channels/channels/")
-    by_tvg = {}
-    for c in chans:
-        if c.get("tvg_id"):
-            by_tvg.setdefault(c["tvg_id"], c)
     print("Fetched %d channels" % len(chans))
 
-    ordered, claimed, ranges = [], set(), []
-    for label, tvg_ids in blocks:
-        block = [by_tvg[t] for t in tvg_ids
-                 if t in by_tvg and by_tvg[t]["id"] not in claimed]
-        block.sort(key=lambda c: (c.get("name") or "").lower())
-        for c in block:
-            claimed.add(c["id"])
-        if block:
-            ranges.append((label, len(ordered) + 1, len(ordered) + len(block)))
-        ordered += block
-        missing = len(tvg_ids) - len(block)
-        print("  %-12s %3d channels%s" % (
-            label, len(block),
-            "  (%d not present yet)" % missing if missing else ""))
-
-    rest = [c for c in chans if c["id"] not in claimed]
-    rest.sort(key=lambda c: (c.get("channel_number")
-                             if c.get("channel_number") is not None else 1e9))
-    if rest:
-        ranges.append(("other", len(ordered) + 1, len(ordered) + len(rest)))
-    ordered += rest
-    print("  %-12s %3d channels (relative order preserved)" % ("other", len(rest)))
-
-    assert len(ordered) == len(chans), "plan size mismatch"
-    assert len({c["id"] for c in ordered}) == len(chans), "duplicate in plan"
+    ordered, ranges, found = plan_order(chans, blocks)
+    for label, present, missing in found:
+        if label == "other":
+            print("  %-12s %3d channels (relative order preserved)" % (label, present))
+        else:
+            print("  %-12s %3d channels%s" % (
+                label, present,
+                "  (%d not present yet)" % missing if missing else ""))
 
     print("\nResulting number ranges:")
     for label, lo, hi in ranges:

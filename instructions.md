@@ -67,8 +67,15 @@ fingerprint → re-served as a raw TS byte stream.
 | `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
 | `tools/reorder_channels.py` | Channel numbering. `--dump-config` prints the built-in order as editable JSON. |
+| `tools/channel_order.example.json` | Generated: exactly `reorder_channels.py --dump-config`. Regenerate it, do not edit it; `check_reorder.py` fails if it drifts. |
+| `tools/check_reorder.py` | Offline proof of the numbering. Pure planner, synthetic channel list, no Dispatcharr. §12b. |
 | `tools/check_console.py`, `tools/check_render.py` | Verification harnesses. Bind-mounted into a scratch image, never shipped. |
+| `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
+| `tools/check_multiview.py` | Multi-view checks with the feature **on**. A separate script because the slot map is derived once at import, so enabled and disabled cannot share a process. §12. |
+| `tools/live_multiview_ui.py` | The console's multi-player section driven against a **real** encoder and real fixtures. Needs the network and the render node; costs two extractions and a minute of encoding. A gate check, not a routine one. §5b. |
 | `lineup.py` | Jellyfin lineup load/save/membership. Implicit-all when the file is missing. |
+| `multiview.py` | Which fixtures each composite slot points at, and the rules that keep a slot playable. No encoder logic; safe to import with the feature off. §12. |
+| `composite.py` | Multi-view plumbing: the feeders that keep each composite's two input FIFOs fed, the ffmpeg supervisor that drains them into one stream, and the ZMQ commands that move the layout and the mix while it plays. §12. |
 | `seed/teams.json` | Seed roster installed on an empty `/data`. Team entries only, no favourites. |
 | `seed/lineup.json` | Majors-only allowlist. Installed only with a fresh roster. Never copy onto existing `/data`. |
 | `entrypoint.sh`, `Dockerfile` | The image. The entrypoint chowns `/data` then drops to `PUID:PGID`. |
@@ -103,7 +110,8 @@ How it is wired, in `app.py` order:
    root logger because logging was configured earlier in the file.
 4. A console write goes `validate` (types, bounds, choices, the cross rules
    `CASCADE_RESERVE < CASCADE_BUDGET`, `SEGMENT_PROBE_TIMEOUT <= SEGMENT_TIMEOUT`,
-   `PREWARM_MARGIN <= EXTRACT_CACHE_TTL`) then `save` (atomic) then
+   `PREWARM_MARGIN <= EXTRACT_CACHE_TTL`,
+   `MULTIVIEW_MAX_ACTIVE <= MULTIVIEW_SLOTS`) then `save` (atomic) then
    `apply_live`. Nothing is saved on a validation error and nothing is applied
    on a save error.
 
@@ -223,6 +231,69 @@ docker run --rm -e STARTUP_DELAY=0 -e CONSOLE_PASSWORD=x \
   -v $PWD/tools/check_console.py:/tmp/check.py:ro streamed-m3u:verify python /tmp/check.py
 ```
 
+That covers the feature switched **off**. The multi-view half needs its own
+run, because the slot map is derived once at import and so enabled and
+disabled cannot share a process:
+
+```bash
+docker run --rm -e STARTUP_DELAY=0 -e MULTIVIEW_ENABLE=1 \
+  -v $PWD/tools/check_multiview.py:/tmp/check_mv.py:ro streamed-m3u:verify python /tmp/check_mv.py
+```
+
+It needs neither the network nor a render node — it drives the software
+encoder on filler — and takes about three minutes, most of it spent waiting
+out real timeouts.
+
+The image also carries ffmpeg and the VAAPI runtime. To verify that half,
+attach the render node and run as the service's own uid — root can open the
+device when `568` cannot, so checking as root proves nothing:
+
+```bash
+docker run --rm --device /dev/dri --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
+  --user 568:568 -v $PWD/tools/check_ffmpeg.py:/tmp/check_ffmpeg.py:ro \
+  streamed-m3u:verify python /tmp/check_ffmpeg.py
+```
+
+Note the `--user` there bypasses `entrypoint.sh` entirely. That is fine for
+`check_ffmpeg.py` and misleading for anything else: pitfall #11 hid behind it
+for a whole phase.
+
+The console's own half - the part no Python check can see, because a corner
+that does not move and a slider that does not travel both look like a passing
+API - is `tools/check_render.py`, which drives Chromium against the real page.
+It turns multi-view on unless told otherwise, and it takes a second, shorter
+path when there is **no** password, where the point is that every control
+that writes is inert:
+
+```bash
+mkdir -p _shots && chmod 777 _shots
+docker run --rm -e STARTUP_DELAY=0 -e CONSOLE_PASSWORD=render-pw \
+  -v $PWD/tools/check_render.py:/tmp/render.py:ro -v $PWD/_shots:/out \
+  streamed-m3u:verify python /tmp/render.py
+docker run --rm -e STARTUP_DELAY=0 \
+  -v $PWD/tools/check_render.py:/tmp/render.py:ro -v $PWD/_shots:/out \
+  streamed-m3u:verify python /tmp/render.py
+```
+
+Screenshots land in `_shots/`; both themes are captured, because the console
+has two and only one of them is ever looked at by accident.
+
+Neither of those runs an encoder. The one that does is
+`tools/live_multiview_ui.py`, which picks the first two fixtures that actually
+resolve, drives the section in Chromium, pulls the channel as an ordinary
+viewer and moves the layout on the picture it is watching:
+
+```bash
+docker run --rm --device /dev/dri -e STARTUP_DELAY=0 -e CONSOLE_PASSWORD=live-pw \
+  -e MV_CANDIDATES=baltimore-orioles,boston-red-sox,nfl-network,tennis-channel \
+  -v $PWD/tools/live_multiview_ui.py:/tmp/live.py:ro -v $PWD/_shots:/out \
+  streamed-m3u:verify python /tmp/live.py
+```
+
+Give it candidates in preference order and it takes the first two that warm -
+a fixture listed is not a fixture on, and the 24/7 feeds at the end of the
+list are the fallback when nothing is.
+
 ### 5c. The cron-to-container cutover (done 2026-09-18)
 
 Until the containerization, a TrueNAS cron job (id 1, `*/8 * * * *`, root, no
@@ -324,7 +395,15 @@ Backups go to `REORDER_BACKUP_DIR`, which defaults to the script's own
 directory inside the container; set it to `/data` to keep them.
 
 Result: **MLB 1-30, NFL 31-62, NFL RedZone 63, NFL Network 64**, then
-everything else from 65 on, keeping its existing relative order.
+everything else from 65 on, keeping its existing relative order. With
+multi-view enabled, **Multi-Player 1 and 2 take 65-66** and everything else
+starts at 67 instead (§12b). Until those channels exist the block is inert.
+
+Every run also **compacts**: channels Dispatcharr created since the last run
+were numbered at the end (1460 and up, on this box), and any gaps left by
+deleted channels close. So a run can move more channels than the change you
+made to the order - check the dry-run's ranges, not just the block you
+touched.
 
 - Idempotent and re-runnable. Every apply first writes a timestamped
   `channel_number_backup_*.json`; undo with `--revert <that-file>`.
@@ -794,3 +873,390 @@ back. If stable numbers matter to you from day one, bring `teams.json`.
 > A fresh install will also show far fewer than 1,344 channels for a while, and
 > many teams will read "No game scheduled" — both are expected. The roster is
 > cumulative: it reflects every team ever *seen*, not every team that exists.
+
+---
+
+## 12. Multi-view (built, not yet deployed)
+
+Two fixtures composited into the one MPEG-TS stream a channel can carry: a
+primary filling the frame, an optional secondary in a miniplayer corner. The
+full plan, the measurements behind it and the phase gates are in
+`docs/internal/PENDING_multiview.md`. **Phases 0-10 are done**: a configured
+slot plays, survives being tuned, and can be changed while it plays. Two
+feeders fill two FIFOs, ffmpeg composites them, and the result is served as
+one MPEG-TS - with the response committed before anything resolves and the gap
+padded with null packets. Corner, size and the mixer move on the running
+encoder over ZMQ; a channel change rebuilds it without breaking the stream.
+The console has a **Multi-player** section driving all of it over
+`/api/multiview`, and the numbering block is ready (§12b). What remains is
+deployment: the rebuild, the Dispatcharr-side checks, the soak, and one
+reorder once the channels exist.
+
+**It is off unless `MULTIVIEW_ENABLE=1`**, and off means nothing is seeded,
+nothing is written under `/data` and no log line is emitted. Verified by
+diffing `/health`, the playlist, `/epg.xml` and the console HTML against a
+build from before the feature existed: identical apart from the generation
+timestamp each carries anyway.
+
+What exists today:
+
+- Nine `MULTIVIEW_*` settings (README table). Two are environment-only:
+  `MULTIVIEW_FILE` and `MULTIVIEW_RENDER_NODE`.
+- `/data/multiview.json`, written through `settings.atomic_write_json`, so it
+  inherits the same `.bak` and `.corrupt-<time>` handling as the roster. It
+  materialises on the first write, not at startup — a missing file is a valid
+  empty document, exactly like `lineup.json`.
+- `multiview.py`, which owns the document and nothing else.
+- A **Multi-player** section in the console, between Active streams and
+  Pre-warm: slot tabs, a channel picker per side, a stage diagram drawn from
+  the encoder's own geometry, the corner grid, the size chips, the mixer and
+  a status strip with the running encoder and a Stop. Present only when the
+  feature is on (pitfall #28).
+- Two channels when enabled, `Multi-Player 1` and `Multi-Player 2`:
+
+  | | |
+  |---|---|
+  | Slug | `multi-player-N` |
+  | Channel id | `streamed.feed.multi-player-N` — the existing non-team prefix |
+  | Group | `Multi-view` |
+  | URL | `/stream?multi=N` |
+  | Guide | `<Primary> + <Secondary>`, or `Multi-view not configured` |
+
+**When this first deploys, check the two Dispatcharr-side facts before
+anything else**: that the sync container created the channels, and that each
+has guide data attached. Gotcha #4 gives no second chance — a channel created
+before its guide entry exists stays blank forever, and the repair is deleting
+and recreating it.
+
+### 12a. The composite path, end to end
+
+Everything else in the service is a byte pipe. This is the one place that
+decodes, composites and re-encodes, so it is worth knowing the whole route a
+tune takes before touching any part of it:
+
+```
+ Dispatcharr ──GET /stream?multi=N──▶ _multiview_stream      404 unknown slot,
+                                        │                     503 unconfigured
+                                        ▼                     (in memory, instant)
+                               _multiview_body ── response committed at once;
+                                        │          null packets pad the wire
+                                        │          until the first picture
+                                        ▼
+                         composite.Manager ── MULTIVIEW_MAX_ACTIVE, reaper,
+                                        │     reconciler against multiview.json
+                                        ▼
+                     Composite (one ffmpeg) ◀── ZMQ over ipc:// in /dev/shm:
+                        ▲             ▲         corner, size, mixer, live
+          FIFO mvN-primary-<tok>.ts   FIFO mvN-secondary-<tok>.ts
+                        ▲             ▲
+                 Feeder (primary)   Feeder (secondary)
+                        │             │
+              GET /stream?team=…   GET /stream?team=…    loopback: the ordinary
+                        │             │                  proxy path, cascade,
+                        ▼             ▼                  extract cache, keepalives
+                     upstream CDN   upstream CDN
+```
+
+In order, when a player tunes a configured slot:
+
+1. **The response is committed before anything resolves.** `_multiview_body`
+   writes a null packet straight away and keeps padding at under a second
+   between packets, because Dispatcharr's budget after the first byte is ten
+   seconds and a cold composite can take longer than that (pitfall #16). The
+   bytes are handed over through a bounded queue by a worker thread, so a
+   stuck encoder can never hold a request thread hostage.
+2. **The Manager starts one composite**, or refuses a second beyond
+   `MULTIVIEW_MAX_ACTIVE`. It owns the reaper - no viewer for
+   `MULTIVIEW_IDLE_TIMEOUT`, or no output for `OUTPUT_STALL_TIMEOUT` (20s),
+   and the encoder is stopped - and the reconciler, which compares every
+   running composite against `multiview.json` so that a hand edit to the file
+   takes effect exactly like a console change.
+3. **Two feeders fill two FIFOs** in `MULTIVIEW_FIFO_DIR` (`/dev/shm`). Each
+   reads `/stream?team=<slug>` over loopback as an ordinary viewer (pitfall
+   #8), resolving while ffmpeg is still opening the other input (#18). Until
+   an input has carried a real stream it is fed a looping black-and-silence
+   clip; after that, never (#20). A per-feeder watchdog cuts a source that
+   goes quiet for `SOURCE_STALL_TIMEOUT` (15s), because one silent input
+   freezes the whole picture (#17).
+4. **ffmpeg composites.** VAAPI decode, software `scale` / `overlay` /
+   `volume` / `amix` (the only filters that obey live commands, #2),
+   `h264_vaapi` at CQP (#1), 1080p60, MPEG-TS on stdout.
+   `-use_wallclock_as_timestamps 1` on both inputs (#14).
+5. **Changes arrive through `PUT /api/multiview/<n>`**, are merged into the
+   stored slot (#24), and then either go to the running encoder over ZMQ -
+   corner, size and mix, with no break in the picture - or, for a channel
+   change, stop it; the viewer's stream re-attaches and the rebuilt composite
+   picks up the new channels (#20, #21). `MULTIVIEW_REATTACHES` bounds how
+   many times one viewer may do that, and `MULTIVIEW_START_TIMEOUT` how long
+   each rebuild may take to show a picture.
+6. **Picking a channel warms it**, there and then (#25), and configured slots
+   go to the front of the pre-warm list (#26). That is the difference between
+   a tune reaching picture in about three seconds and in thirty to fifty.
+
+Measured on this box: first picture **1.7-2.9s** with both sides warm, 13-27s
+cold, ~50s worst case; about **1.4 cores** at live pace for one 1080p60
+composite; output **0.5-1.3 Mbit/s** at `qp=23` depending on how much the
+pictures move.
+
+### 12b. Numbering
+
+With the feature on, the two channels are seeded at boot like the feeds, so
+they exist from the first sync. `reorder_channels.py` then puts them at
+**65-66**, straight after NFL Network, and moves every channel that was at
+65 or later down by exactly two - once. Until the channels exist the block
+matches nothing and changes nothing; the dry-run just reports
+`Multi-view 0 channels (2 not present yet)`.
+
+The block names the channels by id and assumes the defaults,
+`MULTIVIEW_NAME=Multi-Player` and `MULTIVIEW_SLOTS=2`. Change either and the
+ids change with it (`multi-player-N` is derived from the name), so the order
+needs `--config` with the new ids.
+
+`tools/check_reorder.py` proves the numbering offline in a second: the block
+is inert without the channels, lands on 65-66 with them, and shifts
+everything else by two and nothing else.
+
+### 12c. Pitfalls
+
+Everything below cost real time to find. Most of it is invisible from reading
+the code, which is why it is written down rather than left to comments.
+
+**1. `MULTIVIEW_QP` is a quantiser, not a bitrate.** The Intel driver in this
+image supports CQP and nothing else; `-b:v` fails outright with
+`Driver does not support any RC mode compatible with selected options`.
+Switching to a bitrate means adding `intel-media-va-driver-non-free`.
+
+**2. The composite must use software `scale` and `overlay`.** `vpp_qsv` and
+`overlay_qsv` are faster and are the obvious optimisation, and they **accept
+live commands and silently ignore them** — proven by byte-identical output
+with and without the command. Moving the graph onto them would break the
+miniplayer position, size and the audio mixer with no error anywhere.
+`MULTIVIEW_ENCODER` offers `vaapi` and `cpu` for this reason; there is no
+`qsv` choice.
+
+**3. A slot's rules are enforced in `multiview.normalize_slot`, not in the
+console.** A secondary without a primary is dropped, a slug that is not in the
+roster is dropped, a slug cannot be shown against itself, and gains are
+clamped to 0-100. The console is not the only way into that file — it is
+hand-editable — so the rules live where the document is parsed.
+
+**4. `MULTIVIEW_MAX_ACTIVE` cannot exceed `MULTIVIEW_SLOTS`**, enforced as a
+cross-rule in `settings.validate`. One 1080p60 composite costs roughly 1.4 of
+this box's 4 cores, so the default of 1 is a measurement, not caution.
+
+**5. `_multiview_slug()` is the only place a composite slug is derived**, and
+everything goes through it: seeding, the playlist, the guide, the stream route
+and the roster lookup. Gotcha #12's real lesson is not "be careful in five
+places" but "have one place". It routes through `_feed_slug`, so a slot can be
+pinned in `FEED_SLUG_OVERRIDES` if `MULTIVIEW_NAME` ever changes — the slug is
+a live channel's address once the channel exists.
+
+**6. `_MULTIVIEW_BY_SLUG` is empty when the feature is off.** That is what
+keeps the playlist, the guide and the seeding inert without each one carrying
+its own `if MULTIVIEW_ENABLE`. Like `_PREWARM_SLUGS` it is derived after
+`settings.apply`, so defining it higher in the file is a crash on start.
+
+**7. The multi-view reload runs after `_seed_nonteam`, not before.** A slot may
+point at a feed or a series, and those roster entries are created there;
+validating against the roster a moment earlier would silently drop a good
+RedZone slot on first boot for being read too soon.
+
+**8. The feeders read `/stream?team=` over loopback on purpose.** It looks
+like an obvious inefficiency to remove — call the segment path directly and
+skip the HTTP hop. Do not. The segment path is where gotchas #16, #17 and #18
+live, it is defined inside the `stream_proxy` request closure, and reading it
+back as an ordinary viewer is what keeps every one of those behaviours intact
+without re-testing them. The hop costs nothing at these bitrates, and each leg
+gets the cascade, the extract cache and the keepalive padding for free.
+
+**9. Nothing in a feeder may block without a way out.** Two real ways it can,
+both found live and both fixed: opening a FIFO for writing blocks until a
+reader attaches (opened non-blocking and retried), and a cold channel sits
+inside one blocking request for most of `CASCADE_BUDGET` (the connect runs on
+its own thread, polled). Add a blocking call here and a switch will silently
+take a minute to happen.
+
+**10. A switch to a cold channel is a cold extraction of silence.** The FIFO
+stays open and the encoder keeps running, but that input goes quiet for ~20s.
+Warm channels switch in about 5. This is why the console selection has to
+pre-warm rather than just record a choice.
+
+**11. The privilege drop throws away supplementary groups.** `setpriv
+--groups` *replaces* the whole list and `--init-groups` rebuilds it from
+`/etc/group`, where a host gid does not appear. So a group granted from
+outside — compose `group_add`, docker `--group-add` — is gone the moment
+`entrypoint.sh` drops privileges unless the script names it. The render node's
+gid is looked up there for exactly this reason. Miss it and ffmpeg reports
+**"No VA display found"**, which reads like a missing device rather than a
+missing group and will cost you an afternoon.
+
+**12. An input FIFO must never go silent, even when there is nothing to
+show.** ffmpeg blocks probing an input that has produced no data, so an
+unconfigured or unresolvable source would stall the entire graph rather than
+leaving a hole in the picture. A feeder with nothing to play writes a looping
+black-and-silence clip instead. This is also what makes a dead primary behave
+sensibly: that side goes black and the miniplayer keeps playing.
+
+**13. ffmpeg opens its inputs sequentially.** It will not open the second FIFO
+until the first is open and probed, so the second feeder routinely waits out a
+whole cold extraction before its reader appears. Anything that gives up on a
+timer while waiting for a reader will leave that input unfed for the life of
+the composite.
+
+**14. `-use_wallclock_as_timestamps 1` is load-bearing on both inputs.** Every
+source switch and every filler loop restarts that stream's own clock; replay
+those values and the demuxer reports `DTS out of order` and corrupt packets.
+Arrival time is the only clock that stays continuous across a switch.
+
+**15. One composite at a time, and never one without an audience.**
+`MULTIVIEW_MAX_ACTIVE` is enforced by refusing the second, not by queueing it,
+and a reaper stops any composite with no viewer for `MULTIVIEW_IDLE_TIMEOUT`.
+An encoder is the most expensive thing this service does; a forgotten one
+costs a third of the box indefinitely.
+
+**16. A multi slot commits its response before it knows anything.** A cold
+composite is tens of seconds from its first frame and no tuner waits that
+long, so `/stream?multi=` returns 200 immediately and pads the wire with
+`TS_NULL_PACKET` until the picture exists. The padding **must not leave a gap
+over ~10s**: Dispatcharr grants its 60s init grace only while its buffer is
+still empty, and the first padding byte ends that - from then on the budget is
+`CONNECTION_TIMEOUT`, which is 10s. Raising `STREAM_KEEPALIVE_INTERVAL` above
+about 8s would break multi-view in a way that looks like a source fault. The
+price of committing early is that a failure can no longer be reported: a slot
+that will not start pads for `MULTIVIEW_START_TIMEOUT` and then ends.
+
+**17. One silent input freezes the whole composite, not half of it.** ffmpeg
+will not produce a frame without both inputs, and a source that stops
+producing *without closing* leaves its feeder blocked in a read that never
+returns - so neither end notices. Measured live: a secondary that stalled
+thirteen seconds in held the composite frozen for 55 minutes while the primary
+poured 3.8 GB into a queue nobody could use. Each feeder watches its own
+source and cuts one quiet for `SOURCE_STALL_TIMEOUT`. The cut works by closing
+the *transport*, which is why every source must be a closable wrapper: a bare
+generator cannot be closed while it is executing.
+
+**18. Resolve while waiting for the reader, never after it.** Pitfall #13
+says ffmpeg opens its inputs sequentially. The consequence is that a feeder
+which waits for its reader before starting to resolve makes the composite's
+two cold starts *stack*: 50s to picture, with the secondary not beginning its
+own extraction until the 30s mark. Overlapping them halves it. The early
+attempt has to retry on failure too - a transient upstream 503 on the first
+try is common, and without a retry the overlap buys nothing.
+
+**19. A reader that cannot be interrupted is a viewer that never leaves.**
+`Composite.read()` takes its caller's stop event and polls, rather than
+blocking in `stdout.read()`. Blocking there means a wedged encoder keeps its
+readers counted as an audience for ever - four phantom viewers were once sat
+on one slot - and pitfall #15 becomes quietly false, because the reaper can
+never fire.
+
+**20. An input carries one kind of thing for its whole life.** ffmpeg
+configures each input's decoder from the first stream it sees, and anything
+spliced on afterwards that does not match is not decodable *on that input* -
+which freezes the entire composite, not just that side of the picture,
+silently, with nothing logged anywhere. So filler is for an input that has no
+channel at all and never will; once a real stream has gone in, nothing else
+ever does (`Feeder.carried_source`). This is the rule behind three separate
+bugs: filler played during a connect broke every cold start, filler played
+after a source died would have frozen the picture, and **swapping a channel on
+a running encoder is simply not possible**. Verified live: a healthy 13.8 MB
+composite stopped dead the instant its secondary changed and never produced
+another byte.
+
+**21. A channel change therefore rebuilds the encoder, and that is fine.**
+`Composite.apply` returns `restart` instead of retargeting a feeder; the
+viewer's `_multiview_body` loops, re-attaching to the replacement and re-
+reading the stored configuration, so the **HTTP response is never broken** -
+downstream sees a re-buffer, not a channel that died, because the padding
+covers the gap exactly as it covers a cold start. Corner, size and the mixer
+are the things that are genuinely seamless. Do not "optimise" a channel change
+back into a feeder switch.
+
+**22. A live command only lands while frames are moving.** The `zmq` filter
+services its socket between frames, so a composite whose output nobody is
+draining - or whose input has gone quiet - answers nothing at all, and every
+command costs a full `ZMQ_TIMEOUT`. Batches abandon on the first timeout and
+set `needs_resend` so the reconciler retries; a partial application is the
+dangerous state, because the stored value has moved on and the picture has
+not.
+
+**23. The control endpoint is a Unix socket, and its address needs two
+backslashes before every colon.** A TCP port would be reachable by everything
+else in the VPN's network namespace, which this container shares. The double
+escaping is because the string is unescaped once by the filtergraph parser and
+again by the filter's own option parser; one backslash fails as `No option
+name near '//127.0.0.1'`, which reads like a malformed URL rather than an
+escaping bug.
+
+**24. `merge_slot`, never `set_slot`, for anything a person asked for.**
+Callers send the one thing that changed. `set_slot` replaces the whole slot,
+so a "move the miniplayer" that went through it would silently drop both
+channels - which does not look like a bad request, it looks like the stream
+dying for no reason.
+
+**25. Picking a channel has to start resolving it, there and then.** This is
+the feature, not a speed-up: a cold composite is two cold extractions end to
+end, measured at up to 50s, and a selection that merely records a preference
+leaves every one of those seconds on the tune. With both sides warm the same
+tune reaches picture in **7.8s**. `_warm_now` runs it off the request thread
+and behind `_warm_gate`, so it queues behind the pre-warm loop rather than
+starting a second Chromium.
+
+**26. The warm list is capped and multi-view goes first.** Warming is serial
+at 20-25s per entry, so `PREWARM_MAX_ENTRIES` (12) is already a five-minute
+cycle. Configured slots are warmed whether or not anyone is watching - the
+slot nobody has tuned yet is exactly the one about to be tuned - and when the
+list has to be cut it is the favourites that go, because a slot is a choice
+somebody made a moment ago.
+
+**27. `/api/multiview` never contains a resolved URL.** `/stream/status` is
+gated *because* of the signing tokens in its URLs. Rather than depend on a
+gate for the same reason, this payload simply has none, and the harness greps
+the serialised JSON to keep it that way. It is still gated with the rest of
+the console; that is belt and braces, not the plan.
+
+**28. The console section is absent from the markup when the feature is off,
+not hidden - and the whitespace markers are part of that.**
+`{%- if multiview_enabled %}` in `templates/dashboard.html` is what keeps the
+console HTML byte-identical to a build predating the feature, which is the
+diff the rollout promise is actually checked against. Written without the
+`-` markers it is *not* identical: Jinja leaves the blank line the tag sat on,
+twice, and the promise quietly becomes "identical apart from some
+whitespace". Hiding the section with CSS or script would be worse again -
+copy describing a feature the build does not have. `dashboard.js` looks for
+`#mv-panel` and no-ops when it is missing, so the script needs no flag.
+
+**29. A poll must never re-render a control that is in use.** The section
+re-renders every five seconds from `/api/multiview`. `mvHolding()` suppresses
+that whenever an input inside `#multiview` has focus, and the picker's search
+box re-renders only the list beneath it - otherwise a poll would eat what was
+being typed, and a slider would jump back under the pointer mid-drag. The
+mixer writes on `change`, not `input`, so one drag is one command to the
+encoder rather than twenty. Same discipline as the configuration panel, for
+the same reason.
+
+The subtler half of the same problem: a poll that was **already in flight**
+when a write landed carries the state from before it, and applying it puts
+the old value back on screen for five seconds - a click that visibly undoes
+itself. Each poll is tagged with the time it was sent and discarded if that
+is older than the last write. It showed up as a one-in-several-runs flake in
+the browser harness, which is the only reason it was found at all.
+
+**30. A multi-player channel cannot be a source for a multi-player channel.**
+With the feature on, the composite channels are themselves on the roster, so
+the picker would list them and `_multiview_api_update` would have accepted
+them: a composite whose input is a composite that only starts once something
+tunes it. That deadlock looks like a hang rather than a mistake, so it is
+refused by name in the API and filtered out of the picker. Found by building
+the picker, not by reading the code.
+
+**31. The mixer slider is the one component `DESIGN.md` does not describe.**
+That document records under Known Gaps that no slider was ever surfaced, so
+the control is an extrapolation and is commented as one in `dashboard.css`.
+It is built only from parts the system does define - the pill radius, the
+hairline, the single accent, a circular thumb - so that if the gap is ever
+filled upstream this is the shape most likely to agree with it. Two rules the
+section is the likeliest place in the console to break are asserted by the
+harness rather than trusted: no shadow anywhere in its styles (the system's
+one shadow belongs to product photography) and no colour of its own (the
+secondary stream is told apart by label and position, never by hue).

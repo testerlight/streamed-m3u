@@ -83,6 +83,13 @@
    "tvg_ids": [
     "streamed.feed.nfl-network"
    ]
+  },
+  {
+   "label": "Multi-view",
+   "tvg_ids": [
+    "streamed.feed.multi-player-1",
+    "streamed.feed.multi-player-2"
+   ]
   }
  ],
  "pending_blocks": [

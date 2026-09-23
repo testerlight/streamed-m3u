@@ -3,3 +3,8 @@ requests>=2.31,<3
 curl_cffi>=0.7,<1
 playwright>=1.40,<2
 psutil>=6.0,<7
+# Sends live commands to a running ffmpeg filter graph over its zmq filter,
+# which is how the multi-view composite changes miniplayer position, size and
+# the audio mix without restarting the encoder. Neither zmqsend nor pyzmq
+# ships in the image otherwise. See docs/internal/PENDING_multiview.md.
+pyzmq>=26.0,<28

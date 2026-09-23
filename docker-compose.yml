@@ -58,6 +58,15 @@ services:
       CONSOLE_COOKIE_SECURE: ${CONSOLE_COOKIE_SECURE:-0}
       PREWARM_TEAMS: ${PREWARM_TEAMS:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Multi-view: composite channels carrying two fixtures at once. Off by
+      # default; it can also be switched on from the console (restart).
+      MULTIVIEW_ENABLE: ${MULTIVIEW_ENABLE:-}
+    # Multi-view's default encoder uses the Intel iGPU, which needs the render
+    # node passed in. Nothing else is required: the entrypoint grants the
+    # node's own group after the privilege drop, so no group_add. Without it,
+    # set MULTIVIEW_ENCODER=cpu instead, at a much higher CPU cost.
+    # devices:
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
     volumes:
       - ${CONFIG_DIR:-./config}/streamed-m3u:/data
       # Lets the console Restart control bounce this service and

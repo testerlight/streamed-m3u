@@ -48,6 +48,9 @@
   <nav class="anchors" aria-label="Sections">
     <a href="#overview">Overview</a>
     <a href="#streams">Streams</a>
+    {%- if multiview_enabled %}
+    <a href="#multiview">Multi-player</a>
+    {%- endif %}
     <a href="#prewarm">Pre-warm</a>
     <a href="#roster">Roster</a>
     <a href="#aliases">Aliases</a>
@@ -106,6 +109,24 @@
       <div class="empty"><p>Loading.</p></div>
     </div>
   </section>
+
+  {%- if multiview_enabled %}
+  {#- Rendered only when the feature is on, so a console built from this
+      source with MULTIVIEW_ENABLE=0 is byte-identical to one predating it -
+      note the whitespace-control markers: without them the disabled case
+      leaves blank lines behind and the diff that proves it stops being
+      clean. dashboard.js checks for #mv-panel and no-ops when it is absent. -#}
+  <section id="multiview">
+    <div class="section-head">
+      <h2>Multi-player</h2>
+      <p class="section-note">Two fixtures on one channel: one filling the frame, one in a miniplayer corner. The layout and the mix are properties of the channel, so everyone watching sees the same arrangement. Nothing plays until a main picture is chosen.</p>
+    </div>
+    <div class="toolbar" id="mv-tabs"></div>
+    <div id="mv-panel">
+      <div class="empty"><p>Loading.</p></div>
+    </div>
+  </section>
+  {%- endif %}
 
   <section id="prewarm">
     <div class="section-head">

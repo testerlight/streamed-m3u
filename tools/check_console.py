@@ -352,6 +352,13 @@ if hasattr(app, "auth"):
               c.post("/api/cache/extract/refresh", json={"embed_url": "x"}).status_code == 401)
         check("gated: extract clear 401",
               c.post("/api/cache/extract/clear", json={"embed_url": "x"}).status_code == 401)
+        # Multi-view is off in this harness, so these prove the gate rather
+        # than the feature: the guard is the blueprint's, not the feature's.
+        check("gated: multiview read 401", c.get("/api/multiview").status_code == 401)
+        check("gated: multiview write 401",
+              c.put("/api/multiview/1", json={"corner": "tl"}).status_code == 401)
+        check("gated: multiview stop 401",
+              c.post("/api/multiview/1/stop", json={}).status_code == 401)
         for path in ("/health", "/teams", "/prewarm", "/epg.xml", "/playlist-teams.m3u", "/login", "/api/session"):
             check("still open: %s" % path, c.get(path).status_code == 200)
         import time
@@ -479,6 +486,162 @@ if hasattr(app, "auth"):
         r = c.post("/logout", headers=H, json={})
         check("logout ok", r.status_code == 200)
         check("after logout / redirects", c.get("/").status_code == 302)
+
+# ─── Multi-view, Phase 2 ──────────────────────────────────────────────────────
+# Settings schema and the /data/multiview.json document. No channels and no
+# encoder yet, so what is checked here is that the configuration is exposed,
+# and that a hand-edited file cannot produce a slot the later phases would
+# then have to defend against.
+section("multi-view settings")
+import multiview  # noqa: E402
+import settings as _st  # noqa: E402
+
+# With a password set the section above ends logged out, and /api/config is
+# gated — so sign back in rather than reading a redirect as an empty config.
+if PASSWORD:
+    c.post("/login", data={"password": PASSWORD, "next": "/"})
+cfg = c.get("/api/config").get_json() or {}
+by_env = {}
+for grp in (cfg.get("groups") or []):
+    for s in (grp.get("settings") or []):
+        by_env[s.get("env")] = s
+
+for env in ("MULTIVIEW_ENABLE", "MULTIVIEW_SLOTS", "MULTIVIEW_NAME",
+            "MULTIVIEW_MAX_ACTIVE", "MULTIVIEW_ENCODER", "MULTIVIEW_QP",
+            "MULTIVIEW_IDLE_TIMEOUT", "MULTIVIEW_FILE", "MULTIVIEW_RENDER_NODE"):
+    check("/api/config exposes %s" % env, env in by_env)
+
+check("MULTIVIEW_ENABLE defaults off", app.MULTIVIEW_ENABLE is False, app.MULTIVIEW_ENABLE)
+check("MULTIVIEW_QP carries bounds",
+      by_env.get("MULTIVIEW_QP", {}).get("min") == 1
+      and by_env.get("MULTIVIEW_QP", {}).get("max") == 51)
+check("MULTIVIEW_ENCODER offers vaapi and cpu",
+      tuple(by_env.get("MULTIVIEW_ENCODER", {}).get("choices") or ()) == ("vaapi", "cpu"),
+      by_env.get("MULTIVIEW_ENCODER", {}).get("choices"))
+check("MULTIVIEW_FILE is environment only",
+      by_env.get("MULTIVIEW_FILE", {}).get("editable") is False)
+
+# The cap means nothing above the slot count, so the schema refuses it.
+_, _, errs = _st.validate({"MULTIVIEW_MAX_ACTIVE": 4}, {},
+                          {"MULTIVIEW_SLOTS": 2, "MULTIVIEW_MAX_ACTIVE": 1})
+check("MAX_ACTIVE above SLOTS is rejected", "_cross" in errs, errs.get("_cross"))
+_, _, errs = _st.validate({"MULTIVIEW_MAX_ACTIVE": 2}, {},
+                          {"MULTIVIEW_SLOTS": 2, "MULTIVIEW_MAX_ACTIVE": 1})
+check("MAX_ACTIVE equal to SLOTS is allowed", "_cross" not in errs, errs)
+
+section("multi-view document")
+MV = os.path.join(DATA, "multiview.json")
+mv_empty = multiview.normalize({}, slots=2)
+check("empty doc squares up to the slot count", sorted(mv_empty["slots"]) == ["1", "2"])
+check("empty slot is unconfigured", not multiview.configured(mv_empty["slots"]["1"]))
+
+known = {"kansas-city-chiefs", "baltimore-orioles"}
+slot = multiview.normalize_slot(
+    {"primary": "Kansas-City-Chiefs", "secondary": "baltimore-orioles",
+     "corner": "tl", "size": "large", "audio": {"primary": 80, "secondary": 40}}, known)
+check("primary is lowercased", slot["primary"] == "kansas-city-chiefs", slot["primary"])
+check("secondary kept alongside a primary", slot["secondary"] == "baltimore-orioles")
+check("corner and size kept", slot["corner"] == "tl" and slot["size"] == "large")
+check("gains kept", slot["audio"] == {"primary": 80, "secondary": 40}, slot["audio"])
+
+# The rule the console enforces in the UI, enforced again for hand edits.
+orphan = multiview.normalize_slot({"secondary": "baltimore-orioles"}, known)
+check("secondary without a primary is dropped", orphan["secondary"] == "")
+check("orphaned secondary is muted", orphan["audio"]["secondary"] == 0)
+
+gone = multiview.normalize_slot(
+    {"primary": "kansas-city-chiefs", "secondary": "team-that-left"}, known)
+check("unknown secondary is dropped", gone["secondary"] == "")
+gone = multiview.normalize_slot({"primary": "team-that-left"}, known)
+check("unknown primary leaves the slot unconfigured", not multiview.configured(gone))
+
+same = multiview.normalize_slot(
+    {"primary": "kansas-city-chiefs", "secondary": "kansas-city-chiefs"}, known)
+check("a slug cannot be shown against itself", same["secondary"] == "")
+
+bad = multiview.normalize_slot(
+    {"primary": "kansas-city-chiefs", "corner": "middle", "size": "enormous",
+     "audio": {"primary": 900, "secondary": -5}}, known)
+check("bad corner falls back", bad["corner"] == multiview.DEFAULT_CORNER, bad["corner"])
+check("bad size falls back", bad["size"] == multiview.DEFAULT_SIZE, bad["size"])
+check("gains are clamped", bad["audio"]["primary"] == 100, bad["audio"])
+check("slot survives every field being wrong", multiview.configured(bad))
+
+section("multi-view persistence")
+stored = multiview.set_slot("1", {"primary": "kansas-city-chiefs",
+                                  "secondary": "baltimore-orioles",
+                                  "corner": "tr", "size": "small"},
+                            path=MV, slots=2, known=known)
+check("set_slot returns what was stored", stored["corner"] == "tr", stored["corner"])
+check("set_slot stamps updated", bool(stored.get("updated")))
+check("file written", os.path.exists(MV))
+again = multiview.load(MV, slots=2)
+check("round-trips from disk",
+      again["slots"]["1"]["primary"] == "kansas-city-chiefs"
+      and again["slots"]["1"]["corner"] == "tr")
+check("untouched slot stays empty", not multiview.configured(again["slots"]["2"]))
+check("sources lists primary first",
+      multiview.sources(again["slots"]["1"]) == ["kansas-city-chiefs", "baltimore-orioles"])
+
+multiview.clear_slot("1", path=MV, slots=2)
+check("clear_slot empties the slot",
+      not multiview.configured(multiview.load(MV, slots=2)["slots"]["1"]))
+
+# Same discipline as the roster: the corrupt file is moved aside, the .bak is
+# tried, and only with nothing to recover does the slot go empty. Never fatal
+# on either path. A .bak exists here because the slot was written twice above.
+with open(MV, "w") as fh:
+    fh.write("{not json at all")
+salvaged = multiview.load(MV, slots=2)
+check("corrupt file recovers from .bak rather than raising",
+      sorted(salvaged["slots"]) == ["1", "2"], sorted(salvaged["slots"]))
+check("corrupt original is moved aside",
+      any(f.startswith("multiview.json.corrupt-") for f in os.listdir(DATA)))
+
+# Nothing to recover from: degrade to empty rather than carrying a half-read
+# document forward.
+MV2 = os.path.join(DATA, "multiview-nobak.json")
+with open(MV2, "w") as fh:
+    fh.write("not json either")
+bare = multiview.load(MV2, slots=2)
+check("corrupt file with no backup degrades to empty",
+      sorted(bare["slots"]) == ["1", "2"]
+      and not multiview.configured(bare["slots"]["1"]))
+
+# Slot count changes survive in both directions.
+grown = multiview.normalize({"slots": {"1": {"primary": "kansas-city-chiefs"}}}, slots=3)
+check("raising the slot count adds empty slots", sorted(grown["slots"]) == ["1", "2", "3"])
+shrunk = multiview.normalize(
+    {"slots": {"1": {"primary": "kansas-city-chiefs"},
+               "2": {"primary": "baltimore-orioles"}}}, slots=1)
+check("lowering the slot count drops the extras", sorted(shrunk["slots"]) == ["1"])
+
+# ─── Multi-view, Phase 3 ──────────────────────────────────────────────────────
+# Channels: seeding, the playlist entry, the guide row and the stream route.
+# The feature is off in this process, so the disabled half is checked here and
+# the enabled half runs in a second process below (the slot count and the
+# derived slug map are read once at import).
+section("multi-view channels (disabled)")
+check("no slugs derived when off", app._MULTIVIEW_BY_SLUG == {}, app._MULTIVIEW_BY_SLUG)
+check("no multi entries seeded when off",
+      not any(v.get("kind") == "multi" for v in app._team_roster.values()))
+body, _n = app.build_team_m3u()
+check("playlist carries no multi channels when off", "multi=" not in body)
+r = c.get("/stream?multi=1")
+check("multi tune 404s when off", r.status_code == 404, r.status_code)
+r = c.get("/stream")
+check("no parameter is still a 400", r.status_code == 400, r.status_code)
+
+# The console's half of the same promise. The section is omitted from the
+# markup rather than hidden by script, so a build with the feature off renders
+# what it rendered before the feature existed. (Both modes reach this point
+# with a session: the gated branch above signs in.)
+r = c.get("/")
+check("console renders", r.status_code == 200, r.status_code)
+page = r.get_data(as_text=True)
+check("no multi-player section when off", 'id="multiview"' not in page)
+check("no multi-player anchor when off", 'href="#multiview"' not in page)
+check("no multi-player copy when off", "Multi-player" not in page)
 
 shutil.rmtree(DATA, ignore_errors=True)
 print("\n%s" % ("ALL CHECKS PASSED" if not fails else "FAILURES: " + "; ".join(fails)))

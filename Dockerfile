@@ -33,7 +33,26 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium && playwright install-deps chromium \
     && chmod -R a+rX /ms-playwright
 
-COPY app.py extract_stream.py dashboard.py settings.py auth.py dockerctl.py dispatcharr_sync.py lineup.py entrypoint.sh ./
+# Multi-view composite (docs/internal/PENDING_multiview.md). ffmpeg composites
+# two fixtures into the single MPEG-TS stream a channel can carry, and
+# intel-media-va-driver is the VAAPI runtime that keeps decode and encode on
+# the iGPU rather than on the handful of cores this runs on. Deliberately its
+# own layer, placed after the Chromium install so it cannot invalidate it.
+#
+# Two constraints the Phase 0 spike established, both load-bearing:
+#   - The composite uses SOFTWARE scale/overlay on purpose. overlay_qsv and
+#     vpp_qsv accept live commands and silently ignore them, which would break
+#     the layout and volume controls with no error anywhere. Do not "optimise"
+#     the filter graph onto the QSV filters.
+#   - The free iHD driver is CQP-only here, so h264_vaapi must be driven with
+#     -rc_mode CQP -qp N. Passing -b:v fails outright.
+#
+# tools/check_ffmpeg.py verifies all of this inside a built image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg intel-media-va-driver vainfo \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY app.py extract_stream.py dashboard.py settings.py auth.py dockerctl.py dispatcharr_sync.py lineup.py multiview.py composite.py entrypoint.sh ./
 COPY templates/ ./templates/
 COPY static/ ./static/
 COPY seed/ ./seed/
