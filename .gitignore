@@ -13,6 +13,10 @@ config/
 data/
 *.log
 
+# Internal working notes and scoped-out plans. Kept on the host for the
+# maintainer; not published.
+docs/
+
 # Rollback snapshots and dead versions. These are a working convention on the
 # host, not project history worth publishing.
 app4.py
