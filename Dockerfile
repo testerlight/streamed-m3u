@@ -52,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg intel-media-va-driver vainfo \
     && rm -rf /var/lib/apt/lists/*
 
-COPY app.py extract_stream.py dashboard.py settings.py auth.py dockerctl.py dispatcharr_sync.py lineup.py multiview.py composite.py entrypoint.sh ./
+COPY app.py extract_stream.py dashboard.py settings.py auth.py dockerctl.py dispatcharr_sync.py lineup.py multiview.py composite.py streamhealth.py entrypoint.sh ./
 COPY templates/ ./templates/
 COPY static/ ./static/
 COPY seed/ ./seed/

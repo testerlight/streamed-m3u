@@ -411,6 +411,7 @@ Everything persistent lives in `/data` (mounted from `${CONFIG_DIR}/streamed-m3u
 | `settings.json` | Settings written by the console. Same `.bak` protection. |
 | `multiview.json` | Which fixtures each composite slot points at. Only written when `MULTIVIEW_ENABLE` is on and a slot has been configured. Same `.bak` protection; losing it costs a re-pick, nothing more. |
 | `extract_cache.json` | Resolved stream URLs, so a restart does not need to re-resolve everything. |
+| `stream_history.jsonl` | One line per finished stream: freezes and their causes, download speed, how it ended. The last 500 are kept. Shown under **Recent streams** in the console; safe to delete. |
 | `.secret_key` | Session signing key for console logins. |
 
 On a fresh `/data` the image installs a **seed roster** of about 1,390 team
@@ -444,10 +445,37 @@ filtered; visibility is `hidden_from_output` in Dispatcharr.
 | `PUT /api/multiview/<n>` | Change a slot: any of primary, secondary, corner, size, audio (session and CSRF). Picking a channel starts resolving it immediately. |
 | `POST /api/multiview/<n>/stop` | Stop one slot's encoder (session and CSRF) |
 | `/prewarm` | Pre-warm state per favourite |
-| `/stream/status` | Active streams with throughput |
+| `/stream/status` | Active streams with throughput and health |
+| `GET /api/streams/history` | Finished streams, newest first, with their health and totals |
 | `/api/overview`, `/api/config`, `/api/cache`, `/api/events` | Console data |
 | `PUT /api/settings` | Change settings (session and CSRF token required) |
 | `/playlist.m3u` | Legacy per-match playlist, kept as a fallback |
+
+## Stream health
+
+The console's **Active streams** table has a **Health** column, and **Recent
+streams** lists every stream that has finished. Both only watch: nothing about
+what is sent to Dispatcharr, or when, depends on them.
+
+- **Healthy / Struggling / Frozen.** *Frozen* means the proxy has sent less
+  video than real time has used up, so a player that started with the stream
+  has run dry. *Struggling* means it is about to: chunks downloading slower than
+  they play, playlist errors, or under two seconds of video in hand. Click the
+  badge for the stream's figures and timeline.
+- **Speed** is seconds of video per second of download. Below 1.0x the
+  connection cannot keep up with the stream, whatever the source does.
+- **Every freeze gets a cause**: downloads too slow, a download stalled or
+  failing, the source not publishing, the playlist slow or failing, or an
+  internal error. Stalls a chunk or so apart count as one freeze, the way they
+  look on screen.
+- **How each stream ended**: the player disconnected, a console stop, the idle
+  limit, repeated playlist failures, or a dead link. A stream that comes back on
+  the same channel within a minute is marked as a reconnect, with the number of
+  chunks it sent again.
+
+Freezes are estimated from what was sent. Dispatcharr and Jellyfin buffer a
+little of their own, so a short freeze here may never have reached the screen;
+a long one did.
 
 ## Limitations
 

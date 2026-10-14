@@ -41,6 +41,11 @@ stay usable from curl. The endpoints here cover what had no endpoint at all:
   POST /api/cache/extract/clear
                       Drop one extract-cache entry. Same auth as refresh.
   GET /api/events     Ring buffer of recent log records, newest first.
+  GET /api/streams/history
+                      Finished streams, newest first, with their health
+                      (freezes and causes, speed, why each ended) and totals.
+                      Read-only; gated like the rest of /api when a password
+                      is set.
   POST /api/streams/<id>/disconnect
                       Stop one active proxy session. Uses the same stop
                       event the generator already watches for a client
@@ -105,6 +110,7 @@ _lineup_update = None
 _multiview_view = None
 _multiview_update = None
 _multiview_stop = None
+_stream_history = None
 
 
 # ─── Event ring buffer ────────────────────────────────────────────────────────
@@ -461,13 +467,25 @@ def api_events():
     })
 
 
+@bp.route("/api/streams/history")
+def api_stream_history():
+    """Finished streams, newest first. Watch-only data from streamhealth.py."""
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 500))
+    except (TypeError, ValueError):
+        limit = 100
+    if _stream_history is None:
+        return jsonify({"records": [], "totals": None})
+    return jsonify(_stream_history(limit))
+
+
 def register_dashboard(flask_app, *, runtime, caches, config_values,
                        apply_settings=None, stop_stream=None,
                        refresh_extract=None, clear_extract=None,
                        restart_services=None,
                        lineup_view=None, lineup_update=None,
                        multiview_view=None, multiview_update=None,
-                       multiview_stop=None,
+                       multiview_stop=None, stream_history=None,
                        capture_logs=True):
     """Attach the console to a Flask app.
 
@@ -482,11 +500,13 @@ def register_dashboard(flask_app, *, runtime, caches, config_values,
     PID 1 when the verification harness is running. multiview_view /
     multiview_update / multiview_stop are the multi-view coupling; the view is
     deliberately URL-free, so the read endpoint needs no gate of its own.
+    stream_history is limit -> dict, used by GET /api/streams/history.
     """
     global _runtime_provider, _caches_provider, _config_provider
     global _apply_settings, _stop_stream, _refresh_extract, _clear_extract
     global _restart_services, _lineup_view, _lineup_update
     global _multiview_view, _multiview_update, _multiview_stop
+    global _stream_history
     _runtime_provider = runtime
     _caches_provider = caches
     _config_provider = config_values
@@ -500,6 +520,7 @@ def register_dashboard(flask_app, *, runtime, caches, config_values,
     _multiview_view = multiview_view
     _multiview_update = multiview_update
     _multiview_stop = multiview_stop
+    _stream_history = stream_history
 
     if capture_logs:
         root = logging.getLogger()

@@ -7,7 +7,7 @@ Two documents, no overlap between them:
   `python settings.py --markdown`; regenerate it rather than editing by hand.
 - `instructions.md` is the maintainer handover: how the system works
   internally, the TrueNAS SCALE deployment specifics, the settings and auth
-  model, and a numbered list of gotchas (currently 28, plus 41 multi-view
+  model, and a numbered list of gotchas (currently 29, plus 41 multi-view
   pitfalls in §12) covering real bugs
   already hit here. **Read it before changing `app.py`.** Skipping it risks
   redoing debugging that has already been done.
@@ -21,6 +21,12 @@ seed lineup onto an existing `/data`, and never filter `build_team_m3u()`.
 Working notes and scoped-out plans live in `docs/internal/`. Check
 `docs/internal/PENDING_stream_quality.md` for anything touching playback
 quality (failover, buffering, startup latency); it is not yet implemented.
+
+Stream health is being built in three phases, one at a time, per
+`.scratch/stream-health/spec.md`. Phase 1 (`streamhealth.py`, gotcha #29)
+only watches. Do not add detection thresholds or automatic recovery until
+that spec's gate is met: at least five real freezes in the history, read
+with the user.
 
 Verification runs inside the image, not on the host: see the docstring of
 `tools/check_console.py`. Build to a scratch tag for that; never retag the

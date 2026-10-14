@@ -50,6 +50,9 @@
     flash: {},              // env or "overrides.key" -> "applied" | "restart"
     saving: false,
     disconnecting: {},      // stream_id -> true while a stop is in flight
+    healthOpen: {},         // stream_id -> true while its timeline is shown
+    lastStreams: null,      // last /stream/status payload, for local re-renders
+    streamIds: "",          // ids seen last poll; a change refreshes history
     cacheBusy: {}           // embed_url -> "refresh" | "clear" while in flight
   };
 
@@ -296,9 +299,18 @@
 
   function renderStreams(d) {
     var streams = d.streams || [];
+    state.lastStreams = d;
+    var ids = streams.map(function (s) { return s.stream_id; }).sort().join(",");
+    if (state.streamIds && ids !== state.streamIds) { pollHistory(); }
+    state.streamIds = ids || "-";
     Object.keys(state.disconnecting).forEach(function (id) {
       if (!streams.some(function (s) { return s.stream_id === id; })) {
         delete state.disconnecting[id];
+      }
+    });
+    Object.keys(state.healthOpen).forEach(function (id) {
+      if (!streams.some(function (s) { return s.stream_id === id; })) {
+        delete state.healthOpen[id];
       }
     });
     if (!streams.length) {
@@ -318,6 +330,7 @@
         '<td class="nowrap"><span class="dot ' + (stalled ? "error" : "live") +
           '" style="display:inline-block;margin-right:7px;"></span>' +
           '<span class="mono">' + esc(s.stream_id) + "</span></td>" +
+        healthCell(s) +
         '<td><span class="cell-truncate mono" title="' + esc(s.m3u8_url || s.embed_url) +
           '">' + esc(shortUrl(s.m3u8_url || s.embed_url)) + "</span></td>" +
         '<td class="right nowrap">' + dur(s.elapsed_seconds) + "</td>" +
@@ -337,16 +350,209 @@
             (stopping ? " disabled" : "") + ">" +
             (stopping ? "Stopping" : "Disconnect") +
           "</button></td>" +
-        "</tr>";
+        "</tr>" + healthRow(s, 11);
     });
     $("streams-panel").innerHTML = table([
-      { label: "Stream" }, { label: "Source" },
+      { label: "Stream" }, { label: "Health" }, { label: "Source" },
       { label: "Elapsed", right: true }, { label: "Rate", right: true },
       { label: "Sent", right: true }, { label: "Segments", right: true },
       { label: "Failed", right: true }, { label: "Retried", right: true },
       { label: "Last segment", right: true },
       { label: "", right: true }
     ], rows);
+  }
+
+  /* ── Stream health ────────────────────────────────────────────────────── */
+  /* Watch-only (streamhealth.py). The badge is the toggle for the stream's
+   * own timeline, which lives in a full-width row under it, so the table
+   * gains one narrow column rather than a wall of new figures. */
+
+  var HEALTH_LABEL = { healthy: "Healthy", struggling: "Struggling",
+                       frozen: "Frozen", starting: "Starting" };
+  var HEALTH_TONE = { healthy: "ok", struggling: "warn", frozen: "error",
+                      starting: "default" };
+  var CAUSE_TEXT = {
+    slow: "Downloads too slow", stalled: "Download stalled or failing",
+    source: "Source not publishing", playlist: "Playlist slow or failing",
+    internal: "Internal error", unknown: "Unknown"
+  };
+  var END_TEXT = {
+    client_left: "Player disconnected", console: "Stopped from the console",
+    idle_timeout: "Idle limit", playlist_failures: "Playlist failed repeatedly",
+    fatal: "Source link dead"
+  };
+
+  function fx(v) {
+    if (v === null || v === undefined) { return "n/a"; }
+    return (v >= 10 ? Math.round(v) : Number(v).toFixed(2)) + "×";
+  }
+
+  function secs(v) {
+    if (v === null || v === undefined) { return "n/a"; }
+    return v < 60 ? Number(v).toFixed(v < 10 ? 1 : 0) + "s" : dur(v);
+  }
+
+  function mbit(v) {
+    return v === null || v === undefined ? "n/a" : Number(v).toFixed(1) + " Mbit/s";
+  }
+
+  function causeList(byCause) {
+    var keys = Object.keys(byCause || {}).filter(function (k) { return byCause[k] >= 0.05; });
+    keys.sort(function (a, b) { return byCause[b] - byCause[a]; });
+    return keys.map(function (k) {
+      return (CAUSE_TEXT[k] || k) + " " + secs(byCause[k]);
+    }).join(", ");
+  }
+
+  function variantText(h) {
+    var v = h.variant;
+    if (!v) { return "single quality"; }
+    var label = (v.resolution || "?") + (v.bandwidth ? " @ " + mbit(v.bandwidth / 1e6) : "");
+    var others = (h.variants || []).slice(1).map(function (o) {
+      return (o.resolution || "?") + (o.bandwidth ? " @ " + mbit(o.bandwidth / 1e6) : "");
+    });
+    return label + (others.length ? " (also offered: " + others.join(", ") + ")" : "");
+  }
+
+  function healthCell(s) {
+    var h = s.health;
+    if (!h) { return '<td class="nowrap"><span class="cell-dim">n/a</span></td>'; }
+    var open = !!state.healthOpen[s.stream_id];
+    var sub = [];
+    if (h.speed !== null && h.speed !== undefined) { sub.push(fx(h.speed)); }
+    if (h.cushion_s !== null && h.cushion_s !== undefined) { sub.push("cushion " + secs(h.cushion_s)); }
+    return '<td class="nowrap">' +
+      '<button type="button" class="health-toggle" data-health="' + esc(s.stream_id) + '"' +
+        ' aria-expanded="' + (open ? "true" : "false") + '"' +
+        ' title="' + esc(h.reason || HEALTH_LABEL[h.state] || "") + '">' +
+        '<span class="badge ' + (HEALTH_TONE[h.state] || "default") + '">' +
+          esc(HEALTH_LABEL[h.state] || h.state) + "</span>" +
+        '<span class="health-caret" aria-hidden="true">' + (open ? "▾" : "▸") + "</span>" +
+      "</button>" +
+      (sub.length ? '<div class="health-sub">' + esc(sub.join(" · ")) + "</div>" : "") +
+      (h.freezes ? '<div class="health-sub">' + esc(plural(h.freezes, "freeze") + ", " +
+        secs(h.frozen_s)) + "</div>" : "") +
+      "</td>";
+  }
+
+  function healthFacts(h) {
+    var rc = h.reconnect;
+    var facts = [
+      ["Now", h.reason || HEALTH_LABEL[h.state] || h.state],
+      ["Speed", fx(h.speed) + " real time" +
+        (h.link_mbit !== null && h.link_mbit !== undefined ? " (link " + mbit(h.link_mbit) + ")" : "")],
+      ["Video needs", mbit(h.video_mbit)],
+      ["Quality taken", variantText(h)],
+      ["Cushion", secs(h.cushion_s)],
+      ["Behind live", secs(h.behind_live_s)],
+      ["Freezes", h.freezes ? plural(h.freezes, "freeze") + ", " + secs(h.frozen_s) +
+        " total (" + causeList(h.by_cause) + ")" : "none"],
+      ["Jumps", plural(h.skipped || 0, "chunk") + " skipped, " +
+        plural((h.backwards || 0) + (h.playlist_backwards || 0), "jump") + " back"],
+      ["Errors", plural(h.playlist_errors || 0, "playlist error") + ", " +
+        plural(h.downloads_failed || 0, "chunk") + " dropped, " +
+        plural(h.internal_errors || 0, "internal error")]
+    ];
+    if (rc) {
+      facts.push(["Reconnect", "came back " + secs(rc.after_s) + " after " +
+        esc(rc.previous_id) + " ended (" + (END_TEXT[rc.previous_reason] || rc.previous_reason) +
+        "); replayed " + plural(rc.replayed_chunks || 0, "chunk")]);
+    }
+    if (h.endlist) { facts.push(["Source", "says the broadcast has ended"]); }
+    return '<dl class="health-facts">' + facts.map(function (f) {
+      return "<dt>" + esc(f[0]) + "</dt><dd>" + esc(f[1]) + "</dd>";
+    }).join("") + "</dl>";
+  }
+
+  function healthTimeline(items) {
+    if (!items || !items.length) { return ""; }
+    return '<ol class="health-timeline">' + items.slice().reverse().map(function (e) {
+      return '<li class="kind-' + esc(e.kind) + '"><time>' + esc(clock(e.ts)) + "</time>" +
+        "<span>" + esc(e.text) + "</span></li>";
+    }).join("") + "</ol>";
+  }
+
+  function healthRow(s, colspan) {
+    if (!s.health || !state.healthOpen[s.stream_id]) { return ""; }
+    return '<tr class="health-row"><td colspan="' + colspan + '">' +
+      '<div class="health-detail">' + healthFacts(s.health) +
+      healthTimeline(s.health.timeline) + "</div></td></tr>";
+  }
+
+  function toggleHealth(id) {
+    if (state.healthOpen[id]) { delete state.healthOpen[id]; }
+    else { state.healthOpen[id] = true; }
+    if (state.lastStreams) { renderStreams(state.lastStreams); }
+  }
+
+  /* ── Recent streams ───────────────────────────────────────────────────── */
+
+  function renderHistory(d) {
+    var el = $("history-panel");
+    if (!el) { return; }
+    var recs = (d && d.records) || [];
+    if (!recs.length) {
+      el.innerHTML = '<div class="table-wrap">' + emptyState(
+        "No finished streams yet",
+        "Every stream that ends is recorded here, with its freezes and why it ended. " +
+        "The record survives restarts and deploys.") + "</div>";
+      return;
+    }
+    var t = d.totals || {};
+    var endings = Object.keys(t.ended || {}).sort(function (a, b) {
+      return t.ended[b] - t.ended[a];
+    }).map(function (k) { return (END_TEXT[k] || k) + " " + t.ended[k]; }).join(", ");
+    var head = '<div class="stat-grid history-stats">' +
+      stat("hist-streams", "Streams", num(t.streams), dur(t.seconds) + " watched") +
+      stat("hist-freezes", "Freezes", num(t.freezes),
+           num(t.with_freezes) + " of " + num(t.streams) + " streams") +
+      stat("hist-frozen", "Frozen time", secs(t.frozen_s), causeList(t.by_cause) || "none") +
+      stat("hist-ended", "Reconnects", num(t.reconnects),
+           num(t.replayed_chunks) + " replayed chunks") +
+      "</div>" +
+      (endings ? '<p class="section-note history-endings">How they ended: ' + esc(endings) + "</p>" : "");
+    var rows = recs.map(function (r) {
+      var top = "";
+      var bc = r.by_cause || {};
+      Object.keys(bc).forEach(function (k) { if (!top || bc[k] > bc[top]) { top = k; } });
+      var notes = [];
+      if (r.reconnect) {
+        notes.push("reconnect" + (r.reconnect.replayed_chunks
+          ? ", replayed " + r.reconnect.replayed_chunks : ""));
+      }
+      if (r.skipped) { notes.push(r.skipped + " skipped"); }
+      if ((r.backwards || 0) + (r.playlist_backwards || 0)) { notes.push("jumped back"); }
+      if (r.multiview) { notes.push("multi-view " + r.multiview); }
+      if (r.endlist) { notes.push("broadcast ended"); }
+      return "<tr>" +
+        '<td class="nowrap">' + esc(clock(r.ended)) + "</td>" +
+        '<td><span class="cell-truncate" title="' + esc(r.channel) + '">' + esc(r.channel) + "</span>" +
+          (r.source ? '<span class="cell-dim mono">' + esc(r.source) + "</span>" : "") + "</td>" +
+        '<td class="right nowrap">' + dur(r.seconds) + "</td>" +
+        '<td class="right nowrap">' + (r.freezes
+          ? '<span class="badge ' + (r.frozen_s >= 10 ? "error" : "warn") + '">' + num(r.freezes) +
+            " · " + secs(r.frozen_s) + "</span>"
+          : '<span class="cell-dim">0</span>') + "</td>" +
+        "<td>" + (top ? esc(CAUSE_TEXT[top] || top) : '<span class="cell-dim">—</span>') + "</td>" +
+        '<td class="right nowrap">' + fx(r.speed_median) +
+          '<span class="cell-dim"> / ' + fx(r.speed_p10) + "</span></td>" +
+        '<td class="right nowrap">' + mbit(r.video_mbit) +
+          '<span class="cell-dim"> / ' + mbit(r.link_mbit_median) + "</span></td>" +
+        "<td>" + esc(END_TEXT[r.end_reason] || r.end_reason || "") + "</td>" +
+        '<td class="cell-dim">' + esc(notes.join(", ")) + "</td>" +
+        "</tr>";
+    });
+    el.innerHTML = head + '<div class="table-wrap">' + table([
+      { label: "Ended" }, { label: "Channel" }, { label: "Length", right: true },
+      { label: "Freezes", right: true }, { label: "Main cause" },
+      { label: "Speed / slowest", right: true }, { label: "Video / link", right: true },
+      { label: "How it ended" }, { label: "Notes" }
+    ], rows) + "</div>";
+  }
+
+  function pollHistory() {
+    get("/api/streams/history?limit=100").then(renderHistory)
+      .catch(guard("history-panel", "history"));
   }
 
   function disconnectStream(id) {
@@ -1651,7 +1857,8 @@
       ["/health", "Machine-readable status. Roster size, guide count, cache state."],
       ["/teams", "Every channel resolvable right now, with its ranked sources."],
       ["/prewarm", "Per-favourite warm state and remaining cache TTL."],
-      ["/stream/status", "Currently active streams with byte and segment counters."],
+      ["/stream/status", "Currently active streams with byte and segment counters, and each stream's health."],
+      ["/api/streams/history", "Finished streams, newest first: freezes and their causes, speed, how each ended."],
       ["/api/overview", "Aggregate figures behind this page."],
       ["/api/config", "Effective configuration as JSON, with sources and bounds."],
       ["/api/settings", "PUT a change here. Needs a session and the CSRF token."],
@@ -1716,6 +1923,7 @@
     get("/teams?alias=1").then(renderAliases).catch(guard("alias-panel", "aliases"));
     get("/api/cache").then(renderCaches).catch(guard("cache-panel", "caches"));
     get("/api/config").then(applyConfig).catch(guard("config-panel", "config"));
+    pollHistory();
   }
 
   function pollAll() { pollFast(); pollSlow(); }
@@ -2032,6 +2240,11 @@
         return;
       }
       if (target.closest("[data-mv-stop]")) { mvStop(); return; }
+      var healthToggle = target.closest("[data-health]");
+      if (healthToggle) {
+        toggleHealth(healthToggle.getAttribute("data-health"));
+        return;
+      }
       var stop = target.closest("[data-disconnect]");
       if (stop) {
         disconnectStream(stop.getAttribute("data-disconnect"));

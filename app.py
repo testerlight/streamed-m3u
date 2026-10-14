@@ -59,6 +59,7 @@ from flask import Flask, Response, jsonify, request, has_request_context
 
 import auth
 import dashboard
+import streamhealth
 import dockerctl
 import composite
 import lineup
@@ -107,6 +108,9 @@ EXTRACT_CACHE_TTL  = int(os.getenv("EXTRACT_CACHE_TTL", "300"))  # 5 minutes
 EXTRACT_CACHE_FILE = os.getenv("EXTRACT_CACHE_FILE", "/data/extract_cache.json")
 TEAMS_FILE         = os.getenv("TEAMS_FILE", "/data/teams.json")
 LINEUP_FILE        = os.getenv("LINEUP_FILE", "/data/lineup.json")
+# One JSON line per finished stream (streamhealth.py), last 500 kept.
+STREAM_HISTORY_FILE = os.getenv("STREAM_HISTORY_FILE",
+                                "/data/stream_history.jsonl")
 # Bundled roster copied into place when TEAMS_FILE does not exist yet.
 SEED_TEAMS_FILE    = os.getenv("SEED_TEAMS_FILE", "/app/seed/teams.json")
 # Bundled majors-only lineup, copied only on the same first-boot as the roster.
@@ -780,12 +784,20 @@ def _segment_key(url):
 # with the same cached m3u8. Invalidate cache and surface a 502.
 FATAL_STATUS_CODES = {400, 401, 403, 404, 410, 451}
 
-def get_segments(m3u8_url, headers, cookies, _depth=0):
+# Health tracking keys chunks exactly as the dedup does, so a re-signed chunk
+# is still the same chunk to it.
+streamhealth.configure(key_fn=_segment_key, history_path=STREAM_HISTORY_FILE)
+
+def get_segments(m3u8_url, headers, cookies, _depth=0, info=None):
     """
     Fetch m3u8 manifest and return (segments, status_code).
     Handles master playlists (variant streams) and media playlists that
     reference sub-playlists (e.g. tracks-v1a1/mono.ts.m3u8) by recursing
     into them until actual .ts segments are found.
+
+    `info`, when given, is filled with what the playlist's tags say (variants,
+    sequence numbers, durations) for stream health tracking. That parse is a
+    separate pass that cannot raise, so it never changes the return value.
     """
     if _depth > 3:
         return None, 0  # Guard against infinite recursion
@@ -817,8 +829,11 @@ def get_segments(m3u8_url, headers, cookies, _depth=0):
         else:
             segments.append(url)
 
+    streamhealth.note_playlist(m3u8_url, r.text, resolve_url, info)
+
     if sub_playlists and not segments:
-        return get_segments(sub_playlists[0], headers, cookies, _depth + 1)
+        return get_segments(sub_playlists[0], headers, cookies, _depth + 1,
+                            info=info)
 
     return segments, 200
 
@@ -2848,6 +2863,7 @@ def stream_proxy():
     tried    = min(len(candidates), CASCADE_MAX_ATTEMPTS)
     data = m3u8_url = headers = cookies = probe_segments = None
     primed   = None
+    source_label = ""
     attempts = []
     silent_fallback = None   # (embed_url, label, payload) - used only if
                              # nothing with audio can be found at all
@@ -2874,6 +2890,7 @@ def stream_proxy():
         embed_url, data, m3u8_url = cand_url, d, d["url"]
         headers, cookies, probe_segments = h, c, segs
         primed = first
+        source_label = cand["label"]
         if n > 1:
             log.info("Cascade succeeded on attempt %d (%s) after %.1fs",
                      n, cand["label"], time.time() - started)
@@ -2887,6 +2904,7 @@ def stream_proxy():
         embed_url, data, m3u8_url = cand_url, d, d["url"]
         headers, cookies, probe_segments = h, c, segs
         primed = first
+        source_label = cand_label
         log.warning("No source with audio for this match - falling back to "
                     "silent %s (%s)", cand_label, cand_url)
 
@@ -2898,13 +2916,16 @@ def stream_proxy():
             "No playable stream found (tried: %s)\n" % detail, status=502)
 
     def stream_ts(m3u8_url, headers, cookies, initial_segments, stream_id,
-                  primed=None, stop=None):
+                  primed=None, stop=None, health=None):
         """Continuously fetch and yield TS segments as a raw byte stream.
         Uses a stop event so the loop exits cleanly when the client
         disconnects or the console asks this session to stop. On fatal CDN
         errors, invalidates the extract cache so the next request triggers
         a fresh browser extraction rather than re-using a dead URL."""
         stop = stop or threading.Event()
+        # Watch-only (streamhealth.py): every call on H is guarded and returns
+        # None, so none of them can change what is sent or when.
+        H = health or streamhealth.NULL
 
         def _bump(field, n=1):
             with _active_streams_lock:
@@ -2928,6 +2949,7 @@ def stream_proxy():
             for attempt in range(1, SEGMENT_RETRIES + 2):
                 if stop.is_set():
                     return None
+                H.download_attempt(attempt)
                 try:
                     seg = cf_requests.get(
                         seg_url,
@@ -2958,6 +2980,7 @@ def stream_proxy():
                             return None
                         if chunk:
                             buf.extend(chunk)
+                            H.download_bytes(len(chunk))
                             if len(buf) > cap:
                                 log.warning("Segment exceeded %dMB while "
                                             "downloading, abandoning: %s",
@@ -3084,6 +3107,7 @@ def stream_proxy():
                     if cut:
                         _note_prefix(cut)
                     delivered += 1
+                    H.sending()
                     for off in range(0, len(body), 8192):
                         if stop.is_set():
                             return
@@ -3093,14 +3117,18 @@ def stream_proxy():
                             if stream_id in _active_streams:
                                 _active_streams[stream_id]["bytes_sent"] += len(chunk)
                         yield chunk
+                    H.delivered(seg_url, len(body))
                     continue
+                H.download_begin(seg_url)
                 body = yield from _fetch_with_keepalive(seg_url)
+                H.download_end(seg_url, body)
                 if body is None:
                     continue
                 body, cut = _strip_ts_prefix(body)
                 if cut:
                     _note_prefix(cut)
                 delivered += 1
+                H.sending()
                 for off in range(0, len(body), 8192):
                     if stop.is_set():
                         return
@@ -3110,6 +3138,7 @@ def stream_proxy():
                         if stream_id in _active_streams:
                             _active_streams[stream_id]["bytes_sent"] += len(chunk)
                     yield chunk
+                H.delivered(seg_url, len(body))
 
             if initial_segments:
                 last_data_at = time.time()
@@ -3129,10 +3158,15 @@ def stream_proxy():
                         "Stream idle for >%ds, self-terminating (id=%s)",
                         STREAM_IDLE_TIMEOUT, stream_id,
                     )
+                    H.end("idle_timeout", "%ds" % STREAM_IDLE_TIMEOUT)
                     break
                 try:
-                    segments, status = get_segments(m3u8_url, headers, cookies)
+                    H.playlist_begin()
+                    pl = {}
+                    segments, status = get_segments(m3u8_url, headers, cookies,
+                                                    info=pl)
                     if not segments:
+                        H.playlist_failed(status, empty=segments is not None)
                         consecutive_failures += 1
                         if status in FATAL_STATUS_CODES:
                             log.warning(
@@ -3142,20 +3176,26 @@ def stream_proxy():
                             with _extract_cache_lock:
                                 _extract_cache.pop(embed_url, None)
                             _save_extract_cache()
+                            H.end("fatal", "HTTP %d" % status)
                             break
                         if consecutive_failures > 5:
                             log.warning("Too many consecutive m3u8 failures, stopping stream")
+                            H.end("playlist_failures",
+                                  "%d in a row" % consecutive_failures)
                             break
                         yield from _idle(2)
                         continue
                     consecutive_failures = 0
                     new_segments = [s for s in segments
                                     if _segment_key(s) not in seen_set]
+                    H.playlist_ok(pl, len(new_segments))
                     loop_delivered = 0
                     for seg_url in new_segments:
                         if stop.is_set():
                             return
+                        H.download_begin(seg_url)
                         body = yield from _fetch_with_keepalive(seg_url)
+                        H.download_end(seg_url, body)
                         # Marked seen only after the attempts conclude, but
                         # marked either way: a chunk the CDN has genuinely
                         # dropped must not be retried forever while the live
@@ -3167,6 +3207,7 @@ def stream_proxy():
                         if cut:
                             _note_prefix(cut)
                         loop_delivered += 1
+                        H.sending()
                         for off in range(0, len(body), 8192):
                             if stop.is_set():
                                 return
@@ -3176,6 +3217,7 @@ def stream_proxy():
                                 if stream_id in _active_streams:
                                     _active_streams[stream_id]["bytes_sent"] += len(chunk)
                             yield chunk
+                        H.delivered(seg_url, len(body))
                     if loop_delivered:
                         with _active_streams_lock:
                             if stream_id in _active_streams:
@@ -3185,7 +3227,10 @@ def stream_proxy():
                         yield from _idle(2)
                 except GeneratorExit:
                     return
-                except Exception:
+                except Exception as exc:
+                    # Was silent. Still answered exactly as before; the
+                    # tracker now logs it (once per distinct error).
+                    H.loop_error(exc)
                     yield from _idle(2)
 
         try:
@@ -3194,6 +3239,7 @@ def stream_proxy():
             stop.set()
             with _active_streams_lock:
                 _active_streams.pop(stream_id, None)
+            H.finish()
             log.info("Stream closed for: %s", m3u8_url)
 
     # Register stream in active tracking before starting response.
@@ -3201,6 +3247,11 @@ def stream_proxy():
     # session to exit without a second shutdown path.
     stream_id = str(uuid.uuid4())[:8]
     stop = threading.Event()
+    mv_slot = request.headers.get("X-Multiview-Slot") or None
+    health = streamhealth.track(
+        stream_id, channel_key=hold_key, channel=team_arg or embed_url,
+        source=source_label, multiview=mv_slot,
+        concurrency=lambda: len(_active_streams))
     with _active_streams_lock:
         _active_streams[stream_id] = {
             "stream_id":       stream_id,
@@ -3227,14 +3278,17 @@ def stream_proxy():
             # viewer, as "<slot>/<role>". Sent as a header rather than a
             # query parameter so the URL - and with it the operator
             # disconnect-hold key - stays identical to a normal viewer's.
-            "multiview":         request.headers.get("X-Multiview-Slot") or None,
+            "multiview":         mv_slot,
             "stop":              stop,
+            # Watch-only health tracker (streamhealth.py); /stream/status
+            # shows its snapshot, and it writes the history line at the end.
+            "health":            health,
         }
 
     log.info("Streaming TS from: %s (id=%s)", m3u8_url, stream_id)
     return Response(
         stream_ts(m3u8_url, headers, cookies, probe_segments, stream_id,
-                  primed, stop=stop),
+                  primed, stop=stop, health=health),
         content_type="video/mp2t",
         direct_passthrough=True,
     )
@@ -3302,8 +3356,10 @@ def _stop_active_stream(stream_id: str) -> str:
         rec = _active_streams.get(stream_id)
         ev = rec.get("stop") if rec else None
         hold_key = rec.get("hold_key") if rec else None
+        health = rec.get("health") if rec else None
     if ev is None:
         return "missing"
+    (health or streamhealth.NULL).end("console")
     ev.set()
     if hold_key:
         _hold_disconnect(hold_key)
@@ -3342,6 +3398,8 @@ def stream_status():
             # Set when this stream is one leg of a composite rather than a
             # viewer, as "<slot>/<role>".
             "multiview":        s.get("multiview"),
+            # Watch-only health (streamhealth.py). None if tracking failed.
+            "health":           (s.get("health") or streamhealth.NULL).snapshot(),
         })
 
     composites = _mv_manager_instance.stats() if _mv_manager_instance else []
@@ -3851,6 +3909,18 @@ def _dash_runtime() -> dict:
     }
 
 
+def _stream_history(limit: int) -> dict:
+    """Finished streams, newest first, and their totals (streamhealth.py)."""
+    records = streamhealth.HISTORY.read(limit)
+    return {
+        "keep":        streamhealth.HISTORY.keep,
+        "totals":      streamhealth.totals(records),
+        "causes":      streamhealth.CAUSES,
+        "end_reasons": streamhealth.END_REASONS,
+        "records":     records,
+    }
+
+
 def _dash_caches() -> dict:
     """Cache contents for /api/cache."""
     now = time.time()
@@ -3915,6 +3985,7 @@ dashboard.register_dashboard(
     config_values=lambda: globals(),
     apply_settings=lambda s, o: _settings.apply_live(globals(), s, o),
     stop_stream=_stop_active_stream,
+    stream_history=_stream_history,
     refresh_extract=_refresh_extract_entry,
     clear_extract=_clear_extract_entry,
     restart_services=dockerctl.restart_services,

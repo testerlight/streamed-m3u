@@ -66,6 +66,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `dashboard.py`, `templates/`, `static/` | The console. |
 | `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
+| `streamhealth.py` | Watch-only stream health: speed, cushion, freezes and causes, jumps, end reasons, and the `/data/stream_history.jsonl` writer. Changes nothing a stream sends. Gotcha #29. |
 | `tools/reorder_channels.py` | Channel numbering. `--dump-config` prints the built-in order as editable JSON. |
 | `tools/channel_order.example.json` | Generated: exactly `reorder_channels.py --dump-config`. Regenerate it, do not edit it; `check_reorder.py` fails if it drifts. |
 | `tools/check_pacing.py` | Does a composite play at real speed when its inputs arrive in production-shaped bursts? Frame-numbered picture, read back per output frame. `MODE=smooth`/`filler`, `SECONDARY=none`. About a minute; run it after any change to the feeders or the ffmpeg argv. #34-#38. |
@@ -73,6 +74,8 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/soak_multiview.py` | Run on the **host**. Plays a Multi-Player channel through Dispatcharr's proxy (as Jellyfin does), optionally with an ordinary channel alongside and every control stepped, and reports gaps, Dispatcharr's unhealthy/switch counts, encoder exits, CPU and GPU. No Dispatcharr login. |
 | `tools/multiview_api.py` | Console-API helper piped into the running container (`docker exec -i streamed-m3u python - get` / `put '<json>'` / `stop`), so the console password never leaves it. Used by the soak. |
 | `tools/check_console.py`, `tools/check_render.py` | Verification harnesses. Bind-mounted into a scratch image, never shipped. |
+| `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, reconnecting) through the real `/stream` route. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
+| `tools/check_health_render.py`, `tools/check_health_live.py` | The health UI driven in Chromium against scripted streams; and one real stream pulled through a scratch image inside gluetun's namespace (binds no port, own `/data`), reporting health and TS alignment. #29. |
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
 | `tools/check_multiview.py` | Multi-view checks with the feature **on**. A separate script because the slot map is derived once at import, so enabled and disabled cannot share a process. §12. |
 | `tools/live_multiview_ui.py` | The console's multi-player section driven against a **real** encoder and real fixtures. Needs the network and the render node; costs two extractions and a minute of encoding. A gate check, not a routine one. §5b. |
@@ -267,6 +270,20 @@ docker build -t streamed-m3u:verify .
 docker run --rm -e STARTUP_DELAY=0 -e CONSOLE_PASSWORD=x \
   -v $PWD/tools/check_console.py:/tmp/check.py:ro streamed-m3u:verify python /tmp/check.py
 ```
+
+Stream health (gotcha #29) has its own harness. It runs the scripted streams
+through the new image and through the one it replaces, then compares them:
+
+```bash
+mkdir -p /tmp/health && chmod 777 /tmp/health
+docker run --rm -e STARTUP_DELAY=0 -v $PWD/tools/check_health.py:/tmp/h.py:ro \
+  -v /tmp/health:/out streamed-m3u:verify python /tmp/h.py --out /out/new.json
+docker run --rm -e STARTUP_DELAY=0 -v $PWD/tools/check_health.py:/tmp/h.py:ro \
+  -v /tmp/health:/out ix-streamed-m3u-streamed-m3u:latest python /tmp/h.py --baseline --out /out/old.json
+python3 tools/check_health.py --compare /tmp/health/new.json /tmp/health/old.json
+```
+
+About eight minutes in all, most of it real time on purpose.
 
 That covers the feature switched **off**. The multi-view half needs its own
 run, because the slot map is derived once at import and so enabled and
@@ -862,6 +879,50 @@ change that recreates gluetun, recreate streamed-m3u and atwill too:
 --no-deps streamed-m3u` (and the same for atwill). A plain restart of
 gluetun has the same effect on the namespace; treat it the same way.
 
+**29. Stream health only watches, and that is load-bearing.**
+`streamhealth.py` tracks every proxied stream (speed, cushion, freezes and
+their causes, jumps, how it ended) and writes one line per finished stream to
+`/data/stream_history.jsonl`. It never decides anything. It exists because a
+first attempt (2026-10-10) shipped freeze detection *and* automatic recovery
+in one go, alongside an unrelated lineup change, and made playback worse: it
+threw away downloads that were slow but working, spent 3-20s re-extracting,
+skipped ~10s, and ended streams after three recoveries. Everything was
+reverted on 2026-10-11, and buffering carried on without it. Phase 1 is the
+baseline that attempt never had. The plan and its gates are in
+`.scratch/stream-health/spec.md`. Three things are load-bearing:
+
+- **Every hook is guarded.** The stream loop answers any exception with
+  `_idle(2)`, so an unguarded bug in a hook would itself produce a two-second
+  freeze per call. Each hook catches everything, logs once per stream, and
+  returns None; a tracker that cannot be built is replaced by `NULL`, a no-op.
+  `tools/check_health.py` proves it: the same scripted streams through the old
+  image, the new one, the new one with every hook rigged to raise, and the new
+  one with no tracker at all must deliver byte-identical video.
+- **Hooks do no I/O.** The history line goes through a daemon thread after the
+  stream has ended.
+- **`get_segments(..., info=)` is a second pass.** The tag parse runs after the
+  original loop has built its return value and cannot raise, so what the proxy
+  fetches is unchanged. It records durations for every playlist it sees,
+  including the probe's, keyed by `_segment_key` so a re-signed chunk is still
+  the same chunk.
+
+How to read it. The *cushion* is seconds of video sent ahead of a player that
+started at the first byte and plays in real time; when it runs out, that player
+is frozen. Downstream buffers make the real player slightly more patient, so
+the estimate errs towards reporting a freeze. Stalls closer together than 1.5
+chunks (at least 3s) are one freeze: below real time a stream plays a chunk,
+stops, plays a chunk, and counted one gap at a time the stutter disappears
+under any threshold. A freeze's cause is whatever the loop spent most of it
+doing; time blocked on a player that is not reading is recorded as a player
+wait, not a freeze. `speed` below 1.0 means the link cannot keep up; compare
+`video_mbit` with `link_mbit` before blaming a source. The first playlist seen
+on 2026-10-13 offered 1080p at 8 Mbit/s and 540p at 0.7 Mbit/s, and
+`get_segments` always takes the first variant.
+
+Not in Phase 1, on purpose: no threshold, timeout, retry, cache eviction,
+variant choice or reconnect behaviour changed. Those wait for the history to
+hold at least five real freezes, read together with the user.
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when
@@ -878,6 +939,14 @@ curl -s "http://$IP:8787/stream?url=<embed-url>" -o /dev/null      # legacy dire
 /api/settings` changes them (§3, §4). `GET /api/lineup` is the Jellyfin
 lineup; `PUT /api/lineup` adds or removes slugs or a group. `/teams` and
 `/teams?all=1` now carry `kind`, `sport`, `league` and `in_lineup`.
+
+`/stream/status` carries each stream's `health` (gotcha #29), and
+`/api/streams/history` the finished ones with totals:
+
+```bash
+docker exec streamed-m3u tail -n 5 /data/stream_history.jsonl | jq -c '{channel, seconds, freezes, frozen_s, by_cause, speed_median, video_mbit, link_mbit_median, end_reason}'
+docker logs streamed-m3u 2>&1 | grep -E "froze for|summary:"
+```
 
 ---
 

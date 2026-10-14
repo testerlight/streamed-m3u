@@ -48,6 +48,7 @@
   <nav class="anchors" aria-label="Sections">
     <a href="#overview">Overview</a>
     <a href="#streams">Streams</a>
+    <a href="#history">Recent</a>
     {%- if multiview_enabled %}
     <a href="#multiview">Multi-player</a>
     {%- endif %}
@@ -103,10 +104,20 @@
   <section id="streams">
     <div class="section-head">
       <h2>Active streams</h2>
-      <p class="section-note">What is being proxied right now, with per-stream throughput. Disconnect stops this session and refuses reconnects for 90 seconds so the player actually drops.</p>
+      <p class="section-note">What is being proxied right now, with per-stream throughput. Health is watch-only: click it for the stream's timeline. Disconnect stops this session and refuses reconnects for 90 seconds so the player actually drops.</p>
     </div>
     <div class="table-wrap" id="streams-panel">
       <div class="empty"><p>Loading.</p></div>
+    </div>
+  </section>
+
+  <section id="history">
+    <div class="section-head">
+      <h2>Recent streams</h2>
+      <p class="section-note">Every finished stream: how often it froze and why, how fast its chunks downloaded against how fast they play, and how it ended. Freezes are estimated from what was sent, so a short one may never have reached the screen. Kept across restarts; the last 500 are saved in <span class="mono">/data/stream_history.jsonl</span>.</p>
+    </div>
+    <div id="history-panel">
+      <div class="table-wrap"><div class="empty"><p>Loading.</p></div></div>
     </div>
   </section>
 

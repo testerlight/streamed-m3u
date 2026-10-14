@@ -1,0 +1,720 @@
+"""Stream health (Phase 1) verification. Not shipped.
+
+Runs inside an image, with the script bind mounted, against the real app.py:
+
+    # the new image: unit tests, then every scenario with tracking on, with
+    # every tracking hook rigged to raise, and with the tracker failing to
+    # start at all
+    docker run --rm -e STARTUP_DELAY=0 -v $PWD/tools/check_health.py:/tmp/h.py:ro \
+        -v /tmp/out:/out <new-image> python /tmp/h.py --out /out/new.json
+
+    # the image it replaces: the same scenarios, no tracking anywhere
+    docker run --rm -e STARTUP_DELAY=0 -v $PWD/tools/check_health.py:/tmp/h.py:ro \
+        -v /tmp/out:/out <old-image> python /tmp/h.py --baseline --out /out/old.json
+
+    # the proof: identical video, matching timing
+    python3 tools/check_health.py --compare /tmp/out/new.json /tmp/out/old.json
+
+Phase 1 is watch-only, so the claim to prove is that **nothing the proxy
+sends changed**. Each scenario pulls the real /stream route from a fake HLS
+origin on 127.0.0.1 that misbehaves the messy way real sources do: slow
+chunks, a source that stalls and then jumps ahead, playlist error bursts, a
+chunk that stalls halfway, a truncated chunk, a sequence that restarts lower,
+a broadcast that ends. The first attempt's fake failures were too clean
+(dead stayed dead, new links worked instantly), which is why it passed its
+tests and then made real streams worse.
+
+The origin is deterministic by construction - what a playlist lists does not
+depend on exactly when it is polled - so two runs must deliver byte-identical
+video. Each pull stops after a fixed number of chunks rather than after a
+fixed time, for the same reason.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import socket
+import struct
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
+
+D = 1.0                 # seconds of video per chunk
+SEG_PACKETS = 200
+SEG_BYTES = SEG_PACKETS * 188
+FIRST_WINDOW = 3        # what the probe sees: a short, realistic window
+LONG_WINDOW = 20        # later polls: long enough that nothing slides out by accident
+
+fails = []
+
+
+def check(name, cond, detail=""):
+    print("%s %s%s" % ("PASS" if cond else "FAIL", name,
+                       ("  [%s]" % (detail,)) if detail != "" else ""))
+    if not cond:
+        fails.append(name)
+
+
+def section(title):
+    print("\n=== %s ===" % title, flush=True)
+
+
+# ─── Fake origin ──────────────────────────────────────────────────────────────
+
+def seg_body(seq, tag):
+    out = bytearray()
+    for i in range(SEG_PACKETS):
+        out += b"\x47\x41\x00\x10" + struct.pack(">IH", seq, i) + tag * 178
+    return bytes(out)
+
+
+def seg_id(block):
+    return "%s%d" % (block[10:11].decode("ascii", "replace"),
+                     struct.unpack(">I", block[4:8])[0])
+
+
+class Scenario:
+    """One origin timeline. Every misbehaviour is a function of the chunk
+    number or of a fixed point in time that no poll lands near, so what the
+    proxy ends up delivering is the same on every run."""
+
+    def __init__(self, name, take, slow=None, stall=None, pl_errors=None,
+                 seg_fail=None, restart=None, end=None, window=LONG_WINDOW):
+        self.name = name
+        self.take = take            # chunks to pull before hanging up
+        self.slow = slow            # (first, last, seconds per chunk)
+        self.stall = stall          # (start_s, end_s, jump)
+        self.pl_errors = pl_errors  # (start_s, end_s)
+        self.seg_fail = seg_fail or {}   # seq -> "503" | "midstall" | "short"
+        self.restart = restart      # time the sequence restarts lower
+        self.end = end              # time the broadcast ends (ENDLIST)
+        self.window_len = window    # chunks listed once past the probe
+        self.reset()
+
+    def reset(self):
+        self.t0 = time.time()
+        self.lower = None
+        self.attempts = {}
+
+    def first_poll(self):
+        self.lower = None
+
+    def now(self):
+        return time.time() - self.t0
+
+    def window(self):
+        """(tag, first seq, newest seq, media sequence, ended)."""
+        t = self.now()
+        tag, ended = "A", False
+        if self.end is not None and t >= self.end:
+            t, ended = self.end, True
+        newest = 2 + int(t / D)
+        floor = 0
+        if self.stall:
+            s, e, jump = self.stall
+            if s <= t < e:
+                newest = 2 + int(s / D)
+            elif t >= e:
+                newest = 2 + int(s / D) + jump + int((t - e) / D)
+                floor = 2 + int(s / D) + jump
+        if self.restart is not None and t >= self.restart:
+            tag = "B"
+            floor = 2 + int(self.restart / D) - 5
+            newest = floor + int((t - self.restart) / D)
+        if self.lower is None:
+            self.lower = max(floor, newest - FIRST_WINDOW + 1)
+        first = max(self.lower, floor, newest - self.window_len + 1)
+        return tag, first, newest, ended
+
+    def playlist(self):
+        t = self.now()
+        if self.pl_errors and self.pl_errors[0] <= t < self.pl_errors[1]:
+            return 500, ""
+        tag, first, newest, ended = self.window()
+        lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:1",
+                 "#EXT-X-MEDIA-SEQUENCE:%d" % first]
+        prefix = "r2/" if tag == "B" else ""
+        for n in range(first, newest + 1):
+            lines += ["#EXTINF:%.3f," % D, "%sseg%d.ts" % (prefix, n)]
+        if ended:
+            lines.append("#EXT-X-ENDLIST")
+        return 200, "\n".join(lines) + "\n"
+
+
+MASTER = ("#EXTM3U\n"
+          "#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080\nv1/index.m3u8\n"
+          "#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=960x540\nv2/index.m3u8\n")
+
+SCENARIOS = {}
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parts = self.path.split("?")[0].strip("/").split("/")
+        sc = SCENARIOS.get(parts[0])
+        if sc is None:
+            return self._send(404, b"", "text/plain")
+        leaf = parts[-1]
+        if leaf == "master.m3u8":
+            return self._send(200, MASTER.encode(), "application/vnd.apple.mpegurl")
+        if leaf == "index.m3u8":
+            code, text = sc.playlist()
+            return self._send(code, text.encode(), "application/vnd.apple.mpegurl")
+        if leaf.startswith("seg") and leaf.endswith(".ts"):
+            seq = int(leaf[3:-3])
+            tag = b"B" if "r2" in parts else b"A"
+            key = (tag, seq)
+            sc.attempts[key] = sc.attempts.get(key, 0) + 1
+            return self._segment(sc, seq, seg_body(seq, tag), sc.attempts[key])
+        return self._send(404, b"", "text/plain")
+
+    def _segment(self, sc, seq, body, attempt):
+        fail = sc.seg_fail.get(seq) if attempt == 1 else None
+        if fail == "503":
+            return self._send(503, b"busy", "text/plain")
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Content-Length", str(len(body)))
+        if fail == "short":
+            self.send_header("Connection", "close")
+        self.end_headers()
+        half = len(body) // 2
+        if fail == "short":
+            self.wfile.write(body[:half])
+            self.wfile.flush()
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+        if fail == "midstall":
+            self.wfile.write(body[:half])
+            self.wfile.flush()
+            time.sleep(6.0)
+            self.wfile.write(body[half:])
+            return
+        if sc.slow and sc.slow[0] <= seq <= sc.slow[1]:
+            pieces = 10
+            step = len(body) // pieces + 1
+            for i in range(0, len(body), step):
+                self.wfile.write(body[i:i + step])
+                self.wfile.flush()
+                time.sleep(sc.slow[2] / pieces)
+            return
+        self.wfile.write(body)
+
+
+def start_origin():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
+
+
+def scenario_defs():
+    return [
+        Scenario("steady", take=12),
+        # Downloads at half real time for eight chunks: the cushion drains.
+        Scenario("slow", take=18, slow=(6, 13, 2.0)),
+        # Source stops publishing for 9s, then resumes 8 chunks further on.
+        Scenario("stall", take=13, stall=(5.0, 14.0, 8)),
+        # Playlist 500s for 3s; one chunk 503s once; one stalls halfway for
+        # 6s; one arrives truncated once. All recover.
+        Scenario("errors", take=16, pl_errors=(4.5, 7.5),
+                 seg_fail={9: "503", 11: "midstall", 13: "short"}),
+        # The sequence restarts five chunks lower, under new URLs.
+        # A sliding 5-chunk window, so the media sequence really goes back.
+        Scenario("restart", take=15, restart=8.5, window=5),
+        # The broadcast ends; the stream runs out on the idle limit.
+        Scenario("ended", take=10 ** 6, end=8.5),
+    ]
+
+
+# ─── Pulling through the real app ─────────────────────────────────────────────
+
+def pull(app, client, embed, take, max_s=60.0):
+    t0 = time.time()
+    resp = client.get("/stream?url=" + quote(embed, safe=""), buffered=False)
+    data = bytearray()
+    marks = []
+    keepalives = 0
+    try:
+        if resp.status_code != 200:
+            return {"status": resp.status_code, "error": resp.get_data(as_text=True)[:200]}
+        for item in resp.response:
+            if item == app.TS_NULL_PACKET:
+                keepalives += 1
+                continue
+            data += item
+            while len(data) >= (len(marks) + 1) * SEG_BYTES:
+                marks.append(round(time.time() - t0, 2))
+            if len(marks) >= take or time.time() - t0 > max_s:
+                break
+    finally:
+        resp.close()
+    whole = bytes(data[:len(marks) * SEG_BYTES])
+    return {
+        "status": 200,
+        "segments": [seg_id(whole[i:i + SEG_BYTES])
+                     for i in range(0, len(whole), SEG_BYTES)],
+        "digest": hashlib.sha256(whole).hexdigest(),
+        "trailing_bytes": len(data) - len(whole),
+        "marks": marks,
+        "keepalives": keepalives,
+        "seconds": round(time.time() - t0, 1),
+    }
+
+
+def run_scenarios(app, client, port, label, only=None, health=True):
+    out = {}
+    for sc in scenario_defs():
+        if only and sc.name not in only:
+            continue
+        key = "%s-%s" % (sc.name, label)
+        SCENARIOS[key] = sc
+        embed = "http://fake-embed.test/%s" % key
+        url = "http://127.0.0.1:%d/%s/master.m3u8" % (port, key)
+        app.extract_m3u8_via_browser = (
+            lambda _e, *a, _u=url, **k: {"url": _u, "headers": {}, "cookies": {},
+                                         "browser_m3u8_status": 200})
+        sc.reset()
+        res = pull(app, client, embed, sc.take)
+        res["health"] = history_for(app, embed) if health else None
+        out[sc.name] = res
+        print("  %-8s %-12s %3d chunks %5.1fs  %s" % (
+            sc.name, label, len(res.get("segments", [])), res.get("seconds", 0),
+            res.get("digest", res.get("error", ""))[:16]), flush=True)
+    return out
+
+
+def history_for(app, embed):
+    sh = getattr(app, "streamhealth", None)
+    if sh is None:
+        return None
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        sh.HISTORY.flush()
+        for rec in sh.HISTORY.read(500):
+            if rec.get("channel") == embed:
+                return rec
+        time.sleep(0.1)
+    return None
+
+
+# ─── Unit tests (new image only) ──────────────────────────────────────────────
+
+def unit_tests(app):
+    import streamhealth as sh
+
+    section("playlist parsing")
+    master = sh.parse_playlist(MASTER, "http://h/x/master.m3u8", app.resolve_url)
+    check("master detected", master["kind"] == "master")
+    check("variants in order", [v["bandwidth"] for v in master["variants"]] == [8000000, 700000],
+          master["variants"])
+    check("variant resolution", master["variants"][0]["resolution"] == "1920x1080")
+    media = ("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:339243\n"
+             "#EXT-X-PROGRAM-DATE-TIME:2026-10-13T23:19:56.363Z\n"
+             "#EXTINF:3.200,\na.ts\n#EXTINF:3.200,\nb.ts?token=1\n"
+             "#EXT-X-DISCONTINUITY\n#EXTINF:2.000,\nc.ts\n#EXT-X-ENDLIST\n")
+    p = sh.parse_playlist(media, "http://h/x/index.m3u8", app.resolve_url)
+    segs = p["segments"]
+    check("media segments", [s["url"] for s in segs] ==
+          ["http://h/x/a.ts", "http://h/x/b.ts?token=1", "http://h/x/c.ts"])
+    check("durations", [s["duration"] for s in segs] == [3.2, 3.2, 2.0])
+    check("sequence and target", p["media_sequence"] == 339243 and p["target_duration"] == 4.0)
+    check("program date time advances", abs(segs[1]["pdt"] - segs[0]["pdt"] - 3.2) < 1e-3 if segs[0]["pdt"] else False)
+    check("discontinuity on the right chunk", [s["discontinuity"] for s in segs] == [False, False, True])
+    check("endlist", p["endlist"] is True)
+    q = sh.parse_playlist("#EXTM3U\n#EXTINF:6,\nx.ts\n", "http://h/i.m3u8", app.resolve_url)
+    check("no MEDIA-SEQUENCE means unknown, not 0", q["media_sequence"] is None)
+    for junk in ("", "garbage\n\x00\x01", "#EXTINF:abc,\n#EXT-X-MEDIA-SEQUENCE:x\ny.ts"):
+        try:
+            sh.parse_playlist(junk, "http://h/i.m3u8", app.resolve_url)
+            ok = True
+        except Exception as e:
+            ok = repr(e)
+        check("junk playlist does not raise (%r)" % junk[:12], ok is True, ok)
+    info = {}
+    sh.note_playlist("http://h/x/index.m3u8", media, app.resolve_url, info)
+    check("note_playlist fills latest with sequences",
+          [s for _k, s, _d in info.get("latest", [])] == [339243, 339244, 339245], info.get("latest"))
+    sh.note_playlist("http://h/x/index.m3u8", None, app.resolve_url, {})
+    check("note_playlist swallows a bad call", True)
+
+    section("model: cushion, freezes, causes")
+    T = [1000.0]
+    clock = lambda: T[0]   # noqa: E731
+    sh.note_playlist("http://u/p.m3u8",
+                     "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:10\n" +
+                     "".join("#EXTINF:4.0,\ns%d.ts\n" % n for n in range(10, 30)),
+                     app.resolve_url, {})
+    u = lambda n: "http://u/s%d.ts" % n   # noqa: E731
+    h = sh.StreamHealth("t1", "team:x", "x", "admin1", clock=clock)
+    check("starting before the first chunk", h.snapshot()["state"] == "starting")
+    h.sending(); h.delivered(u(10), 100)                 # cushion 4, empty at 1004
+    T[0] = 1003.0
+    h.download_begin(u(11)); h.download_bytes(50)
+    T[0] = 1003.5; h.download_bytes(50)
+    T[0] = 1006.0
+    snap = h.snapshot()
+    check("frozen while the cushion is empty", snap["state"] == "frozen", snap["state"])
+    check("frozen reason names the download", "Downloading" in snap["reason"], snap["reason"])
+    h.download_end(u(11), b"x" * 100)
+    h.sending(); h.delivered(u(11), 100)                  # froze 1004..1006 -> slow
+    s = h.snapshot()
+    check("one freeze, 2s, blamed on slow downloads",
+          s["freezes"] == 1 and abs(s["frozen_s"] - 2.0) < 0.05 and "slow" in s["by_cause"],
+          (s["freezes"], s["frozen_s"], s["by_cause"]))
+    def quick(n):
+        h.download_begin(u(n)); h.download_end(u(n), b"x" * 100)
+        h.sending(); h.delivered(u(n), 100)
+
+    # Two quick chunks put 12s of cushion in hand, so the next freeze is far
+    # enough from the last (more than 1.5 chunks) to count separately.
+    quick(12); quick(13)                                  # empty at 1018
+    # Source quiet: playlist lists nothing new for 16s.
+    h.playlist_begin(); h.playlist_ok({"latest": []}, 0)  # waiting from 1006
+    T[0] = 1022.0
+    h.playlist_begin(); h.playlist_ok({}, 1)
+    h.download_begin(u(14)); T[0] = 1022.2; h.download_bytes(100)
+    h.download_end(u(14), b"x" * 100); h.sending(); h.delivered(u(14), 100)
+    s = h.snapshot()
+    check("source freeze blamed on the source",
+          s["freezes"] == 2 and s["by_cause"].get("source", 0) > 3.5, s["by_cause"])
+    quick(15); quick(16)                                  # empty at 1034.2
+    # A download that needs a second attempt is stalled, not slow.
+    T[0] = 1035.0
+    h.download_begin(u(17)); h.download_attempt(1)
+    T[0] = 1040.0; h.download_attempt(2)
+    T[0] = 1042.0; h.download_bytes(100); h.download_end(u(17), b"x" * 100)
+    h.sending(); h.delivered(u(17), 100)
+    s = h.snapshot()
+    check("retried download blamed as stalled", s["by_cause"].get("stalled", 0) > 4, s["by_cause"])
+    check("three separate freezes", s["freezes"] == 3, s["freezes"])
+    quick(18); quick(19)                                  # empty at 1054
+    # Blocked on the player is not a freeze.
+    before = s["freezes"]
+    T[0] = 1043.0
+    h.download_begin(u(20)); h.download_end(u(20), b"x" * 100); h.sending()
+    T[0] = 1070.0
+    h.delivered(u(20), 100)
+    check("player not reading is not a freeze",
+          h.snapshot()["freezes"] == before and h.player_waits == 1,
+          (h.snapshot()["freezes"], h.player_waits))
+    check("finished freezes are closed", h.freeze_count == 3, h.freeze_count)
+    # Sequence gap with one known failure: one dropped, the rest expired.
+    h.download_begin(u(21)); h.download_end(u(21), None)
+    h.download_begin(u(24)); h.download_end(u(24), b"x" * 100); h.delivered(u(24), 100)
+    check("skipped counts only chunks that were never fetched",
+          h.skipped == 2 and h.downloads_failed == 1, (h.skipped, h.downloads_failed))
+    h.delivered(u(22), 100)
+    check("an older chunk after a newer one is a jump back", h.backwards == 1, h.backwards)
+    h.playlist_ok({"media_sequence": 20}, 0)
+    h.playlist_ok({"media_sequence": 12}, 0)
+    check("playlist going backwards is counted", h.playlist_backwards == 1)
+    h.playlist_ok({"endlist": True}, 0)
+    check("ENDLIST noted", h.endlist is True)
+    h.playlist_failed(503); h.playlist_failed(503)
+    snap = h.snapshot()
+    check("playlist errors counted", h.playlist_errors == 2)
+    check("timeline has events", len(snap["timeline"]) >= 5, len(snap["timeline"]))
+    h.loop_error(ValueError("boom"))
+    check("internal error counted", h.internal_errors == 1)
+    # Ends while frozen: the open freeze is recorded.
+    T[0] = 1100.0
+    h.end("idle_timeout", "45s")
+    sh.HISTORY.configure(os.path.join(tempfile.mkdtemp(), "h.jsonl"), keep=3)
+    h.finish()
+    sh.HISTORY.flush()
+    rec = sh.HISTORY.read(10)[0]
+    check("history record written", rec["id"] == "t1" and rec["end_reason"] == "idle_timeout", rec.get("id"))
+    check("open freeze recorded at the end",
+          rec["freeze_list"] and rec["freeze_list"][-1]["open"] is True, rec["freeze_list"][-1:])
+    check("record carries the speed figures", rec["speed_median"] is not None and rec["speed_p10"] is not None)
+    h.finish()
+    sh.HISTORY.flush()
+    check("finish is idempotent", len(sh.HISTORY.read(10)) == 1)
+
+    section("model: reconnect and replay")
+    T[0] = 1110.0
+    r = sh.StreamHealth("t2", "team:x", "x", "admin1", clock=clock)
+    check("reconnect within 60s detected",
+          r.reconnect is not None and r.reconnect["previous_id"] == "t1", r.reconnect)
+    r.delivered(u(16), 100); r.delivered(u(18), 100); r.delivered(u(29), 100)
+    check("chunks the previous stream already sent count as replayed",
+          r.reconnect["replayed_chunks"] == 2, r.reconnect["replayed_chunks"])
+    T[0] = 1300.0
+    late = sh.StreamHealth("t3", "team:x", "x", "", clock=clock)
+    check("no reconnect after the window", late.reconnect is None)
+
+    section("model: stutter")
+    T[0] = 2000.0
+    st = sh.StreamHealth("t5", "team:y", "y", "", clock=clock)
+    st.sending(); st.delivered(u(20), 100)          # cushion 4, empty at 2004
+    for n in range(21, 29):                         # each 4s chunk takes 5.5s
+        st.download_begin(u(n)); T[0] += 2.75; st.download_bytes(50)
+        T[0] += 2.75; st.download_end(u(n), b"x" * 100)
+        st.sending(); st.delivered(u(n), 100)
+    ss = st.snapshot()
+    check("stutter: many short stalls are one freeze",
+          ss["freezes"] == 1 and ss["frozen_s"] > 8, (ss["freezes"], ss["frozen_s"]))
+    check("stutter: blamed on slow downloads", set(ss["by_cause"]) == {"slow"}, ss["by_cause"])
+    check("stutter: speed below real time", ss["speed"] is not None and ss["speed"] < 1, ss["speed"])
+    T[0] += 20
+    st.sending(); st.delivered(u(29), 100)          # long gap: player label, not a freeze
+    st.finish()
+    rec = [r for r in sh.HISTORY.read(10) if r["id"] == "t5"]
+    sh.HISTORY.flush()
+    rec = [r for r in sh.HISTORY.read(10) if r["id"] == "t5"]
+    check("stutter: closed with its stall count",
+          rec and rec[0]["freeze_list"] and rec[0]["freeze_list"][0]["stalls"] >= 5,
+          rec and rec[0]["freeze_list"])
+
+    section("history file")
+    path = os.path.join(tempfile.mkdtemp(), "trim.jsonl")
+    sh.HISTORY.configure(path, keep=5)
+    for i in range(70):
+        sh.HISTORY.append({"id": "r%d" % i, "seconds": 1, "freezes": i % 2,
+                           "frozen_s": 1.5 * (i % 2), "by_cause": {"slow": 1.5 * (i % 2)},
+                           "end_reason": "client_left"})
+    sh.HISTORY.flush()
+    lines = open(path).read().splitlines()
+    check("trimmed to keep", len(lines) <= 5 + 50 and len(lines) >= 5, len(lines))
+    with open(path, "a") as f:
+        f.write("{not json\n")
+    got = sh.HISTORY.read(3)
+    check("newest first, corrupt line skipped", [g["id"] for g in got] == ["r69", "r68", "r67"],
+          [g["id"] for g in got])
+    tot = sh.totals(sh.HISTORY.read(500))
+    check("totals add up", tot["freezes"] == sum(1 for g in sh.HISTORY.read(500) if g["freezes"]), tot)
+
+    section("guards")
+    class Boom(sh.StreamHealth):
+        @sh._guarded
+        def delivered(self, url, nbytes):
+            raise RuntimeError("rigged")
+    b = Boom("t4", "", "", "", clock=clock)
+    check("a hook that raises returns None", b.delivered("x", 1) is None)
+    check("and marks itself failed once", b._hook_failed is True)
+    n = sh.track(None, bogus=1)
+    check("a tracker that cannot start is the no-op stand-in", n is sh.NULL)
+    check("the stand-in swallows every hook", n.delivered("x", 1) is None and n.snapshot() is None)
+
+
+# ─── Rigs ─────────────────────────────────────────────────────────────────────
+
+HOOKS = ("download_begin", "download_attempt", "download_bytes", "download_end",
+         "sending", "delivered", "playlist_begin", "playlist_failed",
+         "playlist_ok", "loop_error", "end", "finish", "snapshot")
+
+
+def rig_hooks_raise(sh):
+    saved = {n: getattr(sh.StreamHealth, n) for n in HOOKS}
+
+    def boom(self, *a, **k):
+        raise RuntimeError("rigged")
+    for n in HOOKS:
+        setattr(sh.StreamHealth, n, sh._guarded(boom))
+    saved_parse = sh.parse_playlist
+    sh.parse_playlist = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("rigged"))
+
+    def undo():
+        for n, f in saved.items():
+            setattr(sh.StreamHealth, n, f)
+        sh.parse_playlist = saved_parse
+    return undo
+
+
+def rig_tracker_fails(sh):
+    saved = sh.StreamHealth.__init__
+
+    def boom(self, *a, **k):
+        raise RuntimeError("rigged")
+    sh.StreamHealth.__init__ = boom
+
+    def undo():
+        sh.StreamHealth.__init__ = saved
+    return undo
+
+
+# ─── Expectations for the tracked run ─────────────────────────────────────────
+
+def expect(results):
+    section("health matches what the origin did")
+    h = {k: (v.get("health") or {}) for k, v in results.items()}
+    for k, v in h.items():
+        check("%s: history record written" % k, bool(v))
+    st, sl, sa, er, rs, en = (h.get(k, {}) for k in
+                              ("steady", "slow", "stall", "errors", "restart", "ended"))
+    check("steady: no freezes", st.get("freezes") == 0, st.get("freeze_list"))
+    check("steady: keeps up", (st.get("speed_p10") or 0) > 1, st.get("speed_p10"))
+    check("steady: variant taken is the first offered",
+          (st.get("variant") or {}).get("bandwidth") == 8000000 and len(st.get("variants") or []) == 2,
+          st.get("variant"))
+    check("steady: ended by the player", st.get("end_reason") == "client_left", st.get("end_reason"))
+    check("steady: durations came from the playlist", st.get("durations_guessed") == 0,
+          st.get("durations_guessed"))
+    check("slow: slowest tenth below real time", (sl.get("speed_p10") or 9) < 1, sl.get("speed_p10"))
+    check("slow: froze, blamed on slow downloads",
+          sl.get("freezes", 0) >= 1 and "slow" in (sl.get("by_cause") or {}), sl.get("by_cause"))
+    check("stall: froze, blamed on the source",
+          max((sa.get("by_cause") or {"x": 0}).items(), key=lambda kv: kv[1])[0] == "source",
+          sa.get("by_cause"))
+    check("stall: the 7 chunks it never listed count as skipped", sa.get("skipped") == 7,
+          sa.get("skipped"))
+    check("errors: playlist errors counted", (er.get("playlist_errors") or 0) >= 1,
+          er.get("playlist_errors"))
+    check("errors: the halfway stall is blamed as stalled",
+          (er.get("by_cause") or {}).get("stalled", 0) > 0, er.get("by_cause"))
+    check("errors: nothing dropped", er.get("downloads_failed") == 0, er.get("downloads_failed"))
+    check("restart: playlist went backwards", (rs.get("playlist_backwards") or 0) >= 1,
+          rs.get("playlist_backwards"))
+    check("restart: older chunks sent after newer ones", (rs.get("backwards") or 0) >= 1,
+          rs.get("backwards"))
+    check("ended: ENDLIST seen", en.get("endlist") is True)
+    check("ended: ran out on the idle limit", en.get("end_reason") == "idle_timeout",
+          en.get("end_reason"))
+
+
+def compare(new, old, label_new, label_old, tol_max=1.0, tol_median=0.25):
+    section("video: %s vs %s" % (label_new, label_old))
+    for name in sorted(set(new) | set(old)):
+        a, b = new.get(name), old.get(name)
+        if not a or not b:
+            check("%s: present in both" % name, False)
+            continue
+        same = a.get("digest") == b.get("digest") and a.get("segments") == b.get("segments")
+        check("%s: byte-identical video (%d chunks)" % (name, len(a.get("segments") or [])),
+              same, "%s vs %s" % ((a.get("segments") or [])[:30], (b.get("segments") or [])[:30])
+              if not same else "")
+        ma, mb = a.get("marks") or [], b.get("marks") or []
+        deltas = sorted(abs(x - y) for x, y in zip(ma, mb))
+        if deltas:
+            med = deltas[len(deltas) // 2]
+            check("%s: delivery timing matches (median %.2fs, worst %.2fs)" % (name, med, deltas[-1]),
+                  med <= tol_median and deltas[-1] <= tol_max)
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--baseline", action="store_true",
+                    help="old image: scenarios only, no tracking expected")
+    ap.add_argument("--out", default="")
+    ap.add_argument("--compare", nargs=2, metavar=("NEW", "OLD"))
+    ap.add_argument("--only", default="")
+    args = ap.parse_args()
+
+    if args.compare:
+        new = json.load(open(args.compare[0]))
+        old = json.load(open(args.compare[1]))
+        compare(new["runs"]["tracked"], old["runs"]["baseline"], "new image", "old image")
+        print("\n%s" % ("ALL PASS" if not fails else "FAILED: %s" % ", ".join(fails)))
+        sys.exit(1 if fails else 0)
+
+    data = tempfile.mkdtemp(prefix="health-")
+    os.environ.setdefault("STARTUP_DELAY", "0")
+    os.environ["STREAM_IDLE_TIMEOUT"] = "12"
+    os.environ["TEAMS_FILE"] = os.path.join(data, "teams.json")
+    os.environ["LINEUP_FILE"] = os.path.join(data, "lineup.json")
+    os.environ["EXTRACT_CACHE_FILE"] = os.path.join(data, "extract_cache.json")
+    os.environ["SETTINGS_FILE"] = os.path.join(data, "settings.json")
+    os.environ["STREAM_HISTORY_FILE"] = os.path.join(data, "stream_history.jsonl")
+    sys.path.insert(0, "/app")
+    import app  # noqa: E402
+
+    client = app.app.test_client()
+    port = start_origin()
+    only = set(filter(None, args.only.split(",")))
+    sh = getattr(app, "streamhealth", None)
+    result = {"image": "baseline" if args.baseline else "new", "runs": {}}
+
+    if args.baseline:
+        if sh is not None:
+            print("note: this image has streamhealth; running as baseline anyway")
+        section("scenarios (baseline)")
+        result["runs"]["baseline"] = run_scenarios(app, client, port, "baseline", only,
+                                                   health=False)
+    else:
+        if sh is None:
+            sys.exit("this image has no streamhealth module; use --baseline")
+        unit_tests(app)
+        sh.HISTORY.configure(os.environ["STREAM_HISTORY_FILE"])
+        section("scenarios, tracked")
+        tracked = run_scenarios(app, client, port, "tracked", only)
+        result["runs"]["tracked"] = tracked
+        expect(tracked)
+
+        section("scenarios, every tracking hook rigged to raise")
+        undo = rig_hooks_raise(sh)
+        try:
+            rigged = run_scenarios(app, client, port, "rigged", only, health=False)
+        finally:
+            undo()
+        result["runs"]["rigged"] = rigged
+        compare(tracked, rigged, "tracked", "hooks raising")
+
+        section("scenario, tracker fails to start")
+        undo = rig_tracker_fails(sh)
+        try:
+            nostart = run_scenarios(app, client, port, "nostart", {"errors"}, health=False)
+        finally:
+            undo()
+        result["runs"]["nostart"] = nostart
+        compare({"errors": tracked["errors"]}, nostart, "tracked", "no tracker")
+
+        section("reconnect")
+        sc = Scenario("reconnect", take=8)
+        SCENARIOS["reconnect"] = sc
+        url = "http://127.0.0.1:%d/reconnect/master.m3u8" % port
+        app.extract_m3u8_via_browser = (
+            lambda _e, *a, **k: {"url": url, "headers": {}, "cookies": {},
+                                 "browser_m3u8_status": 200})
+        embed = "http://fake-embed.test/reconnect"
+        first = pull(app, client, embed, 8)
+        sc.first_poll()
+        second = pull(app, client, embed, 5)
+        sh.HISTORY.flush()
+        recs = [r for r in sh.HISTORY.read(50) if r.get("channel") == embed]
+        latest = recs[0] if recs else {}
+        rc = latest.get("reconnect") or {}
+        check("second stream recognised as a reconnect", bool(rc), latest.get("reconnect"))
+        check("it replayed chunks the first had sent", (rc.get("replayed_chunks") or 0) >= 1,
+              rc.get("replayed_chunks"))
+        check("both pulls delivered video", first.get("segments") and second.get("segments"))
+
+        section("status endpoint")
+        r = client.get("/api/streams/history?limit=5")
+        body = r.get_json() if r.status_code == 200 else {}
+        check("/api/streams/history answers", r.status_code == 200, r.status_code)
+        check("history has totals and records", "totals" in body and len(body.get("records", [])) == 5)
+        st = client.get("/stream/status").get_json()
+        check("/stream/status still answers with no streams", st.get("active_streams") == 0)
+
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(result, f, indent=1)
+    print("\n%s" % ("ALL PASS" if not fails else "FAILED: %s" % ", ".join(fails)))
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == "__main__":
+    main()
