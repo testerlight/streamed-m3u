@@ -389,6 +389,7 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `SEGMENT_PROBE_TIMEOUT` | `20` | live | Same ceiling for the startup liveness probe. Raising it costs cascade budget. |
 | `SEGMENT_RETRIES` | `1` | live | Extra attempts for a failed chunk. Small on purpose: retries drag the live edge. |
 | `SEGMENT_MAX_MB` | `64` | live | Sanity cap on a buffered chunk, since chunks are held in RAM before forwarding. |
+| `UPSTREAM_IPV4` | `on` | live | Reach stream sources over IPv4 only. Behind the VPN, an IPv6 lookup costs about 2s per request and the IPv6 route bypasses the tunnel. |
 | `STREAM_IDLE_TIMEOUT` | `45` | live | Seconds without a new segment before a stream is treated as dead. |
 | `STREAM_KEEPALIVE_INTERVAL` | `1.0` | live | Seconds between null packets sent while waiting on a slow chunk, so the client does not give up. |
 | `STREAM_SEEN_MAX` | `300` | live | Segment URLs remembered per stream, bounding memory on long sessions. |
@@ -484,7 +485,8 @@ little of their own, so a short freeze here may never have reached the screen;
 a long one did.
 
 **Early warnings.** Twice a second each stream is checked for the things that
-come before a freeze: a playlist request hanging (4s), the playlist failing
+come before a freeze: a playlist request hanging (3s longer than usual for
+that stream), the playlist failing
 twice in a row, a chunk download gone silent (4s), downloads slower than real
 time, the source publishing nothing new. A warning shows in orange under the
 Health badge and in the log, with what an automatic fix *would* do. Nothing

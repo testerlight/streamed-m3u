@@ -158,3 +158,31 @@ Phase 2 on real games, then read together: per warning kind, hits against
 false alarms and lead time, and how many freezes were missed. A kind with
 too many false alarms gets no automatic action. Phase 3 also starts with the
 one thing the data already points at: the playlist request that hangs.
+
+### First real game under Phase 2 (2026-10-14, NFL Network, 3h18m)
+
+7 freezes, 34s, all in the last 80 minutes; 6 of them after the playlist
+server answered HTTP 500 (13 times). The detector was miscalibrated: every one
+of 1,907 playlist requests took ~4.4s, so the fixed 4s `playlist_slow` fired on
+each, 196 of the 200 scored warnings were false, and "7 of 7 warned ahead" was
+meaningless. Scoring was also capped at 200 warnings. Had Phase 3 been acting
+on it, it would have re-requested the playlist ~1,900 times.
+
+Cause of the 4.4s: gluetun's DNS takes ~2s to say the playlist host has no
+IPv6 address, paid on each of the two fresh requests per poll (instructions
+gotcha #30).
+
+Decisions (user, 2026-10-14):
+
+- Fix Phase 2: `playlist_slow` relative to the stream's typical request
+  (+3s, fixed 4s until 10 seen), whole-stream counts, once-a-minute logging,
+  the alarm's remedy follows what is stuck.
+- Force IPv4 on stream requests (playlist, probe chunk, chunk downloads) now,
+  despite being Phase 3 material: it changes no bytes, only how long a DNS
+  lookup takes, and has a live off switch (`UPSTREAM_IPV4`). Catalog and logo
+  requests left alone. Deployed together with the Phase 2 fix, when idle.
+- Live A/B before deploy, same stream, 90s each: playlist polls 0.54s (IPv4)
+  vs 4.37s; cushion ~22s vs ~14.5s; no freezes either way, no TS breaks.
+
+The Phase 3 gate is unchanged. The next games will show what freezes remain
+once polls are fast; the playlist 500s are the candidate after that.

@@ -53,6 +53,7 @@ import requests
 # manifest/segment fetches. Plain `requests` is kept for the streamed.pk API,
 # which is not fingerprint-protected.
 from curl_cffi import requests as cf_requests
+from curl_cffi import CurlOpt
 from datetime import datetime, timezone
 from urllib.parse import quote
 from flask import Flask, Response, jsonify, request, has_request_context
@@ -424,6 +425,15 @@ SEGMENT_RETRIES = int(os.getenv("SEGMENT_RETRIES", "1"))
 # be verified complete before any of it is forwarded; this stops a mislabelled
 # or runaway response from eating the box's RAM.
 SEGMENT_MAX_MB = int(os.getenv("SEGMENT_MAX_MB", "64"))
+# Reach stream sources over IPv4 only: the playlist, the startup probe chunk
+# and every chunk download. Measured 2026-10-14 inside gluetun's namespace:
+# its DNS takes ~2s to answer "no IPv6 address" for the strmd.st playlist
+# hosts, and curl waits for that answer on every fresh connection, so each
+# playlist poll (two requests: master, then variant) spent ~4.4s of a 6s chunk
+# in DNS. IPv4 only: 0.29s. It also keeps stream traffic off the namespace's
+# IPv6 default route, which is Docker's bridge, not the VPN tunnel. Set to 0
+# to restore the library default without a rebuild.
+UPSTREAM_IPV4 = os.getenv("UPSTREAM_IPV4", "1") == "1"
 # Some sources publish a video elementary stream and no audio one at all -
 # observed on `admin`, which carries a raw MLB.TV feed. Playback looks fine and
 # is silent, and _rank_streams puts `admin` above `delta` (both HD, `admin`
@@ -788,6 +798,12 @@ FATAL_STATUS_CODES = {400, 401, 403, 404, 410, 451}
 # is still the same chunk to it.
 streamhealth.configure(key_fn=_segment_key, history_path=STREAM_HISTORY_FILE)
 
+def _upstream_curl_options():
+    """Per-request curl options for stream sources (see UPSTREAM_IPV4).
+    Read at call time, so the setting applies live."""
+    return {CurlOpt.IPRESOLVE: 1} if UPSTREAM_IPV4 else None   # 1 = CURL_IPRESOLVE_V4
+
+
 def get_segments(m3u8_url, headers, cookies, _depth=0, info=None):
     """
     Fetch m3u8 manifest and return (segments, status_code).
@@ -805,7 +821,8 @@ def get_segments(m3u8_url, headers, cookies, _depth=0, info=None):
         r = cf_requests.get(m3u8_url,
                             headers=_headers_for_url(m3u8_url, headers),
                             cookies=_cookies_for_url(m3u8_url, cookies),
-                            timeout=15, impersonate="chrome")
+                            timeout=15, impersonate="chrome",
+                            curl_options=_upstream_curl_options())
     except Exception as exc:
         # Treat connection-level errors (DNS failure, refused, TLS) as
         # transient - the CDN host itself is unreachable, retrying won't help.
@@ -1005,7 +1022,8 @@ def _validate_candidate(embed_url: str, label: str = ""):
         fs = cf_requests.get(first_url,
                              headers=_headers_for_url(first_url, h),
                              cookies=_cookies_for_url(first_url, c),
-                             timeout=SEGMENT_PROBE_TIMEOUT, impersonate="chrome")
+                             timeout=SEGMENT_PROBE_TIMEOUT, impersonate="chrome",
+                             curl_options=_upstream_curl_options())
         first_status, first_body = fs.status_code, fs.content
     except Exception as exc:
         # Note this is usually a timeout on a *working* source that is merely
@@ -2952,6 +2970,7 @@ def stream_proxy():
                         cookies=_cookies_for_url(seg_url, cookies),
                         timeout=SEGMENT_TIMEOUT, stream=True,
                         impersonate="chrome",
+                        curl_options=_upstream_curl_options(),
                     )
                     if seg.status_code != 200:
                         log.warning("Segment HTTP %d (attempt %d/%d): %s",

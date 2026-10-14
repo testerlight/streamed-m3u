@@ -33,8 +33,9 @@ Early warnings (Phase 2)
 ------------------------
 A watcher thread looks at every live stream twice a second and raises an
 early warning when a known precursor of a freeze starts: a playlist request
-hanging, the playlist failing, a chunk download gone silent, downloads slower
-than real time, the source not publishing. Once the cushion has been empty for
+hanging (measured against that stream's own typical request), the playlist
+failing, a chunk download gone silent, downloads slower than real time, the
+source not publishing. Once the cushion has been empty for
 FREEZE_MIN_S it raises a freeze alarm. Each carries what Phase 3 *would* do,
 as text only. Every warning is then scored: a hit if a real freeze began
 within WARN_HORIZON_S of it, otherwise a false alarm; every freeze records how
@@ -86,15 +87,22 @@ HISTORY_KEEP = 500
 # of the 15s request timeout). The history records what they caught and what
 # they cried wolf on, plus playlist request times, so they can be tuned.
 WATCH_INTERVAL_S = 0.5    # how often the watcher looks at each live stream
-PLAYLIST_SLOW_S = 4.0     # a playlist request still running after this long
+# A playlist request is hanging once it runs PLAYLIST_SLOW_MARGIN_S longer than
+# this stream's typical request (median of its last successful ones), or
+# PLAYLIST_SLOW_S until PLAYLIST_BASELINE_N have been seen. A fixed 4s fired on
+# all 1,907 requests of a 2026-10-14 stream whose every request took ~4.4s.
+PLAYLIST_SLOW_S = 4.0
+PLAYLIST_SLOW_MARGIN_S = 3.0
+PLAYLIST_BASELINE_N = 10
+PLAYLIST_BASELINE_WINDOW = 30
 PLAYLIST_FAIL_RUN = 2     # playlist failures in a row
 DOWNLOAD_QUIET_S = 4.0    # a chunk download that has received nothing this long
 SLOW_SPEED = 1.0          # rolling download speed below this (x real time) ...
 SLOW_SAMPLES = 3          # ... over at least this many chunks
 SOURCE_QUIET_MIN_S = 6.0  # polls finding nothing new for max(this, 2 chunks)
 WARN_HORIZON_S = 20.0     # a freeze starting this soon after a warning is its hit
-WARNINGS_MAX = 200
-WARN_LOG_MAX = 10         # log lines per warning kind per stream
+WARNINGS_MAX = 200         # kept for scoring; the counts are not capped by it
+WARN_LOG_EVERY_S = 60.0   # log and timeline at most one warning per kind per minute
 STALE_START_S = 300.0     # a tracker that never started streaming is dropped
 
 # kind -> (what it means, what Phase 3 would do about it)
@@ -485,13 +493,16 @@ class StreamHealth:
         # Early warnings (Phase 2), maintained by tick().
         self._active = {}            # kind -> warning, while its condition holds
         self.warnings = deque(maxlen=WARNINGS_MAX)
-        self._warn_logged = {}
+        self._counts = {}            # kind -> raised, hits, leads (whole stream)
+        self._warn_logged = {}       # kind -> [last logged at, suppressed since]
         self._alarm = None           # the freeze alarm, while it is up
         self._alarm_times = deque(maxlen=WARNINGS_MAX)
         self.alarms = 0
         self._pl_began = None
         self._pl_fail_since = None
         self._pl_times = deque(maxlen=SAMPLES_MAX)
+        self._pl_ok_times = deque(maxlen=PLAYLIST_BASELINE_WINDOW)
+        self._pl_slow = 0
         self._poll_empty = False
         self.download_quiet_max = 0.0
 
@@ -642,9 +653,12 @@ class StreamHealth:
         for w in self.warnings:
             until = w["cleared"] if w["cleared"] is not None else end
             if w["raised"] <= end and start <= until + WARN_HORIZON_S:
-                w["hit"] = True
-                if w["lead"] is None:
+                if not w["hit"]:
+                    w["hit"] = True
                     w["lead"] = start - w["raised"]
+                    c = self._counts[w["kind"]]
+                    c["hits"] += 1
+                    c["leads"].append(w["lead"])
                 kinds.add(w["kind"])
                 first = w["raised"] if first is None else min(first, w["raised"])
         for t in self._alarm_times:
@@ -670,10 +684,14 @@ class StreamHealth:
         return WARNINGS[kind][1]
 
     def _would(self, now):
-        """The remedy for a freeze in progress: the oldest warning that is
-        up, else whatever the loop is stuck in. A download receiving nothing
-        wants a fresh request, not a lower quality."""
-        if self._active:
+        """The remedy for a freeze in progress: the warning matching what the
+        loop is stuck in, else the oldest warning that is up, else the stuck
+        activity itself. A download receiving nothing wants a fresh request,
+        not a lower quality."""
+        matching = _LABEL_WARNING.get(self._label)
+        if matching in self._active:
+            kind = matching
+        elif self._active:
             kind = min(self._active.values(), key=lambda w: w["raised"])["kind"]
         elif (self._label == "download" and self._dl is not None
               and now - self._dl["last"] >= FREEZE_MIN_S):
@@ -685,9 +703,11 @@ class StreamHealth:
     def _conditions(self, now):
         """kind -> (when the condition began, text) for each that holds now."""
         out = {}
-        if self._pl_began is not None and now - self._pl_began >= PLAYLIST_SLOW_S:
-            out["playlist_slow"] = (self._pl_began, "Playlist request running for %.0fs"
-                                    % (now - self._pl_began))
+        if self._pl_began is not None and now - self._pl_began >= self._playlist_slow_after():
+            typical = self._playlist_typical()
+            out["playlist_slow"] = (self._pl_began, "Playlist request running for %.0fs%s"
+                                    % (now - self._pl_began, " (usually %.1fs)" % typical
+                                       if typical is not None else ""))
         if self._pl_run >= PLAYLIST_FAIL_RUN:
             out["playlist_failing"] = (self._pl_fail_since or now,
                                        "Playlist failing (%s, %d in a row)"
@@ -707,15 +727,30 @@ class StreamHealth:
                                        % (now - last))
         return out
 
+    def _playlist_typical(self):
+        if len(self._pl_ok_times) < PLAYLIST_BASELINE_N:
+            return None
+        return _median(self._pl_ok_times)
+
+    def _playlist_slow_after(self):
+        typical = self._playlist_typical()
+        return PLAYLIST_SLOW_S if typical is None else typical + PLAYLIST_SLOW_MARGIN_S
+
     def _note_warning(self, w, now):
+        """Count it; log it and put it on the timeline at most once a minute
+        per kind, saying how many were raised in between."""
         w["would"] = self._remedy(w["kind"])
-        self._event("warn", "Early warning: %s; would %s" % (w["text"], w["would"]), now)
-        n = self._warn_logged.get(w["kind"], 0) + 1
-        self._warn_logged[w["kind"]] = n
-        if n <= WARN_LOG_MAX:
-            log.info("%s: early warning: %s; would %s%s", self._who(), w["text"],
-                     w["would"], " (no more of this kind will be logged)"
-                     if n == WARN_LOG_MAX else "")
+        c = self._counts.setdefault(w["kind"], {"raised": 0, "hits": 0,
+                                                "leads": deque(maxlen=SAMPLES_MAX)})
+        c["raised"] += 1
+        seen = self._warn_logged.setdefault(w["kind"], [None, 0])
+        if seen[0] is not None and now - seen[0] < WARN_LOG_EVERY_S:
+            seen[1] += 1
+            return
+        more = " (%d more since the last one)" % seen[1] if seen[1] else ""
+        seen[0], seen[1] = now, 0
+        self._event("warn", "Early warning: %s; would %s%s" % (w["text"], w["would"], more), now)
+        log.info("%s: early warning: %s; would %s%s", self._who(), w["text"], w["would"], more)
 
     def _note_alarm(self, now, frozen):
         empty_at = now - frozen
@@ -726,8 +761,7 @@ class StreamHealth:
             frozen, self._alarm["would"],
             ("; warned ahead by %s" % ", ".join(ahead)) if ahead else "")
         self._event("alarm", text, now)
-        if self.alarms <= 2 * WARN_LOG_MAX:
-            log.warning("%s: %s", self._who(), text)
+        log.warning("%s: %s", self._who(), text)
 
     def _speed(self):
         if not self._speeds:
@@ -937,10 +971,16 @@ class StreamHealth:
             self._pl_began = now
             self._enter("playlist", now)
 
-    def _playlist_done(self, now):
-        began, self._pl_began = self._pl_began, None
+    def _playlist_done(self, now, ok=False):
+        began = self._pl_began
         if began is not None:
-            self._pl_times.append(now - began)
+            took = now - began
+            if took >= self._playlist_slow_after():
+                self._pl_slow += 1
+            self._pl_times.append(took)
+            if ok:
+                self._pl_ok_times.append(took)
+        self._pl_began = None
         return began
 
     @_guarded
@@ -961,7 +1001,7 @@ class StreamHealth:
     def playlist_ok(self, info, new_count):
         with self._lock:
             now = self._now()
-            self._playlist_done(now)
+            self._playlist_done(now, ok=True)
             self._poll_empty = not new_count
             if self._pl_run:
                 self._event("playlist_ok", "Playlist recovered after %d error(s)"
@@ -1118,23 +1158,25 @@ class StreamHealth:
 
     def _detector(self, now):
         """How the early warnings have scored so far on this stream."""
+        # Counts cover the whole stream. Only the warnings recent enough that a
+        # freeze could still make them hits are pending; every other unhit one
+        # is a false alarm, including any that have left the scoring window.
+        pending = {}
+        if self.ended is None:
+            for w in self.warnings:
+                if not w["hit"] and (w["cleared"] is None
+                                     or now - w["cleared"] <= WARN_HORIZON_S):
+                    pending[w["kind"]] = pending.get(w["kind"], 0) + 1
         kinds = {}
         raised = hits = false = 0
-        for w in self.warnings:
-            k = kinds.setdefault(w["kind"], {"raised": 0, "hits": 0, "false": 0, "_leads": []})
-            k["raised"] += 1
-            raised += 1
-            if w["hit"]:
-                k["hits"] += 1
-                hits += 1
-                if w["lead"] is not None:
-                    k["_leads"].append(w["lead"])
-            elif self.ended is not None or (w["cleared"] is not None
-                                            and now - w["cleared"] > WARN_HORIZON_S):
-                k["false"] += 1
-                false += 1
-        for k in kinds.values():
-            k["lead_median_s"] = _r(_median(k.pop("_leads")))
+        for kind, c in self._counts.items():
+            p = pending.get(kind, 0)
+            f = c["raised"] - c["hits"] - p
+            kinds[kind] = {"raised": c["raised"], "hits": c["hits"], "false": f,
+                           "lead_median_s": _r(_median(c["leads"]))}
+            raised += c["raised"]
+            hits += c["hits"]
+            false += f
         # Every freeze counts: one over before any tick saw it is a miss.
         noticed = [f["noticed_s"] for f in self.freezes if f.get("noticed_s") is not None]
         return {
@@ -1187,7 +1229,9 @@ class StreamHealth:
                 "median_s": _r(_median(self._pl_times), 2),
                 "p90_s": _r(_pct(self._pl_times, 0.9), 2),
                 "max_s": _r(max(self._pl_times) if self._pl_times else None),
-                "slow": sum(1 for x in self._pl_times if x >= PLAYLIST_SLOW_S),
+                "typical_s": _r(self._playlist_typical(), 2),
+                "slow_after_s": _r(self._playlist_slow_after(), 2),
+                "slow": self._pl_slow,
             },
             "download_quiet_max_s": _r(self.download_quiet_max),
             "reconnect": None if r is None else {
@@ -1254,6 +1298,8 @@ class StreamHealth:
                               "hit": w["hit"], "lead_s": _r(w["lead"])}
                              for w in list(self.warnings)[-FREEZE_LIST_MAX:]],
             "thresholds": {"playlist_slow_s": PLAYLIST_SLOW_S,
+                           "playlist_slow_margin_s": PLAYLIST_SLOW_MARGIN_S,
+                           "playlist_baseline_n": PLAYLIST_BASELINE_N,
                            "playlist_fail_run": PLAYLIST_FAIL_RUN,
                            "download_quiet_s": DOWNLOAD_QUIET_S,
                            "slow_speed": SLOW_SPEED,

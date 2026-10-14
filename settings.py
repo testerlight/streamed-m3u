@@ -223,6 +223,9 @@ SCHEMA = [
     _s("SEGMENT_MAX_MB", "SEGMENT_MAX_MB", "Playback", "live", "int",
        "Sanity cap on a buffered chunk, since chunks are held in RAM before forwarding.",
        min=1, max=512),
+    _s("UPSTREAM_IPV4", "UPSTREAM_IPV4", "Playback", "live", "bool",
+       "Reach stream sources over IPv4 only. Behind the VPN, an IPv6 lookup costs "
+       "about 2s per request and the IPv6 route bypasses the tunnel."),
     _s("STREAM_IDLE_TIMEOUT", "STREAM_IDLE_TIMEOUT", "Playback", "live", "int",
        "Seconds without a new segment before a stream is treated as dead.", min=5, max=600),
     _s("STREAM_KEEPALIVE_INTERVAL", "STREAM_KEEPALIVE_INTERVAL", "Playback", "live", "float",

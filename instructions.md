@@ -929,8 +929,9 @@ on 2026-10-13 offered 1080p at 8 Mbit/s and 540p at 0.7 Mbit/s, and
 
 **Early warnings (Phase 2, 2026-10-14).** A daemon thread (`_watch`) calls
 each live tracker's `tick()` twice a second. It raises a warning when a known
-precursor starts: a playlist request running 4s (`playlist_slow`), two
-playlist failures in a row, a chunk download silent for 4s, rolling speed
+precursor starts: a playlist request running 3s longer than that stream's
+typical one (median of its last 30 successful requests; a fixed 4s until 10
+have been seen) (`playlist_slow`), two playlist failures in a row, a chunk download silent for 4s, rolling speed
 below 1.0x over 3+ chunks, polls finding nothing new for max(6s, 2 chunks).
 Once the cushion has been empty 1s it raises a freeze alarm. Each carries the
 remedy Phase 3 *would* apply, as text. When a freeze closes, `_score` marks
@@ -938,7 +939,13 @@ every warning up (or cleared under 20s before) during it as a hit and records
 the freeze's `noticed_s` (negative: warned ahead; null: over before any tick
 saw it, a miss). Unhit warnings are false alarms. The record carries
 `detector`, `warning_list`, `thresholds` and `playlist_fetch` (request times),
-which is what the thresholds get tuned from. Same rules as Phase 1: `tick` is
+which is what the thresholds get tuned from. The counts cover the whole
+stream; only the scoring window (`warnings`, last 200) is capped. Warnings are
+logged and put on the timeline at most once a minute per kind, with a count
+of the ones in between. The first version used a fixed 4s and capped counts at
+200: on a 3h18m NFL Network stream (2026-10-14) every one of 1,907 playlist
+requests took ~4.4s (gotcha #30), so it fired on each, scored 196 of 200 as
+false alarms and claimed every freeze was "warned ahead". Same rules as Phase 1: `tick` is
 guarded and rigged to raise in the harness, the watcher only reads tracker
 state, and the video stays byte-identical. Trackers made by `track()` are
 watched; ones built directly (the unit tests) are not, so tests drive
@@ -952,8 +959,28 @@ the window each time.
 
 Not in Phase 2, on purpose: no threshold, timeout, retry, cache eviction,
 variant choice or reconnect behaviour changed, and nothing acts on a warning.
+The one playback change since, IPv4 for stream requests, is gotcha #30.
 Phase 3 waits until Phase 2 has run on real games and its scores (hits, false
 alarms, misses, lead time) have been read together with the user.
+
+**30. Stream requests go over IPv4, because the VPN's DNS is slow to say "no".**
+gluetun's DNS (DoT, `DNS_UPSTREAM_IPV6=off`) takes ~2.0s to answer an AAAA
+query for a name with no IPv6 address, and the strmd.st playlist hosts have
+none. curl waits for that answer on every fresh connection, and every
+`cf_requests.get` is a fresh connection, so each playlist poll (master, then
+variant) cost ~4.4s against 6s chunks. That left almost no slack: one HTTP 500
+plus the 2s retry idle and the player ran dry. Measured 2026-10-14 inside the
+namespace: 2.2s per fresh request, 0.29s with IPv4 forced, 0.08s on a reused
+connection; on the live NFL Network stream, playlist polls 4.37s vs 0.54s and
+the cushion 14.5s vs 22s. The chunk host (a TikTok CDN) has IPv6 records, so
+chunks never paid it. The namespace's IPv6 default route is also Docker's
+bridge, not the tunnel, so IPv4 keeps stream traffic inside the VPN.
+`_upstream_curl_options()` passes `CURLOPT_IPRESOLVE=V4` to the three stream
+fetches (playlist, probe chunk, chunk downloads), read at call time;
+`UPSTREAM_IPV4=0` (console, live) restores the library default. The catalog
+API and logos use plain `requests` and still pay the lookup; not on the stream
+path, left alone on purpose. Connection reuse would cut a further ~0.4s per
+poll, but it changes more (cookies, impersonation state) and is Phase 3.
 
 ## 8. Endpoint reference
 

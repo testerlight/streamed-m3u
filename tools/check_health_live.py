@@ -101,7 +101,8 @@ if recs:
             "behind_live_median_s", "behind_live_max_s", "variant", "variants",
             "target_duration", "durations_guessed", "skipped", "backwards",
             "playlist_backwards", "discontinuities", "playlist_errors", "downloads_failed",
-            "internal_errors", "end_reason", "freeze_list")
+            "internal_errors", "end_reason", "freeze_list", "playlist_fetch",
+            "detector")
     print("\nhistory record:")
     print(json.dumps({k: r.get(k) for k in keep}, indent=1))
 else:

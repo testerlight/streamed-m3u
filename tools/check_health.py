@@ -637,6 +637,68 @@ def unit_tests(app):
     check("too slow with nothing lower on offer says so",
           "no lower quality" in no_var._remedy("too_slow"))
 
+    section("early warnings: tuned after the 2026-10-14 stream")
+    T[0] = 6000.0
+    v = sh.StreamHealth("v1", "team:v", "v", "", clock=clock)
+    v.playlist_begin(); v.playlist_ok({"target_duration": 6.0}, 1)
+    v.sending(); v.delivered("http://v/a.ts", 100)
+    for _ in range(sh.PLAYLIST_BASELINE_N):          # every request takes 4.4s
+        v.playlist_begin(); T[0] += 4.4; v.playlist_ok({}, 0); v.tick()
+    check("a stream whose every request takes 4.4s raises nothing",
+          "playlist_slow" not in v._counts, dict(v._counts))
+    check("its typical request is learned", abs((v._playlist_typical() or 0) - 4.4) < 0.01,
+          v._playlist_typical())
+    v.playlist_begin(); T[0] += 7.0; v.tick()
+    check("7s is within 3s of usual: no warning", "playlist_slow" not in v._active)
+    T[0] += 0.5; v.tick()
+    w7 = v._active.get("playlist_slow")
+    check("7.5s is: warning, saying what usual is",
+          w7 is not None and "usually 4.4s" in w7["text"], w7 and w7["text"])
+    v.playlist_ok({}, 0)
+    f = sh.StreamHealth("v2", "", "", "", clock=clock)
+    f.playlist_begin(); f.playlist_ok({}, 1)
+    f.sending(); f.delivered("http://v/b.ts", 100)
+    for _ in range(sh.PLAYLIST_BASELINE_N):          # IPv4: 0.3s requests
+        f.playlist_begin(); T[0] += 0.3; f.playlist_ok({}, 0)
+    f.playlist_begin(); T[0] += 3.4; f.tick()
+    check("a fast stream's threshold is lower too (0.3s usual: warns at 3.3s)",
+          "playlist_slow" in f._active, f._playlist_slow_after())
+    f.playlist_ok({}, 0)
+    # 250 warnings: the counts are not capped by the 200 kept for scoring, the
+    # log and timeline say it once a minute, and none is left pending.
+    # Two 4s chunks per 4.5s keep the cushion full, so no freeze makes them hits.
+    q = sh.StreamHealth("v3", "", "", "", clock=clock)
+    q.sending(); q.delivered("http://v/c.ts", 100); q.delivered("http://v/c.ts", 100)
+    for _ in range(250):
+        q.download_begin("http://v/d.ts"); T[0] += 4.5; q.tick()
+        q.download_bytes(10); q.tick()
+        q.download_end("http://v/d.ts", b"x" * 10)
+        q.sending(); q.delivered("http://v/d.ts", 10); q.delivered("http://v/d.ts", 10)
+    q.end("client_left")
+    q.finish()
+    d = q._detector(T[0])
+    dq = d["by_kind"].get("download_quiet", {})
+    check("250 warnings counted as 250, all false",
+          dq.get("raised") == 250 and dq.get("false") == 250 and d["pending"] == 0, d)
+    warns = [e for e in q.timeline if e["kind"] == "warn"]
+    check("timeline carries at most one warning a minute",
+          0 < len(warns) <= 250 * 4.5 / sh.WARN_LOG_EVERY_S + 1, len(warns))
+    check("and says how many it skipped", any("more since the last one" in e["text"] for e in warns),
+          warns[-1:])
+    # The alarm's remedy follows what is stuck, not the oldest warning.
+    r = sh.StreamHealth("v4", "", "", "", clock=clock)
+    r.playlist_begin(); r.playlist_ok({}, 1)
+    r.sending()
+    for _ in range(3):                                # 12s of cushion
+        r.delivered("http://v/e.ts", 100)
+    r.playlist_begin(); r.playlist_ok({}, 0)
+    T[0] += 7; r.tick()                               # source_quiet up first
+    check("source quiet is up before the playlist fails", "source_quiet" in r._active)
+    r.playlist_failed(500); r.playlist_failed(500); r.tick()
+    T[0] += 6.5; r.tick()                             # cushion empty 1.5s
+    check("frozen in playlist errors: would fetch a fresh link, not try another source",
+          r._alarm is not None and "fresh stream link" in r._alarm["would"], r._alarm)
+
     section("watcher")
     t = sh.track("w3", "team:z", "z", "", clock=time.time)
     check("track() registers with the watcher", t in sh._live and sh._watcher.is_alive())
@@ -885,6 +947,39 @@ def main():
         check("it replayed chunks the first had sent", (rc.get("replayed_chunks") or 0) >= 1,
               rc.get("replayed_chunks"))
         check("both pulls delivered video", first.get("segments") and second.get("segments"))
+
+        section("IPv4 on the stream path")
+        from curl_cffi import CurlOpt
+        check("UPSTREAM_IPV4 on by default", app.UPSTREAM_IPV4 is True)
+        check("it asks curl for IPv4 only",
+              app._upstream_curl_options() == {CurlOpt.IPRESOLVE: 1}, app._upstream_curl_options())
+        app.UPSTREAM_IPV4 = False
+        check("switched off live, the library default is back", app._upstream_curl_options() is None)
+        app.UPSTREAM_IPV4 = True
+        seen = []
+        real_get = app.cf_requests.get
+
+        def spy(url, *a, **k):
+            seen.append((url.rsplit("/", 1)[-1], k.get("curl_options")))
+            return real_get(url, *a, **k)
+        app.cf_requests.get = spy
+        try:
+            sc = Scenario("ipv4", take=6)
+            SCENARIOS["ipv4"] = sc
+            url4 = "http://127.0.0.1:%d/ipv4/master.m3u8" % port
+            app.extract_m3u8_via_browser = (
+                lambda _e, *a, **k: {"url": url4, "headers": {}, "cookies": {},
+                                     "browser_m3u8_status": 200})
+            pulled = pull(app, client, "http://fake-embed.test/ipv4", 6)
+        finally:
+            app.cf_requests.get = real_get
+        leaves = {u for u, _o in seen}
+        check("a stream made playlist, probe and chunk requests",
+              {"master.m3u8", "index.m3u8"} <= leaves and any(x.endswith(".ts") for x in leaves)
+              and len(pulled.get("segments") or []) == 6, sorted(leaves)[:8])
+        check("every one of them was IPv4 only",
+              all(o == {CurlOpt.IPRESOLVE: 1} for _u, o in seen),
+              [x for x in seen if x[1] != {CurlOpt.IPRESOLVE: 1}][:3])
 
         section("status endpoint")
         r = client.get("/api/streams/history?limit=5")
