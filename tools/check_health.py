@@ -1,4 +1,4 @@
-"""Stream health (Phase 1) verification. Not shipped.
+"""Stream health (Phases 1 and 2) verification. Not shipped.
 
 Runs inside an image, with the script bind mounted, against the real app.py:
 
@@ -15,8 +15,10 @@ Runs inside an image, with the script bind mounted, against the real app.py:
     # the proof: identical video, matching timing
     python3 tools/check_health.py --compare /tmp/out/new.json /tmp/out/old.json
 
-Phase 1 is watch-only, so the claim to prove is that **nothing the proxy
-sends changed**. Each scenario pulls the real /stream route from a fake HLS
+Both phases are watch-only, so the claim to prove is that **nothing the
+proxy sends changed**. Phase 2 adds a watcher thread raising early warnings;
+the tracked run checks each misbehaviour raises the warning it should, and
+the rigged run makes the watcher's tick() raise too. Each scenario pulls the real /stream route from a fake HLS
 origin on 127.0.0.1 that misbehaves the messy way real sources do: slow
 chunks, a source that stalls and then jumps ahead, playlist error bursts, a
 chunk that stalls halfway, a truncated chunk, a sequence that restarts lower,
@@ -83,7 +85,8 @@ class Scenario:
     proxy ends up delivering is the same on every run."""
 
     def __init__(self, name, take, slow=None, stall=None, pl_errors=None,
-                 seg_fail=None, restart=None, end=None, window=LONG_WINDOW):
+                 seg_fail=None, restart=None, end=None, window=LONG_WINDOW,
+                 pl_hang=None):
         self.name = name
         self.take = take            # chunks to pull before hanging up
         self.slow = slow            # (first, last, seconds per chunk)
@@ -93,6 +96,7 @@ class Scenario:
         self.restart = restart      # time the sequence restarts lower
         self.end = end              # time the broadcast ends (ENDLIST)
         self.window_len = window    # chunks listed once past the probe
+        self.pl_hang = pl_hang      # (start_s, end_s, delay): requests in it hang
         self.reset()
 
     def reset(self):
@@ -174,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
         if leaf == "master.m3u8":
             return self._send(200, MASTER.encode(), "application/vnd.apple.mpegurl")
         if leaf == "index.m3u8":
+            if sc.pl_hang and sc.pl_hang[0] <= sc.now() < sc.pl_hang[1]:
+                time.sleep(sc.pl_hang[2])
             code, text = sc.playlist()
             return self._send(code, text.encode(), "application/vnd.apple.mpegurl")
         if leaf.startswith("seg") and leaf.endswith(".ts"):
@@ -244,6 +250,9 @@ def scenario_defs():
         Scenario("restart", take=15, restart=8.5, window=5),
         # The broadcast ends; the stream runs out on the idle limit.
         Scenario("ended", take=10 ** 6, end=8.5),
+        # A playlist request hangs for 7s and then answers: the failure
+        # behind all three long freezes of 2026-10-13 (there for ~15s).
+        Scenario("hang", take=18, pl_hang=(6.0, 7.0, 7.0)),
     ]
 
 
@@ -505,6 +514,141 @@ def unit_tests(app):
     tot = sh.totals(sh.HISTORY.read(500))
     check("totals add up", tot["freezes"] == sum(1 for g in sh.HISTORY.read(500) if g["freezes"]), tot)
 
+    section("early warnings")
+    T[0] = 3000.0
+    sh.note_playlist("http://w/p.m3u8",
+                     "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:1\n" +
+                     "".join("#EXTINF:4.0,\nw%d.ts\n" % n for n in range(1, 40)),
+                     app.resolve_url, {})
+    wu = lambda n: "http://w/w%d.ts" % n   # noqa: E731
+    w = sh.StreamHealth("w1", "team:w", "w", "admin1", clock=clock)
+    w.playlist_begin()
+    w.playlist_ok({"variants": [{"bandwidth": 8000000, "resolution": "1920x1080"},
+                                {"bandwidth": 700000, "resolution": "960x540"}],
+                   "target_duration": 4.0}, 3)
+    for n in (1, 2, 3):                     # 12s of cushion, empty at 3012
+        w.download_begin(wu(n)); w.download_end(wu(n), b"x" * 100)
+        w.sending(); w.delivered(wu(n), 100)
+    for _ in range(4):
+        T[0] += 0.5; w.tick()
+    check("steady: nothing raised", not w.warnings and w.snapshot()["state"] == "healthy",
+          list(w.warnings))
+    # The playlist request hangs at 3004 and answers at 3019: the 2026-10-13 shape.
+    T[0] = 3004.0
+    w.playlist_begin()
+    T[0] = 3007.5; w.tick()
+    check("hang: nothing before PLAYLIST_SLOW_S", "playlist_slow" not in w._active)
+    T[0] = 3008.0; w.tick()
+    snap = w.snapshot()
+    check("hang: playlist_slow raised at 4s",
+          [x["kind"] for x in snap["warnings"]] == ["playlist_slow"], snap["warnings"])
+    check("hang: state struggling with the warning's text",
+          snap["state"] == "struggling" and "Playlist request" in snap["reason"], snap["reason"])
+    check("hang: warning says what Phase 3 would do",
+          "fresh connection" in snap["warnings"][0]["would"], snap["warnings"][0]["would"])
+    T[0] = 3012.8; w.tick()
+    check("hang: no alarm before the cushion has been empty 1s", w._alarm is None)
+    T[0] = 3013.5; w.tick()
+    snap = w.snapshot()
+    check("hang: freeze alarm once empty for 1s", snap["alarm"] is not None and w.alarms == 1,
+          snap["alarm"])
+    check("hang: alarm would re-ask for the playlist",
+          "playlist" in snap["alarm"]["would"], snap["alarm"])
+    check("hang: the alarm is on the timeline, naming the warning",
+          any(e["kind"] == "alarm" and "playlist_slow" in e["text"] for e in snap["timeline"]),
+          [e["text"] for e in snap["timeline"] if e["kind"] == "alarm"])
+    for _ in range(6):
+        T[0] += 0.5; w.tick()
+    check("hang: one alarm per stall, not per tick", w.alarms == 1, w.alarms)
+    T[0] = 3019.0
+    w.playlist_ok({}, 1)
+    w.download_begin(wu(4)); T[0] = 3019.5; w.download_bytes(100)
+    w.download_end(wu(4), b"x" * 100); w.sending(); w.delivered(wu(4), 100)
+    w.tick()
+    check("hang: warning and alarm clear when video flows",
+          not w._active and w._alarm is None, (list(w._active), w._alarm))
+    T[0] += 30
+    w.download_begin(wu(5)); w.download_end(wu(5), b"x" * 100)
+    w.sending(); w.delivered(wu(5), 100)    # closes the freeze episode
+    f = w.freezes[-1] if w.freezes else {}
+    check("hang: freeze recorded, blamed on the playlist", f.get("cause") == "playlist", f)
+    check("hang: warned 4s ahead of the cushion running out",
+          f.get("noticed_s") == -4.0 and f.get("warned_by") == ["playlist_slow"], f)
+    det = w.snapshot()["detector"]
+    check("hang: the warning scored as a hit",
+          det["hits"] == 1 and det["false"] == 0 and det["warned_ahead"] == 1, det)
+    check("hang: playlist request times recorded",
+          w.snapshot()["playlist_fetch"]["slow"] == 1 and w.snapshot()["playlist_fetch"]["max_s"] == 15.0,
+          w.snapshot()["playlist_fetch"])
+    # A quiet download that recovers well before the cushion runs out.
+    base = T[0]
+    w.download_begin(wu(6)); T[0] = base + 4.5; w.tick()
+    check("quiet download raised", "download_quiet" in w._active, list(w._active))
+    w.download_bytes(100); w.download_end(wu(6), b"x" * 100); w.sending(); w.delivered(wu(6), 100)
+    w.tick()
+    for n in (7, 8, 9, 10, 11, 12, 13):
+        w.download_begin(wu(n)); w.download_end(wu(n), b"x" * 100)
+        w.sending(); w.delivered(wu(n), 100)
+    T[0] += sh.WARN_HORIZON_S + 1; w.tick()
+    det = w.snapshot()["detector"]
+    check("a warning no freeze followed is a false alarm",
+          det["by_kind"]["download_quiet"]["false"] == 1, det["by_kind"])
+    # Too slow: three chunks at half real time. The remedy names the variant.
+    for n in (14, 15, 16):
+        w.download_begin(wu(n)); T[0] += 8; w.download_end(wu(n), b"x" * 100)
+        w.sending(); w.delivered(wu(n), 100)
+    w.tick()
+    slow = w._active.get("too_slow")
+    check("too slow raised, would switch to 960x540",
+          slow is not None and "960x540" in slow.get("would", ""), slow)
+    # Source quiet: polls keep finding nothing for 8s (2 x 4s chunks).
+    for n in (17, 18, 19, 20, 21):
+        w.download_begin(wu(n)); w.download_end(wu(n), b"x" * 100)
+        w.sending(); w.delivered(wu(n), 100)
+    w.playlist_begin(); w.playlist_ok({}, 1)
+    t_new = T[0]
+    for k in range(9):
+        T[0] = t_new + k
+        w.playlist_begin(); w.playlist_ok({}, 0); w.tick()
+    check("source quiet raised after 8s of empty polls", "source_quiet" in w._active,
+          list(w._active))
+    w.playlist_failed(503); w.tick()
+    check("one playlist failure is not a warning", "playlist_failing" not in w._active)
+    w.playlist_failed(503); w.tick()
+    check("two in a row are", "playlist_failing" in w._active)
+    T[0] += 40
+    w.finish()
+    sh.HISTORY.flush()
+    rec = [r for r in sh.HISTORY.read(20) if r["id"] == "w1"]
+    rec = rec[0] if rec else {}
+    check("record carries the detector and thresholds",
+          rec.get("detector", {}).get("raised", 0) >= 5 and rec.get("thresholds", {}).get(
+              "playlist_slow_s") == sh.PLAYLIST_SLOW_S, (rec.get("detector"), rec.get("thresholds")))
+    check("record lists the warnings", len(rec.get("warning_list") or []) >= 5)
+    check("at the end every unhit warning is false, none pending",
+          rec.get("detector", {}).get("pending") == 0, rec.get("detector"))
+    tot = sh.totals([rec, {"seconds": 10, "freezes": 0}])
+    check("totals add the detector, skipping pre-Phase-2 records",
+          tot["detector"]["streams"] == 1
+          and tot["detector"]["warned_ahead"] == rec["detector"]["warned_ahead"] >= 1,
+          tot["detector"])
+    check("summary line mentions the warnings", "early warnings" in sh._summary_line(rec))
+    no_var = sh.StreamHealth("w2", "", "", "", clock=clock)
+    check("too slow with nothing lower on offer says so",
+          "no lower quality" in no_var._remedy("too_slow"))
+
+    section("watcher")
+    t = sh.track("w3", "team:z", "z", "", clock=time.time)
+    check("track() registers with the watcher", t in sh._live and sh._watcher.is_alive())
+    t.finish()
+    check("finish() unregisters", t not in sh._live)
+    T[0] = 5000.0
+    stale = sh.StreamHealth("w4", "", "", "", clock=clock)
+    sh._register(stale)
+    T[0] += sh.STALE_START_S + 1
+    stale.tick()
+    check("a stream that never started is dropped after STALE_START_S", stale not in sh._live)
+
     section("guards")
     class Boom(sh.StreamHealth):
         @sh._guarded
@@ -522,7 +666,7 @@ def unit_tests(app):
 
 HOOKS = ("download_begin", "download_attempt", "download_bytes", "download_end",
          "sending", "delivered", "playlist_begin", "playlist_failed",
-         "playlist_ok", "loop_error", "end", "finish", "snapshot")
+         "playlist_ok", "loop_error", "end", "finish", "snapshot", "tick")
 
 
 def rig_hooks_raise(sh):
@@ -591,6 +735,47 @@ def expect(results):
     check("ended: ENDLIST seen", en.get("endlist") is True)
     check("ended: ran out on the idle limit", en.get("end_reason") == "idle_timeout",
           en.get("end_reason"))
+
+    section("early warnings match what the origin did")
+    hg = h.get("hang", {})
+
+    def kinds(rec, hit=None):
+        return {w["kind"] for w in rec.get("warning_list") or []
+                if hit is None or w["hit"] == hit}
+    check("steady: no warnings at all", not kinds(st), st.get("warning_list"))
+    check("slow: too_slow raised and hit", "too_slow" in kinds(sl, True), sl.get("warning_list"))
+    check("stall: source_quiet raised and hit", "source_quiet" in kinds(sa, True),
+          sa.get("warning_list"))
+    check("errors: the halfway stall raised download_quiet", "download_quiet" in kinds(er),
+          er.get("warning_list"))
+    check("hang: froze, blamed on the playlist",
+          max((hg.get("by_cause") or {"x": 0}).items(), key=lambda kv: kv[1])[0] == "playlist",
+          hg.get("by_cause"))
+    check("hang: playlist_slow raised and hit", "playlist_slow" in kinds(hg, True),
+          hg.get("warning_list"))
+    check("hang: the slow request is in the playlist figures",
+          ((hg.get("playlist_fetch") or {}).get("max_s") or 0) >= 6, hg.get("playlist_fetch"))
+    # A single stall raises the alarm within FREEZE_MIN_S plus a tick or two.
+    # One barely over FREEZE_MIN_S can end before any tick sees it: a miss,
+    # recorded as such. A stutter of sub-second stalls never trips the alarm;
+    # it is noticed by whichever warning its cause raises.
+    import streamhealth as shm
+    short = shm.FREEZE_MIN_S + 2 * shm.WATCH_INTERVAL_S
+    for name, rec in h.items():
+        for f in rec.get("freeze_list") or []:
+            n = f.get("noticed_s")
+            if f["stalls"] > 1:
+                ok, what = n is not None, "stutter noticed"
+            elif f["s"] < short:
+                ok, what = n is None or n <= 2.0, "short freeze noticed or honestly missed"
+            else:
+                ok, what = n is not None and n <= 2.0, "freeze noticed within 2s"
+            check("%s: %s (at %.0fs, %.1fs)" % (name, what, f["at_s"], f["s"]), ok, f)
+        det = rec.get("detector") or {}
+        fl = rec.get("freeze_list") or []
+        check("%s: every freeze scored, misses included" % name,
+              det.get("freezes_scored") == len(fl)
+              and det.get("missed") == sum(1 for f in fl if f.get("noticed_s") is None), det)
 
 
 def compare(new, old, label_new, label_old, tol_max=1.0, tol_median=0.25):

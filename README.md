@@ -483,6 +483,15 @@ Freezes are estimated from what was sent. Dispatcharr and Jellyfin buffer a
 little of their own, so a short freeze here may never have reached the screen;
 a long one did.
 
+**Early warnings.** Twice a second each stream is checked for the things that
+come before a freeze: a playlist request hanging (4s), the playlist failing
+twice in a row, a chunk download gone silent (4s), downloads slower than real
+time, the source publishing nothing new. A warning shows in orange under the
+Health badge and in the log, with what an automatic fix *would* do. Nothing
+acts on it yet. Recent streams scores them: how many freezes were **warned
+ahead**, how many were missed, and how many warnings were **false alarms**
+because no freeze followed.
+
 ## Limitations
 
 - No mid-stream failover. If a source dies during playback the stream ends and

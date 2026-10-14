@@ -1238,7 +1238,9 @@ tr.health-row td { background: var(--surface-step); padding: var(--s-md) var(--s
 .health-timeline .kind-freeze span, .health-timeline .kind-internal span { color: var(--error); }
 .health-timeline .kind-skip span, .health-timeline .kind-backwards span,
 .health-timeline .kind-playlist_error span, .health-timeline .kind-dropped span,
-.health-timeline .kind-replay span { color: var(--warn); }
+.health-timeline .kind-replay span, .health-timeline .kind-warn span { color: var(--warn); }
+.health-timeline .kind-alarm span { color: var(--error); }
+.health-sub.health-warning { color: var(--warn); }
 
 .history-stats { margin-bottom: var(--s-sm); }
 .history-endings { margin: 0 0 var(--s-sm); }

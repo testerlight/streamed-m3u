@@ -26,9 +26,9 @@ quality (failover, buffering, startup latency); it is not yet implemented.
 
 Stream health is being built in three phases, one at a time, per
 `.scratch/stream-health/spec.md`. Phase 1 (`streamhealth.py`, gotcha #29)
-only watches. Do not add detection thresholds or automatic recovery until
-that spec's gate is met: at least five real freezes in the history, read
-with the user.
+only watches; Phase 2 adds early warnings that are scored but never acted
+on. Do not add automatic recovery (Phase 3) until that spec's gate is met:
+Phase 2 has run on real games and its scores have been read with the user.
 
 Verification runs inside the image, not on the host: see the docstring of
 `tools/check_console.py`. Build to a scratch tag for that; never retag the

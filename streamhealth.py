@@ -1,7 +1,8 @@
 """streamhealth: watch-only health tracking for proxied streams.
 
-Phase 1 of the stream-health work (.scratch/stream-health/spec.md). It
-observes and never acts: nothing here may change what a stream sends, or when.
+Phases 1 and 2 of the stream-health work (.scratch/stream-health/spec.md).
+It observes and never acts: nothing here may change what a stream sends, or
+when.
 
 Two rules follow from that, and both are load-bearing:
 
@@ -27,6 +28,19 @@ While a stream runs, its wall clock is labelled with what the loop was doing
 freeze's cause is the label that covered most of it. Time spent blocked on a
 player that is not reading is recorded, but it is not a freeze: that is the
 player's choice, not a failure on this side.
+
+Early warnings (Phase 2)
+------------------------
+A watcher thread looks at every live stream twice a second and raises an
+early warning when a known precursor of a freeze starts: a playlist request
+hanging, the playlist failing, a chunk download gone silent, downloads slower
+than real time, the source not publishing. Once the cushion has been empty for
+FREEZE_MIN_S it raises a freeze alarm. Each carries what Phase 3 *would* do,
+as text only. Every warning is then scored: a hit if a real freeze began
+within WARN_HORIZON_S of it, otherwise a false alarm; every freeze records how
+soon it was noticed and whether it was warned about ahead. Those scores are
+the evidence Phase 3 is gated on. The watcher runs off the stream path, so it
+can be slow or broken without a stream noticing.
 """
 
 import json
@@ -62,10 +76,49 @@ SPEED_WINDOW = 5
 LOW_CUSHION_S = 2.0
 # Used only when a playlist gives neither EXTINF nor a target duration.
 DEFAULT_DURATION_S = 4.0
-TIMELINE_MAX = 40
+TIMELINE_MAX = 60
 FREEZE_LIST_MAX = 50
 SAMPLES_MAX = 5000
 HISTORY_KEEP = 500
+
+# Early warnings (Phase 2). First values, chosen from one game's freezes
+# (2026-10-13: three 15-19s freezes, each a playlist request hanging for most
+# of the 15s request timeout). The history records what they caught and what
+# they cried wolf on, plus playlist request times, so they can be tuned.
+WATCH_INTERVAL_S = 0.5    # how often the watcher looks at each live stream
+PLAYLIST_SLOW_S = 4.0     # a playlist request still running after this long
+PLAYLIST_FAIL_RUN = 2     # playlist failures in a row
+DOWNLOAD_QUIET_S = 4.0    # a chunk download that has received nothing this long
+SLOW_SPEED = 1.0          # rolling download speed below this (x real time) ...
+SLOW_SAMPLES = 3          # ... over at least this many chunks
+SOURCE_QUIET_MIN_S = 6.0  # polls finding nothing new for max(this, 2 chunks)
+WARN_HORIZON_S = 20.0     # a freeze starting this soon after a warning is its hit
+WARNINGS_MAX = 200
+WARN_LOG_MAX = 10         # log lines per warning kind per stream
+STALE_START_S = 300.0     # a tracker that never started streaming is dropped
+
+# kind -> (what it means, what Phase 3 would do about it)
+WARNINGS = {
+    "playlist_slow":    ("Playlist request hanging",
+                         "ask for the playlist again on a fresh connection"),
+    "playlist_failing": ("Playlist failing",
+                         "fetch a fresh stream link"),
+    "download_quiet":   ("Chunk download gone quiet",
+                         "fetch the same chunk again on a fresh connection"),
+    "too_slow":         ("Downloads slower than real time",
+                         "switch to a lower quality"),
+    "source_quiet":     ("Source not publishing",
+                         "check another source for this game"),
+}
+
+# What the loop is doing while frozen -> the warning whose remedy applies.
+_LABEL_WARNING = {
+    "playlist":         "playlist_slow",
+    "playlist_error":   "playlist_failing",
+    "download_stalled": "download_quiet",
+    "download":         "too_slow",
+    "waiting":          "source_quiet",
+}
 
 CAUSES = {
     "slow":     "Downloads too slow",
@@ -276,6 +329,42 @@ def _match_reconnect(channel_key, now):
             "replayed_s": 0.0, "_keys": set(r["keys"])}
 
 
+# ─── Watcher ──────────────────────────────────────────────────────────────────
+# One daemon thread for every live stream. It only ever calls tick(), which is
+# guarded like every hook; the loop itself swallows anything else.
+
+_live_lock = threading.Lock()
+_live = set()
+_watcher = None
+
+
+def _watch():
+    while True:
+        time.sleep(WATCH_INTERVAL_S)
+        try:
+            with _live_lock:
+                streams = list(_live)
+            for t in streams:
+                t.tick()
+        except Exception:
+            _warn_once("watch", "Stream health watcher error")
+
+
+def _register(tracker):
+    global _watcher
+    with _live_lock:
+        _live.add(tracker)
+        if _watcher is None:
+            _watcher = threading.Thread(target=_watch, name="streamhealth-watch",
+                                        daemon=True)
+            _watcher.start()
+
+
+def _unregister(tracker):
+    with _live_lock:
+        _live.discard(tracker)
+
+
 # ─── Per-stream tracker ───────────────────────────────────────────────────────
 
 def _guarded(fn):
@@ -393,6 +482,19 @@ class StreamHealth:
         self.internal_errors = 0
         self._seen_errors = set()
 
+        # Early warnings (Phase 2), maintained by tick().
+        self._active = {}            # kind -> warning, while its condition holds
+        self.warnings = deque(maxlen=WARNINGS_MAX)
+        self._warn_logged = {}
+        self._alarm = None           # the freeze alarm, while it is up
+        self._alarm_times = deque(maxlen=WARNINGS_MAX)
+        self.alarms = 0
+        self._pl_began = None
+        self._pl_fail_since = None
+        self._pl_times = deque(maxlen=SAMPLES_MAX)
+        self._poll_empty = False
+        self.download_quiet_max = 0.0
+
         self.end_reason = None
         self.end_detail = None
         self.ended = None
@@ -498,6 +600,7 @@ class StreamHealth:
             self.blip_s += ep["starved"]
             return
         cause = max(ep["blamed"], key=ep["blamed"].get)
+        noticed, kinds = self._score(ep)
         self.freeze_count += 1
         self.frozen_s += ep["starved"]
         self.longest_freeze = max(self.longest_freeze, ep["starved"])
@@ -509,15 +612,122 @@ class StreamHealth:
                                  "s": round(ep["starved"], 1),
                                  "span_s": round(span, 1),
                                  "stalls": ep["stalls"], "cause": cause,
-                                 "open": ep["open"]})
+                                 "open": ep["open"], "noticed_s": _r(noticed),
+                                 "warned_by": kinds})
         shape = ("" if ep["stalls"] == 1 else
                  " (%d stalls over %.0fs)" % (ep["stalls"], span))
         text = "%s %.1fs%s: %s" % ("Frozen at end," if ep["open"] else "Froze",
                                    ep["starved"], shape, CAUSES[cause])
         self._event("freeze", text, ep["last_end"])
-        log.warning("%s froze for %.1fs%s%s: %s", self._who(), ep["starved"],
+        if noticed is None:
+            seen = ""
+        elif noticed < 0:
+            seen = "; warned %.0fs ahead (%s)" % (-noticed, ", ".join(kinds))
+        else:
+            seen = "; noticed after %.1fs" % noticed
+        log.warning("%s froze for %.1fs%s%s: %s%s", self._who(), ep["starved"],
                     shape, " (still frozen when it ended)" if ep["open"] else "",
-                    CAUSES[cause])
+                    CAUSES[cause], seen)
+
+    def _score(self, ep):
+        """A real freeze closed: mark the warnings it makes hits.
+
+        A warning is a hit if it was up, or had cleared less than
+        WARN_HORIZON_S earlier, at any point during the freeze. Returns how
+        soon the freeze was noticed, relative to the cushion running out
+        (negative: warned ahead), and the kinds that saw it coming.
+        """
+        start, end = ep["start"], ep["last_end"]
+        kinds, first = set(), None
+        for w in self.warnings:
+            until = w["cleared"] if w["cleared"] is not None else end
+            if w["raised"] <= end and start <= until + WARN_HORIZON_S:
+                w["hit"] = True
+                if w["lead"] is None:
+                    w["lead"] = start - w["raised"]
+                kinds.add(w["kind"])
+                first = w["raised"] if first is None else min(first, w["raised"])
+        for t in self._alarm_times:
+            if start <= t <= end:
+                first = t if first is None else min(first, t)
+                break
+        return (None if first is None else first - start), sorted(kinds)
+
+    def _lower_variant(self):
+        vs = self.variants or []
+        if len(vs) < 2 or not vs[0].get("bandwidth"):
+            return None
+        lower = [v for v in vs[1:] if v.get("bandwidth") and v["bandwidth"] < vs[0]["bandwidth"]]
+        if not lower:
+            return None
+        v = max(lower, key=lambda v: v["bandwidth"])
+        return "%s @ %.1f Mbit/s" % (v.get("resolution") or "?", v["bandwidth"] / 1e6)
+
+    def _remedy(self, kind):
+        if kind == "too_slow":
+            lower = self._lower_variant()
+            return ("switch to %s" % lower) if lower else "nothing: no lower quality on offer"
+        return WARNINGS[kind][1]
+
+    def _would(self, now):
+        """The remedy for a freeze in progress: the oldest warning that is
+        up, else whatever the loop is stuck in. A download receiving nothing
+        wants a fresh request, not a lower quality."""
+        if self._active:
+            kind = min(self._active.values(), key=lambda w: w["raised"])["kind"]
+        elif (self._label == "download" and self._dl is not None
+              and now - self._dl["last"] >= FREEZE_MIN_S):
+            kind = "download_quiet"
+        else:
+            kind = _LABEL_WARNING.get(self._label)
+        return self._remedy(kind) if kind else "nothing obvious to try"
+
+    def _conditions(self, now):
+        """kind -> (when the condition began, text) for each that holds now."""
+        out = {}
+        if self._pl_began is not None and now - self._pl_began >= PLAYLIST_SLOW_S:
+            out["playlist_slow"] = (self._pl_began, "Playlist request running for %.0fs"
+                                    % (now - self._pl_began))
+        if self._pl_run >= PLAYLIST_FAIL_RUN:
+            out["playlist_failing"] = (self._pl_fail_since or now,
+                                       "Playlist failing (%s, %d in a row)"
+                                       % (self._pl_status, self._pl_run))
+        dl = self._dl
+        if dl is not None and now - dl["last"] >= DOWNLOAD_QUIET_S:
+            out["download_quiet"] = (dl["last"], "Chunk download silent for %.0fs"
+                                     % (now - dl["last"]))
+        speed, _link = self._speed()
+        if speed is not None and len(self._speeds) >= SLOW_SAMPLES and speed < SLOW_SPEED:
+            out["too_slow"] = (now, "Downloads at %.2fx real time" % speed)
+        if self._poll_empty and self.first_delivery is not None and not self.endlist:
+            last = self.last_new_chunk_at or self.first_delivery
+            limit = max(SOURCE_QUIET_MIN_S, 2 * (self.target_duration or 0))
+            if now - last >= limit:
+                out["source_quiet"] = (last, "No new chunk from the source for %.0fs"
+                                       % (now - last))
+        return out
+
+    def _note_warning(self, w, now):
+        w["would"] = self._remedy(w["kind"])
+        self._event("warn", "Early warning: %s; would %s" % (w["text"], w["would"]), now)
+        n = self._warn_logged.get(w["kind"], 0) + 1
+        self._warn_logged[w["kind"]] = n
+        if n <= WARN_LOG_MAX:
+            log.info("%s: early warning: %s; would %s%s", self._who(), w["text"],
+                     w["would"], " (no more of this kind will be logged)"
+                     if n == WARN_LOG_MAX else "")
+
+    def _note_alarm(self, now, frozen):
+        empty_at = now - frozen
+        ahead = sorted({w["kind"] for w in self.warnings
+                        if w["raised"] <= empty_at
+                        and (w["cleared"] is None or w["cleared"] >= empty_at - WARN_HORIZON_S)})
+        text = "Freeze alarm: cushion empty for %.1fs; would %s%s" % (
+            frozen, self._alarm["would"],
+            ("; warned ahead by %s" % ", ".join(ahead)) if ahead else "")
+        self._event("alarm", text, now)
+        if self.alarms <= 2 * WARN_LOG_MAX:
+            log.warning("%s: %s", self._who(), text)
 
     def _speed(self):
         if not self._speeds:
@@ -606,6 +816,7 @@ class StreamHealth:
             now = self._now()
             dl["gap"] = max(dl["gap"], now - dl["last"])
             secs = now - dl["began"]
+            self.download_quiet_max = max(self.download_quiet_max, dl["gap"])
             if body is None or dl["attempts"] > 1 or dl["gap"] >= STALL_GAP_S:
                 self._relabel(dl["began"], "download_stalled")
             if body is None:
@@ -722,14 +933,25 @@ class StreamHealth:
     @_guarded
     def playlist_begin(self):
         with self._lock:
-            self._enter("playlist", self._now())
+            now = self._now()
+            self._pl_began = now
+            self._enter("playlist", now)
+
+    def _playlist_done(self, now):
+        began, self._pl_began = self._pl_began, None
+        if began is not None:
+            self._pl_times.append(now - began)
+        return began
 
     @_guarded
     def playlist_failed(self, status, empty=False):
         with self._lock:
             now = self._now()
+            began = self._playlist_done(now)
             self.playlist_errors += 1
             self._pl_run += 1
+            if self._pl_run == 1:
+                self._pl_fail_since = began or now
             self._pl_status = "empty playlist" if empty else "HTTP %s" % status
             if self._pl_run == 1:
                 self._event("playlist_error", "Playlist error (%s)" % self._pl_status, now)
@@ -739,6 +961,8 @@ class StreamHealth:
     def playlist_ok(self, info, new_count):
         with self._lock:
             now = self._now()
+            self._playlist_done(now)
+            self._poll_empty = not new_count
             if self._pl_run:
                 self._event("playlist_ok", "Playlist recovered after %d error(s)"
                             % self._pl_run, now)
@@ -782,6 +1006,41 @@ class StreamHealth:
         log.warning("%s: stream loop error, retrying in 2s: %s",
                     self._who(), msg, exc_info=exc)
 
+    # ── the watcher (its own thread) ─────────────────────────────────────────
+
+    @_guarded
+    def tick(self):
+        """Raise and clear early warnings and the freeze alarm. Watch-only."""
+        with self._lock:
+            now = self._now()
+            if self.ended is not None or (self.first_delivery is None
+                                          and now - self.started > STALE_START_S):
+                _unregister(self)
+                return
+            conds = self._conditions(now)
+            for kind, (onset, text) in conds.items():
+                w = self._active.get(kind)
+                if w is None:
+                    w = {"kind": kind, "since": onset, "raised": now, "cleared": None,
+                         "hit": False, "lead": None, "text": text}
+                    self._active[kind] = w
+                    self.warnings.append(w)
+                    self._note_warning(w, now)
+                else:
+                    w["text"] = text
+            for kind in [k for k in self._active if k not in conds]:
+                self._active.pop(kind)["cleared"] = now
+            _cushion, frozen = self._cushion_now(now)
+            if (self._cushion_at is not None and frozen >= FREEZE_MIN_S
+                    and self._label != "sending"):
+                if self._alarm is None:
+                    self._alarm = {"raised": now, "would": self._would(now)}
+                    self._alarm_times.append(now)
+                    self.alarms += 1
+                    self._note_alarm(now, frozen)
+            elif frozen <= 0:
+                self._alarm = None
+
     # ── hooks: end ───────────────────────────────────────────────────────────
 
     @_guarded
@@ -808,9 +1067,14 @@ class StreamHealth:
             r = self.reconnect
             if r is not None and r["replayed_chunks"] and self.chunks < 12:
                 self._replay_note(now)
+            for w in self._active.values():
+                w["cleared"] = now
+            self._active = {}
+            self._alarm = None
             self._event("end", self._end_text(), now)
             record = self._record(now)
             keys = list(self._keys)
+        _unregister(self)
         _remember_ended(self.channel_key, now, self.end_reason, self.id, keys)
         log.info("%s summary: %s", self._who(), _summary_line(record))
         HISTORY.append(record)
@@ -830,6 +1094,9 @@ class StreamHealth:
             return "frozen", self._activity_text(now)
         if self._pl_run:
             return "struggling", self._activity_text(now)
+        if self._active:
+            return "struggling", min(self._active.values(),
+                                     key=lambda w: w["raised"])["text"]
         if speed is not None and speed < 1.0:
             return "struggling", "Downloads at %.2fx real time" % speed
         if cushion is not None and cushion < LOW_CUSHION_S:
@@ -848,6 +1115,38 @@ class StreamHealth:
             for c, secs in ep["blamed"].items():
                 causes[c] = causes.get(c, 0.0) + secs
         return count, frozen, longest, causes
+
+    def _detector(self, now):
+        """How the early warnings have scored so far on this stream."""
+        kinds = {}
+        raised = hits = false = 0
+        for w in self.warnings:
+            k = kinds.setdefault(w["kind"], {"raised": 0, "hits": 0, "false": 0, "_leads": []})
+            k["raised"] += 1
+            raised += 1
+            if w["hit"]:
+                k["hits"] += 1
+                hits += 1
+                if w["lead"] is not None:
+                    k["_leads"].append(w["lead"])
+            elif self.ended is not None or (w["cleared"] is not None
+                                            and now - w["cleared"] > WARN_HORIZON_S):
+                k["false"] += 1
+                false += 1
+        for k in kinds.values():
+            k["lead_median_s"] = _r(_median(k.pop("_leads")))
+        # Every freeze counts: one over before any tick saw it is a miss.
+        noticed = [f["noticed_s"] for f in self.freezes if f.get("noticed_s") is not None]
+        return {
+            "raised": raised, "hits": hits, "false": false,
+            "pending": raised - hits - false,
+            "by_kind": kinds,
+            "alarms": self.alarms,
+            "freezes_scored": len(self.freezes),
+            "missed": len(self.freezes) - len(noticed),
+            "warned_ahead": sum(1 for n in noticed if n < 0),
+            "noticed_median_s": _r(_median(noticed)),
+        }
 
     def _common(self, now):
         speed, link = self._speed()
@@ -882,6 +1181,15 @@ class StreamHealth:
             "variant": variant,
             "variants": self.variants,
             "concurrent_max": self.concurrent_max,
+            "detector": self._detector(now),
+            "playlist_fetch": {
+                "count": len(self._pl_times),
+                "median_s": _r(_median(self._pl_times), 2),
+                "p90_s": _r(_pct(self._pl_times, 0.9), 2),
+                "max_s": _r(max(self._pl_times) if self._pl_times else None),
+                "slow": sum(1 for x in self._pl_times if x >= PLAYLIST_SLOW_S),
+            },
+            "download_quiet_max_s": _r(self.download_quiet_max),
             "reconnect": None if r is None else {
                 k: (_r(v) if isinstance(v, float) else v)
                 for k, v in r.items() if not k.startswith("_")},
@@ -903,6 +1211,14 @@ class StreamHealth:
                 "behind_live_s": _r(self.behind_now),
                 "activity": self._label,
                 "activity_s": _r(now - self._label_since),
+                "warnings": [{"kind": w["kind"], "title": WARNINGS[w["kind"]][0],
+                              "text": w["text"], "for_s": _r(now - w["raised"]),
+                              "would": w.get("would")}
+                             for w in sorted(self._active.values(),
+                                             key=lambda w: w["raised"])],
+                "alarm": None if self._alarm is None else {
+                    "for_s": _r(now - self._alarm["raised"]),
+                    "would": self._alarm["would"]},
                 "timeline": list(self.timeline),
             })
             return out
@@ -933,6 +1249,16 @@ class StreamHealth:
             "behind_live_median_s": _r(_median(self._behind)),
             "behind_live_max_s": _r(max(self._behind) if self._behind else None),
             "freeze_list": list(self.freezes),
+            "warning_list": [{"kind": w["kind"], "at_s": _r(w["raised"] - self.started),
+                              "s": _r((w["cleared"] or now) - w["raised"]),
+                              "hit": w["hit"], "lead_s": _r(w["lead"])}
+                             for w in list(self.warnings)[-FREEZE_LIST_MAX:]],
+            "thresholds": {"playlist_slow_s": PLAYLIST_SLOW_S,
+                           "playlist_fail_run": PLAYLIST_FAIL_RUN,
+                           "download_quiet_s": DOWNLOAD_QUIET_S,
+                           "slow_speed": SLOW_SPEED,
+                           "source_quiet_min_s": SOURCE_QUIET_MIN_S,
+                           "warn_horizon_s": WARN_HORIZON_S},
         })
         out.pop("speed", None)
         out.pop("link_mbit", None)
@@ -964,6 +1290,17 @@ def _summary_line(rec):
                      (rec.get("internal_errors"), "internal error(s)")):
         if n:
             parts.append("%d %s" % (n, label))
+    det = rec.get("detector") or {}
+    if det.get("raised") or det.get("freezes_scored"):
+        parts.append("early warnings: %d raised, %d hit, %d false; %d of %d freeze(s) "
+                     "warned ahead, %d missed"
+                     % (det.get("raised", 0), det.get("hits", 0), det.get("false", 0),
+                        det.get("warned_ahead", 0), det.get("freezes_scored", 0),
+                        det.get("missed", 0)))
+    pf = rec.get("playlist_fetch") or {}
+    if pf.get("count"):
+        parts.append("playlist requests %.2fs median, %.1fs worst"
+                     % (pf.get("median_s") or 0, pf.get("max_s") or 0))
     rc = rec.get("reconnect")
     if rc:
         parts.append("reconnect %.0fs after %s, replayed %d chunk(s)"
@@ -987,12 +1324,21 @@ NULL = _Null()
 
 
 def track(*args, **kwargs):
-    """Build a tracker, or the no-op stand-in if that fails. Never raises."""
+    """Build a tracker, or the no-op stand-in if that fails. Never raises.
+
+    Trackers built here are watched for early warnings; ones built directly
+    (the tests) are not, so a test drives tick() itself on its own clock.
+    """
     try:
-        return StreamHealth(*args, **kwargs)
+        tracker = StreamHealth(*args, **kwargs)
     except Exception:
         _warn_once("track", "Stream health tracker could not start")
         return NULL
+    try:
+        _register(tracker)
+    except Exception:
+        _warn_once("register", "Stream health watcher could not start")
+    return tracker
 
 
 # ─── History ──────────────────────────────────────────────────────────────────
@@ -1104,7 +1450,22 @@ def totals(records):
     out = {"streams": len(records), "seconds": 0.0, "freezes": 0,
            "frozen_s": 0.0, "by_cause": {}, "ended": {}, "reconnects": 0,
            "replayed_chunks": 0, "skipped": 0, "with_freezes": 0}
+    det = {"streams": 0, "seconds": 0.0, "raised": 0, "hits": 0, "false": 0,
+           "freezes_scored": 0, "missed": 0, "warned_ahead": 0, "by_kind": {}}
+    noticed = []
     for r in records:
+        d = r.get("detector")
+        if d:   # streams from before Phase 2 have no detector figures
+            det["streams"] += 1
+            det["seconds"] += r.get("seconds") or 0
+            for k in ("raised", "hits", "false", "freezes_scored", "missed", "warned_ahead"):
+                det[k] += d.get(k) or 0
+            for kind, v in (d.get("by_kind") or {}).items():
+                agg = det["by_kind"].setdefault(kind, {"raised": 0, "hits": 0, "false": 0})
+                for k in agg:
+                    agg[k] += v.get(k) or 0
+            noticed += [f["noticed_s"] for f in (r.get("freeze_list") or [])
+                        if f.get("noticed_s") is not None]
         out["seconds"] += r.get("seconds") or 0
         out["freezes"] += r.get("freezes") or 0
         out["frozen_s"] += r.get("frozen_s") or 0
@@ -1121,4 +1482,7 @@ def totals(records):
             out["replayed_chunks"] += rc.get("replayed_chunks") or 0
     out["seconds"] = round(out["seconds"], 1)
     out["frozen_s"] = round(out["frozen_s"], 1)
+    det["seconds"] = round(det["seconds"], 1)
+    det["noticed_median_s"] = _r(_median(noticed))
+    out["detector"] = det
     return out

@@ -112,12 +112,17 @@ with sync_playwright() as pw:
     check("live stream shows a health badge", badge in ("Healthy", "Struggling", "Frozen"), badge)
     sub = page.inner_text("#streams-panel .health-sub")
     check("badge carries speed and cushion", "×" in sub and "cushion" in sub, sub)
+    page.wait_for_selector("#streams-panel .health-warning", timeout=15000)
+    warn = page.inner_text("#streams-panel .health-warning")
+    check("early warning shown under the badge", "slower than real time" in warn, warn)
     page.click("[data-health]")
     page.wait_for_selector("tr.health-row", timeout=5000)
     facts = page.inner_text("tr.health-row .health-facts")
     check("timeline row shows the figures",
           "Speed" in facts and "Quality taken" in facts and "1920x1080" in facts, facts[:200])
     check("timeline lists events", page.locator("tr.health-row .health-timeline li").count() >= 1)
+    check("facts say what Phase 3 would do",
+          "Warnings now" in facts and "would switch to 960x540" in facts, facts[-400:])
     time.sleep(5.5)   # one fast poll: the row must survive a re-render
     check("open timeline survives a poll", page.locator("tr.health-row").count() == 1)
     page.wait_for_selector("#history-panel table", timeout=25000)
@@ -127,6 +132,8 @@ with sync_playwright() as pw:
     check("recent streams names causes",
           "Source not publishing" in hist and "Download stalled or failing" in hist, hist[:300])
     check("recent streams shows the skipped chunks", "7 skipped" in hist)
+    check("recent streams scores the early warnings",
+          "Warned ahead" in hist and "false alarm" in hist, hist[:400])
     page.locator("#streams").screenshot(path="/out/health-streams-dark.png")
     page.locator("#history").screenshot(path="/out/health-history-dark.png")
     page.click("#theme-toggle")

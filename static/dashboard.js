@@ -365,7 +365,8 @@
   /* ── Stream health ────────────────────────────────────────────────────── */
   /* Watch-only (streamhealth.py). The badge is the toggle for the stream's
    * own timeline, which lives in a full-width row under it, so the table
-   * gains one narrow column rather than a wall of new figures. */
+   * gains one narrow column rather than a wall of new figures. Early
+   * warnings (Phase 2) say what Phase 3 *would* do; nothing acts on them. */
 
   var HEALTH_LABEL = { healthy: "Healthy", struggling: "Struggling",
                        frozen: "Frozen", starting: "Starting" };
@@ -390,6 +391,11 @@
   function secs(v) {
     if (v === null || v === undefined) { return "n/a"; }
     return v < 60 ? Number(v).toFixed(v < 10 ? 1 : 0) + "s" : dur(v);
+  }
+
+  /* How soon a freeze was noticed: "3s ahead" or "1.2s after it began". */
+  function signedSecs(v) {
+    return v < 0 ? secs(-v) + " ahead" : secs(v) + " after it began";
   }
 
   function mbit(v) {
@@ -432,7 +438,29 @@
       (sub.length ? '<div class="health-sub">' + esc(sub.join(" · ")) + "</div>" : "") +
       (h.freezes ? '<div class="health-sub">' + esc(plural(h.freezes, "freeze") + ", " +
         secs(h.frozen_s)) + "</div>" : "") +
+      warningLine(h) +
       "</td>";
+  }
+
+  function warningLine(h) {
+    var ws = h.warnings || [];
+    if (!ws.length) { return ""; }
+    var text = ws[0].title + (ws.length > 1 ? " +" + (ws.length - 1) : "");
+    return '<div class="health-sub health-warning" title="' +
+      esc(ws.map(function (w) { return w.text + "; would " + w.would; }).join("\n")) + '">' +
+      esc(text) + "</div>";
+  }
+
+  function detectorText(d) {
+    if (!d || (!d.raised && !d.freezes_scored)) { return "nothing raised yet"; }
+    var parts = [plural(d.raised || 0, "warning") + " raised: " + num(d.hits || 0) +
+      " around a freeze, " + plural(d.false || 0, "false alarm")];
+    if (d.pending) { parts.push(num(d.pending) + " still open"); }
+    if (d.freezes_scored) {
+      parts.push(num(d.warned_ahead || 0) + " of " + plural(d.freezes_scored, "freeze") +
+        " warned ahead" + (d.missed ? ", " + num(d.missed) + " missed" : ""));
+    }
+    return parts.join("; ");
   }
 
   function healthFacts(h) {
@@ -451,8 +479,18 @@
         plural((h.backwards || 0) + (h.playlist_backwards || 0), "jump") + " back"],
       ["Errors", plural(h.playlist_errors || 0, "playlist error") + ", " +
         plural(h.downloads_failed || 0, "chunk") + " dropped, " +
-        plural(h.internal_errors || 0, "internal error")]
+        plural(h.internal_errors || 0, "internal error")],
+      ["Warnings now", (h.warnings || []).length ? h.warnings.map(function (w) {
+        return w.text + " (would " + w.would + ")";
+      }).join("; ") : "none"],
+      ["Warnings so far", detectorText(h.detector)]
     ];
+    if (h.alarm) { facts.splice(1, 0, ["Would do", h.alarm.would + " (Phase 3; nothing acts yet)"]); }
+    var pf = h.playlist_fetch;
+    if (pf && pf.count) {
+      facts.push(["Playlist requests", secs(pf.median_s) + " typical, " + secs(pf.max_s) +
+        " worst" + (pf.slow ? ", " + plural(pf.slow, "slow one") : "")]);
+    }
     if (rc) {
       facts.push(["Reconnect", "came back " + secs(rc.after_s) + " after " +
         esc(rc.previous_id) + " ended (" + (END_TEXT[rc.previous_reason] || rc.previous_reason) +
@@ -502,15 +540,26 @@
     var endings = Object.keys(t.ended || {}).sort(function (a, b) {
       return t.ended[b] - t.ended[a];
     }).map(function (k) { return (END_TEXT[k] || k) + " " + t.ended[k]; }).join(", ");
+    var det = t.detector || {};
+    var perHour = det.seconds ? (det.false || 0) / (det.seconds / 3600) : null;
     var head = '<div class="stat-grid history-stats">' +
       stat("hist-streams", "Streams", num(t.streams), dur(t.seconds) + " watched") +
       stat("hist-freezes", "Freezes", num(t.freezes),
            num(t.with_freezes) + " of " + num(t.streams) + " streams") +
       stat("hist-frozen", "Frozen time", secs(t.frozen_s), causeList(t.by_cause) || "none") +
-      stat("hist-ended", "Reconnects", num(t.reconnects),
-           num(t.replayed_chunks) + " replayed chunks") +
+      stat("hist-warned", "Warned ahead",
+           det.freezes_scored ? num(det.warned_ahead) + " of " + num(det.freezes_scored) : "—",
+           det.streams ? plural(det.false || 0, "false alarm") +
+             (perHour !== null ? " (" + perHour.toFixed(1) + " an hour)" : "") +
+             (det.missed ? ", " + num(det.missed) + " missed" : "") +
+             (det.noticed_median_s !== null && det.noticed_median_s !== undefined
+               ? "; typically noticed " + signedSecs(det.noticed_median_s) : "")
+             : "no streams scored yet") +
       "</div>" +
-      (endings ? '<p class="section-note history-endings">How they ended: ' + esc(endings) + "</p>" : "");
+      '<p class="section-note history-endings">' +
+        (endings ? "How they ended: " + esc(endings) + ". " : "") +
+        esc(plural(t.reconnects || 0, "reconnect") + ", " +
+            plural(t.replayed_chunks || 0, "replayed chunk")) + ".</p>";
     var rows = recs.map(function (r) {
       var top = "";
       var bc = r.by_cause || {};
@@ -522,6 +571,9 @@
       }
       if (r.skipped) { notes.push(r.skipped + " skipped"); }
       if ((r.backwards || 0) + (r.playlist_backwards || 0)) { notes.push("jumped back"); }
+      var d = r.detector;
+      if (d && d.freezes_scored) { notes.push("warned ahead " + d.warned_ahead + "/" + d.freezes_scored); }
+      if (d && d.false) { notes.push(plural(d.false, "false alarm")); }
       if (r.multiview) { notes.push("multi-view " + r.multiview); }
       if (r.endlist) { notes.push("broadcast ended"); }
       return "<tr>" +

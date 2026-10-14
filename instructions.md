@@ -71,7 +71,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `dashboard.py`, `templates/`, `static/` | The console. |
 | `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
-| `streamhealth.py` | Watch-only stream health: speed, cushion, freezes and causes, jumps, end reasons, and the `/data/stream_history.jsonl` writer. Changes nothing a stream sends. Gotcha #29. |
+| `streamhealth.py` | Watch-only stream health: speed, cushion, freezes and causes, jumps, end reasons, early warnings scored against the freezes that followed, and the `/data/stream_history.jsonl` writer. Changes nothing a stream sends. Gotcha #29. |
 | `tools/reorder_channels.py` | Channel numbering. `--dump-config` prints the built-in order as editable JSON. |
 | `tools/channel_order.example.json` | Generated: exactly `reorder_channels.py --dump-config`. Regenerate it, do not edit it; `check_reorder.py` fails if it drifts. |
 | `tools/check_pacing.py` | Does a composite play at real speed when its inputs arrive in production-shaped bursts? Frame-numbered picture, read back per output frame. `MODE=smooth`/`filler`, `SECONDARY=none`. About a minute; run it after any change to the feeders or the ffmpeg argv. #34-#38. |
@@ -79,7 +79,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/soak_multiview.py` | Run on the **host**. Plays a Multi-Player channel through Dispatcharr's proxy (as Jellyfin does), optionally with an ordinary channel alongside and every control stepped, and reports gaps, Dispatcharr's unhealthy/switch counts, encoder exits, CPU and GPU. No Dispatcharr login. |
 | `tools/multiview_api.py` | Console-API helper piped into the running container (`docker exec -i streamed-m3u python - get` / `put '<json>'` / `stop`), so the console password never leaves it. Used by the soak. |
 | `tools/check_console.py`, `tools/check_render.py` | Verification harnesses. Bind-mounted into a scratch image, never shipped. |
-| `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, reconnecting) through the real `/stream` route. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
+| `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, a hanging playlist request, reconnecting) through the real `/stream` route, checking each raises the early warning it should. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
 | `tools/check_health_render.py`, `tools/check_health_live.py` | The health UI driven in Chromium against scripted streams; and one real stream pulled through a scratch image inside gluetun's namespace (binds no port, own `/data`), reporting health and TS alignment. #29. |
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
 | `tools/check_multiview.py` | Multi-view checks with the feature **on**. A separate script because the slot map is derived once at import, so enabled and disabled cannot share a process. §12. |
@@ -927,9 +927,33 @@ wait, not a freeze. `speed` below 1.0 means the link cannot keep up; compare
 on 2026-10-13 offered 1080p at 8 Mbit/s and 540p at 0.7 Mbit/s, and
 `get_segments` always takes the first variant.
 
-Not in Phase 1, on purpose: no threshold, timeout, retry, cache eviction,
-variant choice or reconnect behaviour changed. Those wait for the history to
-hold at least five real freezes, read together with the user.
+**Early warnings (Phase 2, 2026-10-14).** A daemon thread (`_watch`) calls
+each live tracker's `tick()` twice a second. It raises a warning when a known
+precursor starts: a playlist request running 4s (`playlist_slow`), two
+playlist failures in a row, a chunk download silent for 4s, rolling speed
+below 1.0x over 3+ chunks, polls finding nothing new for max(6s, 2 chunks).
+Once the cushion has been empty 1s it raises a freeze alarm. Each carries the
+remedy Phase 3 *would* apply, as text. When a freeze closes, `_score` marks
+every warning up (or cleared under 20s before) during it as a hit and records
+the freeze's `noticed_s` (negative: warned ahead; null: over before any tick
+saw it, a miss). Unhit warnings are false alarms. The record carries
+`detector`, `warning_list`, `thresholds` and `playlist_fetch` (request times),
+which is what the thresholds get tuned from. Same rules as Phase 1: `tick` is
+guarded and rigged to raise in the harness, the watcher only reads tracker
+state, and the video stays byte-identical. Trackers made by `track()` are
+watched; ones built directly (the unit tests) are not, so tests drive
+`tick()` on their own clock.
+
+The first values came from one game (2026-10-13, Warriors): three of its four
+freezes were a playlist request hanging for most of the 15s timeout in
+`get_segments`, at a 275 Mbit/s link, during which `_generate` sends nothing,
+not even keepalives (they only pad chunk downloads), and a chunk slid out of
+the window each time.
+
+Not in Phase 2, on purpose: no threshold, timeout, retry, cache eviction,
+variant choice or reconnect behaviour changed, and nothing acts on a warning.
+Phase 3 waits until Phase 2 has run on real games and its scores (hits, false
+alarms, misses, lead time) have been read together with the user.
 
 ## 8. Endpoint reference
 
@@ -953,7 +977,8 @@ lineup; `PUT /api/lineup` adds or removes slugs or a group. `/teams` and
 
 ```bash
 docker exec streamed-m3u tail -n 5 /data/stream_history.jsonl | jq -c '{channel, seconds, freezes, frozen_s, by_cause, speed_median, video_mbit, link_mbit_median, end_reason}'
-docker logs streamed-m3u 2>&1 | grep -E "froze for|summary:"
+docker exec streamed-m3u tail -n 5 /data/stream_history.jsonl | jq -c '{channel, detector, playlist_fetch, freezes: [.freeze_list[] | {at_s, s, cause, noticed_s, warned_by}]}'
+docker logs streamed-m3u 2>&1 | grep -E "froze for|summary:|early warning|Freeze alarm"
 ```
 
 ---
