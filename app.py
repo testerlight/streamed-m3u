@@ -15,7 +15,7 @@ Endpoints:
   GET /api/overview          - Aggregate status, uptime, cache sizes
   GET /api/config            - Every setting with value, source and bounds
   PUT /api/settings          - Change settings (session + CSRF; settings.py)
-  GET /api/lineup            - Jellyfin lineup policy, counts and groups
+  GET /api/lineup            - Jellyfin allowlist counts and groups
   PUT /api/lineup            - Add or remove slugs/groups (session + CSRF)
   GET /api/cache             - Extraction, logo and no-audio cache contents
   POST /api/cache/extract/refresh
@@ -113,7 +113,7 @@ STREAM_HISTORY_FILE = os.getenv("STREAM_HISTORY_FILE",
                                 "/data/stream_history.jsonl")
 # Bundled roster copied into place when TEAMS_FILE does not exist yet.
 SEED_TEAMS_FILE    = os.getenv("SEED_TEAMS_FILE", "/app/seed/teams.json")
-# Bundled majors-only lineup, copied only on the same first-boot as the roster.
+# Default Jellyfin allowlist, installed by lineup.prepare() when lineup.json is missing.
 SEED_LINEUP_FILE   = os.getenv("SEED_LINEUP_FILE", "/app/seed/lineup.json")
 # Cascade budget. Dispatcharr aborts a channel at channel_init_grace_period
 # (currently 60s), so we stop starting new attempts before that ceiling.
@@ -1379,16 +1379,15 @@ def _rank_streams(streams: list[dict]) -> list[dict]:
 
 
 def _install_seed_roster():
-    """Copy the bundled roster (and lineup) into place on a fresh /data.
+    """Copy the bundled roster into place on a fresh /data.
 
     The seed is a scrubbed snapshot: team entries only, no favourites, no
     feed/series/pool channels (those are recreated from config). Without it a
     new deployment starts at roughly twenty channels and fills in over days as
     fixtures are listed. An existing roster is never touched.
 
-    The majors-only seed lineup is copied only in this same first-boot path.
-    An existing /data with no lineup.json stays implicit-all: every slug is
-    visible until someone presses −.
+    The default Jellyfin lineup is not installed here: lineup.prepare() does
+    that at startup for any /data that has no lineup.json.
     """
     teams_existed = os.path.exists(TEAMS_FILE)
     if teams_existed or not os.path.exists(SEED_TEAMS_FILE):
@@ -1401,8 +1400,6 @@ def _install_seed_roster():
         log.info("Installed seed roster: %d teams -> %s", count, TEAMS_FILE)
     except Exception as e:
         log.warning("Could not install seed roster: %s", e)
-        return
-    lineup.install_seed(LINEUP_FILE, SEED_LINEUP_FILE, teams_existed=False)
 
 
 def _league_of(slug: str, sport: str, kind: str = "team"):
@@ -1420,7 +1417,7 @@ def _league_of(slug: str, sport: str, kind: str = "team"):
 def _entry_view(slug: str, entry: dict, doc=None) -> dict:
     """kind, sport, league, in_lineup for a roster row. Does not mutate entry."""
     if doc is None:
-        doc, _ = lineup.current()
+        doc = lineup.current()
     kind = entry.get("kind", "team")
     sport = entry.get("sport") or ""
     return {
@@ -1442,7 +1439,7 @@ def _group_id_of(kind: str, sport: str, league):
 def _slugs_in_group(roster: dict, group: str, doc=None) -> list:
     """Roster slugs that belong to a console group id."""
     if doc is None:
-        doc, _ = lineup.current()
+        doc = lineup.current()
     out = []
     for slug, entry in roster.items():
         view = _entry_view(slug, entry, doc)
@@ -1452,14 +1449,13 @@ def _slugs_in_group(roster: dict, group: str, doc=None) -> list:
 
 
 def _lineup_counts(roster=None):
-    doc, implicit = lineup.current()
+    doc = lineup.current()
     if roster is None:
         with _team_lock:
             roster = dict(_team_roster)
     n_in = sum(1 for s in roster if lineup.in_lineup(doc, s))
     return {
         "policy": doc["policy"],
-        "implicit": implicit,
         "in_lineup": n_in,
         "out_of_lineup": len(roster) - n_in,
         "roster": len(roster),
@@ -1468,7 +1464,7 @@ def _lineup_counts(roster=None):
 
 def _lineup_snapshot():
     """GET /api/lineup payload: policy, counts, group sizes."""
-    doc, implicit = lineup.current()
+    doc = lineup.current()
     with _team_lock:
         roster = dict(_team_roster)
     counts = _lineup_counts(roster)
@@ -1507,7 +1503,6 @@ def _lineup_snapshot():
         })
     return {
         "policy": counts["policy"],
-        "implicit": implicit,
         "in_lineup": counts["in_lineup"],
         "out_of_lineup": counts["out_of_lineup"],
         "roster": counts["roster"],
@@ -1536,7 +1531,7 @@ def _lineup_apply(payload: dict):
             return None, "unknown group", 400
         with _team_lock:
             roster = dict(_team_roster)
-        slugs = _slugs_in_group(roster, group, lineup.current()[0])
+        slugs = _slugs_in_group(roster, group, lineup.current())
         if not slugs:
             return None, "empty group", 400
     elif isinstance(slugs, str):
@@ -1544,7 +1539,7 @@ def _lineup_apply(payload: dict):
     elif not isinstance(slugs, (list, tuple)):
         return None, "expected slugs or group", 400
     try:
-        doc, _implicit = lineup.current()
+        doc = lineup.current()
         new = lineup.apply_op(doc, op, slugs)
         lineup.persist(new, LINEUP_FILE)
     except ValueError as e:
@@ -3480,7 +3475,7 @@ def teams():
     with _team_lock:
         roster = dict(_team_roster)
         tmap   = {k: dict(v) for k, v in _team_map.items()}
-    doc, _ = lineup.current()
+    doc = lineup.current()
 
     want = request.args.get("team", "").strip()
     if want:
@@ -4005,9 +4000,11 @@ if __name__ == "__main__":
     _load_extract_cache()
     _install_seed_roster()
     _load_team_roster()
-    lineup.reload(LINEUP_FILE)
     _seed_favourites()
     _seed_nonteam()
+    with _team_lock:
+        _roster_slugs = list(_team_roster)
+    lineup.prepare(_roster_slugs, LINEUP_FILE, SEED_LINEUP_FILE)
     # Only when enabled: with the feature off nothing should touch /data or
     # hold state for it, so a disabled build is indistinguishable from one
     # that predates multi-view entirely.

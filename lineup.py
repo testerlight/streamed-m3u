@@ -1,25 +1,25 @@
 """Jellyfin lineup membership.
 
 A roster slug is either on the lineup or not. That decision is computed from
-/data/lineup.json; it is never stored on a roster row. The playlist still
-emits every roster entry — hiding happens in Dispatcharr via
-hidden_from_output, so streams stay and channel numbers stay put.
+the allowlist in /data/lineup.json; it is never stored on a roster row. The
+playlist still emits every roster entry, so every team stays a Dispatcharr
+stream. Only allowlisted slugs get a Dispatcharr channel, and so only they
+reach Jellyfin. Nothing is ever added automatically: a team seen for the
+first time stays a stream until someone presses + in the console.
 
-Two policies:
+A missing file means the bundled default set (seed/lineup.json), never
+"everything". The file keeps `"policy": "allowlist"` so that an older build
+reading it can never mistake it for its own show-everything mode.
 
-  all        every slug is in except those in exclude. New teams appear in
-             Jellyfin automatically. This is also the implicit document when
-             the file is missing (this box today).
-  allowlist  only the slugs in include. New teams stay streams until added.
-
-The first write materializes the file. Do not copy seed/lineup.json onto an
-existing /data — that seed is majors-only and is installed only on the same
-first-boot path as seed/teams.json.
+Startup runs `prepare()`, which installs the defaults when the file is
+missing and converts a legacy `policy: "all"` file once, into an allowlist of
+exactly the slugs that were visible at that moment.
 """
 
 import copy
 import logging
 import os
+import shutil
 import threading
 
 import settings
@@ -27,35 +27,29 @@ import settings
 log = logging.getLogger("lineup")
 
 VERSION = 1
-POLICIES = ("all", "allowlist")
+POLICY = "allowlist"
 
 LINEUP_FILE = os.getenv("LINEUP_FILE", os.path.join(settings.DATA_DIR, "lineup.json"))
 SEED_LINEUP_FILE = os.getenv("SEED_LINEUP_FILE", "/app/seed/lineup.json")
 
 _lock = threading.Lock()
 _doc = None
-_implicit = True
 _loaded = False
 
 
-def implicit_all():
-    return {"version": VERSION, "policy": "all", "include": [], "exclude": []}
+def empty():
+    return {"version": VERSION, "policy": POLICY, "include": []}
 
 
 def normalize(raw):
-    """Coerce a loaded object into a lineup document. Unknown keys dropped."""
-    out = implicit_all()
-    if not isinstance(raw, dict):
-        return out
-    policy = raw.get("policy")
-    if policy in POLICIES:
-        out["policy"] = policy
-    out["include"] = _slug_list(raw.get("include"))
-    out["exclude"] = _slug_list(raw.get("exclude"))
-    try:
-        out["version"] = int(raw.get("version") or VERSION)
-    except (TypeError, ValueError):
-        out["version"] = VERSION
+    """Coerce a loaded object into a lineup document. Unknown keys dropped.
+
+    A legacy `policy: "all"` document cannot be converted here (that needs the
+    roster), so it reads as an empty allowlist until `prepare()` has run.
+    """
+    out = empty()
+    if isinstance(raw, dict):
+        out["include"] = _slug_list(raw.get("include"))
     return out
 
 
@@ -76,17 +70,12 @@ def in_lineup(doc, slug):
     """Whether this slug should be a visible Dispatcharr channel."""
     if not slug:
         return False
-    doc = doc or implicit_all()
-    if doc.get("policy") == "allowlist":
-        return slug in set(doc.get("include") or [])
-    return slug not in set(doc.get("exclude") or [])
+    return slug in set((doc or {}).get("include") or [])
 
 
 def apply_op(doc, op, slugs):
     """Return a new document after add/remove of slugs.
 
-    + on allowlist adds to include; − removes from include.
-    + / − on all only edit exclude (+ clears, − adds).
     The caller writes the result; this does not persist.
     """
     if op not in ("add", "remove"):
@@ -95,46 +84,32 @@ def apply_op(doc, op, slugs):
     if not wanted:
         raise ValueError("no slugs")
     out = normalize(doc)
-    include = list(out["include"])
-    exclude = list(out["exclude"])
-    if out["policy"] == "allowlist":
-        if op == "add":
-            have = set(include)
-            for slug in wanted:
-                if slug not in have:
-                    include.append(slug)
-                    have.add(slug)
-        else:
-            drop = set(wanted)
-            include = [s for s in include if s not in drop]
-        out["include"] = include
-        return out
-    if op == "remove":
-        have = set(exclude)
-        for slug in wanted:
-            if slug not in have:
-                exclude.append(slug)
-                have.add(slug)
+    if op == "add":
+        have = set(out["include"])
+        out["include"].extend(s for s in wanted if s not in have)
     else:
         drop = set(wanted)
-        exclude = [s for s in exclude if s not in drop]
-    out["exclude"] = exclude
+        out["include"] = [s for s in out["include"] if s not in drop]
     return out
 
 
-def load(path=None):
-    """Load the lineup. Missing file => implicit all. Never raises.
+def default_doc(seed_path=None):
+    """The bundled default lineup. Empty when the seed is missing or unreadable."""
+    seed_path = seed_path or SEED_LINEUP_FILE
+    data, _err = settings.read_json_with_fallback(seed_path, "seed lineup")
+    return normalize(data)
 
-    Returns (doc, implicit). implicit is True when no file was used, so a
-    later write is what first materializes it.
+
+def load(path=None):
+    """Load the lineup. Missing or unreadable => the bundled defaults.
+
+    Never raises. Writing is what materializes the file.
     """
     path = path or LINEUP_FILE
-    if not os.path.exists(path):
-        return implicit_all(), True
-    data, err = settings.read_json_with_fallback(path, "lineup")
+    data, _err = settings.read_json_with_fallback(path, "lineup")
     if data is None:
-        return implicit_all(), True
-    return normalize(data), False
+        return default_doc()
+    return normalize(data)
 
 
 def save(doc, path=None):
@@ -143,21 +118,16 @@ def save(doc, path=None):
 
 
 def current():
-    """In-memory document and whether it is still implicit (no file yet)."""
+    """In-memory document."""
     ensure_loaded()
     with _lock:
-        return copy.deepcopy(_doc), _implicit
+        return copy.deepcopy(_doc)
 
 
 def reload(path=None):
     """Re-read from disk into the process cache."""
-    global _doc, _implicit, _loaded
-    doc, implicit = load(path)
-    with _lock:
-        _doc = doc
-        _implicit = implicit
-        _loaded = True
-    return copy.deepcopy(doc), implicit
+    doc = load(path)
+    return _adopt(doc)
 
 
 def ensure_loaded():
@@ -167,58 +137,62 @@ def ensure_loaded():
         reload()
 
 
-def persist(doc, path=None):
-    """Write then adopt. Used by the first − and every later console edit."""
-    global _doc, _implicit, _loaded
+def _adopt(doc):
+    global _doc, _loaded
     clean = normalize(doc)
-    save(clean, path)
     with _lock:
         _doc = clean
-        _implicit = False
         _loaded = True
     return copy.deepcopy(clean)
 
 
-def install_seed(lineup_path=None, seed_path=None, teams_existed=False):
-    """Copy the bundled allowlist only on the same first-boot as the roster.
+def persist(doc, path=None):
+    """Write then adopt. Used by every console edit."""
+    clean = normalize(doc)
+    save(clean, path)
+    return _adopt(clean)
 
-    teams_existed must be False — the caller checks TEAMS_FILE before copying
-    the roster. An existing /data is never given the seed lineup, even if
-    lineup.json is missing (that absence means implicit-all on this box).
+
+def prepare(roster_slugs, path=None, seed_path=None):
+    """Startup: leave a valid allowlist on disk, then load it. Returns what it did.
+
+    "seeded"    no usable file: the bundled defaults were written.
+    "migrated"  a legacy `policy: "all"` file: converted to an allowlist of
+                every roster slug it was showing (roster minus exclude), so
+                Jellyfin sees exactly what it saw before. The old file is
+                kept beside it as `<name>.pre-allowlist`.
+    "ok"        already an allowlist; untouched.
+    "unsaved"   a change was needed but the write failed; the in-memory
+                lineup is still the right one and the next start retries.
+
+    Run after the roster is loaded and the feed/series/pool slugs are seeded,
+    so a slug created this boot still counts as visible under a legacy file.
     """
-    if teams_existed:
-        return False
-    lineup_path = lineup_path or LINEUP_FILE
-    seed_path = seed_path or SEED_LINEUP_FILE
-    if os.path.exists(lineup_path) or not os.path.exists(seed_path):
-        return False
+    path = path or LINEUP_FILE
+    data, _err = settings.read_json_with_fallback(path, "lineup")
+    if isinstance(data, dict) and data.get("policy") != "all":
+        _adopt(data)
+        return "ok"
+    if isinstance(data, dict):
+        hidden = set(_slug_list(data.get("exclude")))
+        doc = normalize({"include": [s for s in roster_slugs if s not in hidden]})
+        action = "migrated"
+    else:
+        doc = default_doc(seed_path)
+        action = "seeded"
     try:
-        os.makedirs(os.path.dirname(lineup_path) or ".", exist_ok=True)
-        data, err = settings.read_json_with_fallback(seed_path, "seed lineup")
-        if data is None:
-            return False
-        clean = normalize(data)
-        save(clean, lineup_path)
-        reload(lineup_path)
-        log.info("Installed seed lineup (%s) -> %s",
-                 clean.get("policy"), lineup_path)
-        return True
-    except Exception as e:
-        log.warning("Could not install seed lineup: %s", e)
-        return False
-
-
-def seed_document(slugs, comment=None):
-    """Allowlist document for seed/lineup.json. Majors only."""
-    doc = {
-        "version": VERSION,
-        "policy": "allowlist",
-        "include": _slug_list(slugs),
-        "exclude": [],
-    }
-    if comment:
-        doc["comment"] = comment
-    return doc
+        if action == "migrated":
+            keep = path + ".pre-allowlist"
+            if not os.path.exists(keep):
+                shutil.copyfile(path, keep)
+        persist(doc, path)
+    except OSError as e:
+        log.warning("Could not write %s: %s", path, e)
+        _adopt(doc)
+        action = "unsaved"
+    log.info("Lineup %s: %d channel(s) on the Jellyfin allowlist",
+             action, len(doc["include"]))
+    return action
 
 
 def count_in(doc, slugs):

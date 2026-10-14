@@ -93,7 +93,7 @@ SCHEMA = [
        "Where resolved stream URLs are persisted across restarts.",
        editable=False),
     _s("LINEUP_FILE", "LINEUP_FILE", "Service", "restart", "str",
-       "Jellyfin lineup file. Missing means every roster slug is visible.",
+       "Jellyfin allowlist file. Missing means the bundled default set is installed.",
        editable=False),
 
     # Upstream

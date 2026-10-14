@@ -1,6 +1,5 @@
 {
- "comment": "Majors only (MLB / NFL / NHL / NBA). Installed only on an empty /data together with seed/teams.json; never copy this over an existing lineup.",
- "exclude": [],
+ "comment": "First-run default Jellyfin allowlist: MLB / NFL / NHL / NBA teams, NFL RedZone, NFL Network, Formula 1, IndyCar and NASCAR Cup + Truck. Installed by lineup.prepare() when /data has no lineup.json. Never overwrites an existing file.",
  "include": [
   "arizona-diamondbacks",
   "athletics",
@@ -128,7 +127,13 @@
   "san-antonio-spurs",
   "toronto-raptors",
   "utah-jazz",
-  "washington-wizards"
+  "washington-wizards",
+  "nfl-vs-redzone",
+  "nfl-network",
+  "formula-1",
+  "indycar",
+  "nascar-cup-series",
+  "nascar-truck-series"
  ],
  "policy": "allowlist",
  "version": 1
