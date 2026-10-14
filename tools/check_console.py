@@ -55,12 +55,17 @@ check("no favourites in seed", not any(v.get("favourite") for v in app._team_ros
 check("only team entries in seed", all(v.get("kind") == "team" for v in app._team_roster.values()))
 
 section("seed lineup")
-app.lineup.reload(os.environ["LINEUP_FILE"])
 lf = os.environ["LINEUP_FILE"]
-check("seed lineup installed on empty /data", os.path.exists(lf))
-seed_lu = app.lineup.current()[0]
+check("no lineup.json before prepare", not os.path.exists(lf))
+act = app.lineup.prepare(list(app._team_roster), lf, app.SEED_LINEUP_FILE)
+check("empty /data gets the default lineup", act == "seeded" and os.path.exists(lf), act)
+seed_lu = app.lineup.current()
 check("seed lineup policy is allowlist", seed_lu.get("policy") == "allowlist", seed_lu.get("policy"))
 check("seed MLB slug in lineup", app.lineup.in_lineup(seed_lu, "philadelphia-phillies"))
+check("seed NBA slug in lineup", app.lineup.in_lineup(seed_lu, "boston-celtics"))
+for slug in ("nfl-vs-redzone", "nfl-network", "formula-1", "indycar",
+             "nascar-cup-series", "nascar-truck-series"):
+    check("seed lineup has " + slug, app.lineup.in_lineup(seed_lu, slug))
 check("seed soccer slug out of lineup", not app.lineup.in_lineup(seed_lu, "1-fc-heidenheim-1846"))
 all_teams = c.get("/teams?all=1").get_json() or {}
 philly = (all_teams.get("roster") or {}).get("philadelphia-phillies") or {}
@@ -71,34 +76,51 @@ check("seed soccer in_lineup false", soccer.get("in_lineup") is False, soccer.ge
 check("seed MLB league", philly.get("league") == "mlb", philly.get("league"))
 one = c.get("/teams?team=Philadelphia%20Phillies").get_json() or {}
 check("/teams?team= carries in_lineup", one.get("in_lineup") is True and one.get("league") == "mlb")
+check("prepare leaves an allowlist alone",
+      app.lineup.prepare(list(app._team_roster), lf, app.SEED_LINEUP_FILE) == "ok")
 
-section("implicit-all lineup (existing /data)")
+section("missing lineup.json means defaults, never everything")
 os.remove(lf)
 app.lineup.reload(lf)
-impl, implicit = app.lineup.current()
-check("missing file is implicit all", implicit is True and impl.get("policy") == "all")
-all_again = c.get("/teams?all=1").get_json() or {}
-check("existing roster no lineup.json => all in_lineup",
-      all((e or {}).get("in_lineup") for e in (all_again.get("roster") or {}).values()),
-      "some out")
-# Restore the seed allowlist so later checks see a file again.
-app.lineup.install_seed(lf, app.SEED_LINEUP_FILE, teams_existed=False)
-app.lineup.reload(lf)
+miss = app.lineup.current()
+check("missing file reads as the default allowlist",
+      miss.get("policy") == "allowlist" and app.lineup.in_lineup(miss, "philadelphia-phillies"))
+again = c.get("/teams?all=1").get_json() or {}
+n_in = sum(1 for e in (again.get("roster") or {}).values() if (e or {}).get("in_lineup"))
+check("existing roster no lineup.json => only the defaults in_lineup",
+      0 < n_in < len(again.get("roster") or {}) // 2, n_in)
+app.lineup.prepare(list(app._team_roster), lf, app.SEED_LINEUP_FILE)
+
+section("legacy policy:all lineup is frozen into an allowlist")
+legacy = {"version": 1, "policy": "all", "include": [], "exclude": ["boston-red-sox"]}
+with open(lf, "w") as f:
+    json.dump(legacy, f)
+roster_now = list(app._team_roster)
+act = app.lineup.prepare(roster_now, lf, app.SEED_LINEUP_FILE)
+frozen = app.lineup.current()
+check("legacy file migrated", act == "migrated", act)
+check("frozen = roster minus exclude",
+      set(frozen["include"]) == set(roster_now) - {"boston-red-sox"}, len(frozen["include"]))
+check("frozen doc is an allowlist with no exclude",
+      frozen["policy"] == "allowlist" and "exclude" not in frozen)
+check("old file kept", os.path.exists(lf + ".pre-allowlist"))
+on_disk = json.load(open(lf))
+check("file on disk is an allowlist", on_disk.get("policy") == "allowlist" and "exclude" not in on_disk)
+check("a team seen later is not on the allowlist",
+      not app.lineup.in_lineup(frozen, "brand-new-team-2099"))
+app.lineup.persist(app.lineup.default_doc(app.SEED_LINEUP_FILE), lf)
 
 section("lineup membership unit")
 L = app.lineup
-all_doc = {"version": 1, "policy": "all", "include": [], "exclude": ["hide-me"]}
-check("all: in unless excluded", L.in_lineup(all_doc, "keep-me") and not L.in_lineup(all_doc, "hide-me"))
-allow = {"version": 1, "policy": "allowlist", "include": ["keep-me"], "exclude": []}
+allow = {"version": 1, "policy": "allowlist", "include": ["keep-me"]}
 check("allowlist: only include", L.in_lineup(allow, "keep-me") and not L.in_lineup(allow, "hide-me"))
-removed = L.apply_op(all_doc, "remove", ["keep-me"])
-check("all − adds exclude", "keep-me" in removed["exclude"] and removed["policy"] == "all")
-added = L.apply_op(removed, "add", ["keep-me"])
-check("all + clears exclude", "keep-me" not in added["exclude"])
+check("empty slug is never in", not L.in_lineup(allow, ""))
 allow2 = L.apply_op(allow, "add", ["new-one"])
 check("allowlist + adds include", "new-one" in allow2["include"])
+check("allowlist + is idempotent", L.apply_op(allow2, "add", ["new-one"])["include"].count("new-one") == 1)
 allow3 = L.apply_op(allow2, "remove", ["keep-me"])
 check("allowlist − drops include", "keep-me" not in allow3["include"] and "new-one" in allow3["include"])
+check("apply_op never grows an exclude list", "exclude" not in allow3)
 
 section("sync hide helper")
 import dispatcharr_sync as sync
@@ -138,6 +160,44 @@ check("duplicate slug keeps lowest number",
           {"id": 10, "hidden_from_output": False},
           {"id": 11, "hidden_from_output": True},
       ], dup_diffs)
+
+section("sync creates channels only for the allowlist")
+_streams = [
+    {"id": 1, "url": "http://x/stream?team=on-list"},
+    {"id": 2, "url": "http://x/stream?team=off-list"},
+    {"id": 3, "url": "http://x/stream?team=brand-new"},
+    {"id": 4, "name": "no slug", "url": "http://y/other"},
+]
+_created = []
+_saved = {n: getattr(sync, n) for n in (
+    "trigger_refresh", "get_all_streams", "fetch_lineup_map",
+    "get_existing_channel_stream_ids", "create_channels_for_streams",
+    "get_epg_source_id", "refresh_epg", "link_epg_data",
+    "apply_lineup_visibility", "REFRESH_SETTLE", "CREATE_SETTLE")}
+sync.trigger_refresh = lambda account_id: None
+sync.get_all_streams = lambda account_id: list(_streams)
+sync.get_existing_channel_stream_ids = lambda: set()
+sync.create_channels_for_streams = lambda ids: _created.append(sorted(ids))
+sync.get_epg_source_id = lambda: 1
+sync.refresh_epg = lambda source_id: None
+sync.link_epg_data = lambda source_id: None
+sync.apply_lineup_visibility = lambda *a, **k: None
+sync.REFRESH_SETTLE = 0
+sync.CREATE_SETTLE = 0
+try:
+    sync.fetch_lineup_map = lambda: {"on-list": True, "off-list": False}
+    sync.run_cycle(1)
+    check("only the allowlisted stream becomes a channel", _created == [[1]], _created)
+    _created.clear()
+
+    def _down():
+        raise RuntimeError("streamed-m3u unreachable")
+    sync.fetch_lineup_map = _down
+    sync.run_cycle(1)
+    check("lineup unreachable => no channels created (fails closed)", _created == [], _created)
+finally:
+    for _n, _v in _saved.items():
+        setattr(sync, _n, _v)
 
 section("playlist address derivation")
 r = c.get("/playlist-teams.m3u", base_url="http://10.0.0.5:8787")

@@ -14,9 +14,11 @@ Four jobs, in order:
 
 1. REFRESH  - Re-pull the team M3U so Dispatcharr sees the current stream list.
               The playlist is never filtered; every roster entry stays a stream.
-2. SYNC     - Create a channel for any in-lineup stream that does not have one.
+2. SYNC     - Create a channel for any allowlisted stream that does not have
+              one. Every other stream stays a stream and is never imported.
+              If the allowlist cannot be read, nothing is created.
 3. EPG      - Re-import the guide so fixtures stay current.
-4. LINEUP   - Set hidden_from_output so only the Jellyfin lineup is visible.
+4. LINEUP   - Set hidden_from_output so only the allowlist is visible.
               Never deletes a channel.
 
 It deliberately DELETES NOTHING. In the team-channel model a channel is a
@@ -400,7 +402,10 @@ def run_cycle(account_id):
 
     existing = get_existing_channel_stream_ids()
     if in_lineup is None:
-        new_ids = [s["id"] for s in streams if s["id"] not in existing]
+        # Fail closed: with no allowlist to consult, creating channels would
+        # publish every stream to Jellyfin. Wait for the next cycle instead.
+        new_ids = []
+        log.warning("Lineup unavailable - creating no channels this cycle")
     else:
         new_ids = [s["id"] for s in streams
                    if s["id"] not in existing

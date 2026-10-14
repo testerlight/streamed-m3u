@@ -22,20 +22,25 @@ Three containers, plus one cron job:
 | **gluetun** | WireGuard VPN. All streamed-m3u traffic egresses through it. |
 | **streamed-m3u** | The service. Builds the playlist + EPG, resolves and proxies streams. Shares gluetun's network namespace. |
 | **dispatcharr** | IPTV middleware. Consumes the playlist/EPG, exposes them to Jellyfin. |
-| **dispatcharr_sync.py** | Cron job, every 8 min. Creates channels for in-lineup streams; never deletes. Hides the rest from Jellyfin. |
+| **dispatcharr_sync.py** | Cron job, every 8 min. Creates channels for allowlisted streams only; never deletes. Hides the rest from Jellyfin. |
 
 **The key design idea:** a channel's URL contains no match ID — it's just
 `/stream?team=<slug>`. The channel is a permanent shelf; whichever fixture that
 team has today gets resolved at click time. This is why channel numbers never
 shuffle. Do not "optimise" this back into per-match channels.
 
-**The Jellyfin lineup is a second, smaller set.** Every roster entry stays a
-Dispatcharr stream (`playlist-teams.m3u` is never filtered). Only slugs in
-`/data/lineup.json` become, or stay, visible channels. A missing file is
-implicit-all. This box now has the file (`policy: all`) after the first −;
-membership is still every slug until someone excludes one. New installs
-seed MLB / NFL / NHL / NBA only. Do not copy `seed/lineup.json` onto an
-existing `/data`.
+**The Jellyfin lineup is a second, smaller set, and it is an allowlist.**
+Every roster entry stays a Dispatcharr stream (`playlist-teams.m3u` is never
+filtered). Only slugs in `/data/lineup.json` become, or stay, visible
+channels; a team seen for the first time stays a stream until someone adds
+it in the console. There is no "show everything" mode. A missing file means
+the bundled defaults (`seed/lineup.json`: MLB / NFL / NHL / NBA, NFL RedZone,
+NFL Network, Formula 1, IndyCar, NASCAR Cup and Truck), installed by
+`lineup.prepare()` at startup. A legacy `policy: "all"` file is converted
+once, at the same point, into an allowlist of exactly what it was showing
+(roster minus exclude); the old file is kept as `lineup.json.pre-allowlist`.
+The file keeps `"policy": "allowlist"` so a rollback to an older build cannot
+read it as show-everything.
 
 **Two team lists, deliberately separate.** A channel normally resolves only the
 fixtures where the upstream API lists that team as *home*; an away fixture would
@@ -76,11 +81,11 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
 | `tools/check_multiview.py` | Multi-view checks with the feature **on**. A separate script because the slot map is derived once at import, so enabled and disabled cannot share a process. §12. |
 | `tools/live_multiview_ui.py` | The console's multi-player section driven against a **real** encoder and real fixtures. Needs the network and the render node; costs two extractions and a minute of encoding. A gate check, not a routine one. §5b. |
-| `lineup.py` | Jellyfin lineup load/save/membership. Implicit-all when the file is missing. |
+| `lineup.py` | Jellyfin allowlist load/save/membership, and `prepare()` (seed or migrate at startup). Defaults when the file is missing. |
 | `multiview.py` | Which fixtures each composite slot points at, and the rules that keep a slot playable. No encoder logic; safe to import with the feature off. §12. |
 | `composite.py` | Multi-view plumbing: the feeders that keep each composite's two input FIFOs fed, the ffmpeg supervisor that drains them into one stream, and the ZMQ commands that move the layout and the mix while it plays. §12. |
 | `seed/teams.json` | Seed roster installed on an empty `/data`. Team entries only, no favourites. |
-| `seed/lineup.json` | Majors-only allowlist. Installed only with a fresh roster. Never copy onto existing `/data`. |
+| `seed/lineup.json` | The default allowlist. Installed by `lineup.prepare()` whenever `/data` has no `lineup.json`; never overwrites one. |
 | `entrypoint.sh`, `Dockerfile` | The image. The entrypoint chowns `/data` then drops to `PUID:PGID`. |
 | `docker-compose.yml`, `docker-compose.novpn.yml`, `.env.example` | Generic deployment. `.env.example` is generated: `python settings.py --env-example`. |
 | `docs/internal/` | Scoped-out plans and working notes. Not user documentation. |
@@ -139,8 +144,8 @@ cannot blank a league. All overrides are restart-only because each feeds an
 import-time structure.
 
 `LINEUP_FILE` is env-only, sibling of `TEAMS_FILE`, default `/data/lineup.json`.
-A missing file is implicit `policy: "all"` with an empty exclude. The first −
-materializes it. Do not install the seed lineup onto an existing `/data`.
+A missing file means the default allowlist and `lineup.prepare()` writes it at
+startup. An existing `lineup.json` is never replaced by the seed.
 
 Persistence: `settings.atomic_write_json` writes a temp file in the same
 directory, fsyncs, keeps the previous file as `.bak`, then renames. It is also
@@ -471,8 +476,9 @@ curl -s "http://$IP:8787/teams?alias=1" | jq '.seen_count, .unseen_count'
 curl -s http://$IP:8787/playlist-teams.m3u | grep -c '#EXTINF'
 curl -s http://$IP:8787/epg.xml | head -5    # valid XML
 curl -s http://$IP:8787/teams?all=1 | jq '[.roster | to_entries[] | select(.value.in_lineup==false)] | length'
-# This box: 1336 (lineup.json, policy "all" with an exclude list, since
-# 2026-09-20). New install: the non-majors. No lineup.json at all: 0.
+# Roster size minus the allowlist. A new install: everything but the defaults.
+# This box froze its old policy-all lineup into an allowlist of 157 on the
+# first start of the allowlist build.
 
 # The two NFL feeds resolve, and RedZone kept its pinned slug:
 curl -s "http://$IP:8787/teams?team=NFL%20RedZone" | jq '.slug, .roster.kind'
@@ -796,12 +802,11 @@ connection is refused, not silent. Before `up -d`, check
 wait for zero or warn whoever is watching. There is no fix on this side;
 the retry policy is Dispatcharr's.
 
-**22. Do not copy `seed/lineup.json` onto an existing `/data`.** That seed is
-an MLB/NFL/NHL/NBA allowlist for new installs. A missing file is
-implicit-all, so Jellyfin stays unchanged until someone presses −. Copying
-the seed would hide every college, soccer, feed and series channel
-overnight. After the first − the file exists (`policy: all`); that is not
-a licence to replace it with the seed.
+**22. Never overwrite an existing `lineup.json` with `seed/lineup.json`.** The
+seed is the default set for a `/data` that has no lineup. `lineup.prepare()`
+only writes it when the file is missing, and only converts (never resets) a
+legacy `policy: "all"` file. Replacing a live allowlist with the seed would
+hide every channel the user added and expose the ones they removed.
 
 **23. Never filter `build_team_m3u()`.** Removing an M3U line orphans the
 Dispatcharr stream and later duplicates the channel when the team returns.
@@ -812,9 +817,12 @@ later need to remove, and it still deletes nothing. `hidden_from_output`
 drops a channel out of `/output/m3u` and `/output/epg` while keeping the
 number, `tvg_id`, EPG link and stream ids.
 
-**25. The first − materializes `/data/lineup.json`.** Until that write the
-policy is implicit-all and every slug reports `in_lineup: true`. + / − on
-`all` only edit `exclude`; + / − on `allowlist` only edit `include`.
+**25. + adds a slug to `include`, − removes it. Nothing is ever automatic.**
+There is no exclude list and no implicit "everything" state; a slug not in
+`include` is not in the lineup. The sync fails closed as well: if it cannot
+read `/teams?all=1` it creates no channels that cycle, rather than creating
+one for every stream (that fallback used to exist and would now publish the
+whole roster to Jellyfin).
 
 **26. Dispatcharr's channel list omits hidden rows by default.**
 `GET /api/channels/channels/` uses `visibility_filter=active` unless you
@@ -944,11 +952,12 @@ Feeds and series are the exception: `_seed_nonteam` creates them at boot from
 config, so RedZone and NFL Network get channels on the very first sync whether
 or not they are airing. Teams do not — they appear only once observed.
 
-A brand-new `/data` also gets `seed/lineup.json` (MLB / NFL / NHL / NBA
-allowlist). Those majors become visible Jellyfin channels; stations, series,
-pool slots and everything else stay streams until added. **This box already
-had a roster**, so it must not receive that seed. Missing `lineup.json` here
-means implicit-all.
+Any `/data` without a `lineup.json` gets `seed/lineup.json` at startup (MLB /
+NFL / NHL / NBA, NFL RedZone, NFL Network, Formula 1, IndyCar, NASCAR Cup and
+Truck). Those become the visible Jellyfin channels once the sync runs; every
+other station, series, pool slot and later-seen team stays a stream until
+added. The slugs are listed whether or not the roster has them yet, so the
+feeds and series are covered from the very first sync.
 
 **3. Running the reorder early is not harmful, just temporary.** With, say, 9 of
 30 MLB teams known, you get MLB 1-9, NFL 10-…, and the feeds land right after

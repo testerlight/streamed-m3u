@@ -54,8 +54,11 @@ each step.
 8. In **Dashboard → Live TV**, paste the M3U link as a **Tuner Device** and
    the EPG link as a **Guide Data Provider** (XMLTV).
 9. No need to customize anything in those settings. Just add the links.
-10. Open the dashboard at `http://<IP>:8787`, sign in, and choose the
-    channels you want on your lineup.
+10. Jellyfin starts with the default channels only (the MLB, NFL, NHL and NBA
+    teams, NFL RedZone, NFL Network, Formula 1, IndyCar and NASCAR). To
+    change that, open the dashboard at `http://<IP>:8787`, sign in, and add
+    or remove channels on your lineup. New channels never appear in Jellyfin
+    on their own.
 
 If channels time out before they start playing, set Dispatcharr's channel
 init grace period to `60` seconds ([Quick start](#quick-start), step 3). For
@@ -339,7 +342,7 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `STARTUP_DELAY` | `15` | restart | Pause before the first scrape, giving the VPN tunnel time to come up. |
 | `TEAMS_FILE` | `/data/teams.json` | env only | Roster file. The only irreplaceable state the service holds. |
 | `EXTRACT_CACHE_FILE` | `/data/extract_cache.json` | env only | Where resolved stream URLs are persisted across restarts. |
-| `LINEUP_FILE` | `/data/lineup.json` | env only | Jellyfin lineup file. Missing means every roster slug is visible. |
+| `LINEUP_FILE` | `/data/lineup.json` | env only | Jellyfin allowlist file. Missing means the bundled default set is installed. |
 | **Upstream** | | | |
 | `STREAMED_BASE_URL` | `https://streamed.pk` | live | Catalog the service scrapes. Change this when the site moves domain. |
 | `REQUEST_TIMEOUT` | `10` | live | Seconds before an upstream API call is abandoned. |
@@ -406,7 +409,7 @@ Everything persistent lives in `/data` (mounted from `${CONFIG_DIR}/streamed-m3u
 |---|---|
 | `teams.json` | The roster: every channel that exists. It only ever grows. This is the one irreplaceable file; back it up. |
 | `teams.json.bak` | The previous save. Used automatically if `teams.json` is unreadable, which is then kept as `teams.json.corrupt-<time>`. |
-| `lineup.json` | Which roster slugs Jellyfin can see. Missing means every slug is visible. This box has the file (`policy: all`) after the first −. A new install seeds MLB / NFL / NHL / NBA only. |
+| `lineup.json` | The allowlist: the only roster slugs that become Dispatcharr channels and so reach Jellyfin. Missing means the bundled default set is installed on the next start. |
 | `lineup.json.bak` | The previous lineup save. Same recovery as the roster. |
 | `settings.json` | Settings written by the console. Same `.bak` protection. |
 | `multiview.json` | Which fixtures each composite slot points at. Only written when `MULTIVIEW_ENABLE` is on and a slot has been configured. Same `.bak` protection; losing it costs a re-pick, nothing more. |
@@ -419,13 +422,16 @@ one by one as fixtures are listed. The seed is a snapshot: team entries only,
 no favourites, and no feed or series channels (those are created from
 `FEED_CHANNELS` and `SERIES_CHANNELS`). An existing roster is never touched.
 
-The same first-boot copies `seed/lineup.json`: an allowlist of MLB / NFL /
-NHL / NBA. Stations, racing series, pool slots, and everything else stay
-Dispatcharr streams until you add them in the console. **This box is
-different.** It already had a roster, so the first boot did not install the
-seed allowlist. The first − wrote `lineup.json` with `policy: all`; every
-slug stays on the Jellyfin lineup until excluded. The playlist is never
-filtered; visibility is `hidden_from_output` in Dispatcharr.
+Any `/data` without a `lineup.json` also gets `seed/lineup.json`: an
+allowlist of the MLB / NFL / NHL / NBA teams, NFL RedZone, NFL Network,
+Formula 1, IndyCar and NASCAR Cup and Truck. Everything else stays a
+Dispatcharr stream and is never made into a channel until you add it in the
+console. New teams that appear later are no exception. The playlist is
+never filtered; visibility is `hidden_from_output` in Dispatcharr.
+
+A `lineup.json` from an older build (`policy: all`, with an exclude list) is
+converted once at startup into an allowlist of exactly the channels it was
+showing, and the old file is kept as `lineup.json.pre-allowlist`.
 
 ## Endpoints
 
@@ -438,7 +444,7 @@ filtered; visibility is `hidden_from_output` in Dispatcharr.
 | `/stream?multi=<n>` | Composite slot `n`, when `MULTIVIEW_ENABLE` is on |
 | `/health` | Machine-readable status |
 | `/teams`, `/teams?all=1`, `/teams?alias=1`, `/teams?team=<name>` | Roster diagnostics, including `in_lineup` |
-| `GET /api/lineup` | Jellyfin lineup policy, counts and groups |
+| `GET /api/lineup` | Jellyfin allowlist counts and groups |
 | `PUT /api/lineup` | Add or remove slugs or a group (session and CSRF) |
 | `GET /api/multiview` | Multi-view slots, their layout, and whether each side is warm. Carries no CDN URLs. |
 | `PUT /api/multiview/<n>` | Change a slot: any of primary, secondary, corner, size, audio (session and CSRF). Picking a channel starts resolving it immediately. |
