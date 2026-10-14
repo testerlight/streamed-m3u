@@ -132,6 +132,8 @@ with sync_playwright() as pw:
     check("recent streams names causes",
           "Source not publishing" in hist and "Download stalled or failing" in hist, hist[:300])
     check("recent streams shows the skipped chunks", "7 skipped" in hist)
+    check("recent streams lists the automatic fixes",
+          "Automatic fixes: Backup chunk requests 1 started, 1 won" in hist, hist[:600])
     check("recent streams scores the early warnings",
           "Warned ahead" in hist and "false alarm" in hist, hist[:400])
     page.locator("#streams").screenshot(path="/out/health-streams-dark.png")

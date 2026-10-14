@@ -79,7 +79,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/soak_multiview.py` | Run on the **host**. Plays a Multi-Player channel through Dispatcharr's proxy (as Jellyfin does), optionally with an ordinary channel alongside and every control stepped, and reports gaps, Dispatcharr's unhealthy/switch counts, encoder exits, CPU and GPU. No Dispatcharr login. |
 | `tools/multiview_api.py` | Console-API helper piped into the running container (`docker exec -i streamed-m3u python - get` / `put '<json>'` / `stop`), so the console password never leaves it. Used by the soak. |
 | `tools/check_console.py`, `tools/check_render.py` | Verification harnesses. Bind-mounted into a scratch image, never shipped. |
-| `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, a hanging playlist request, reconnecting) through the real `/stream` route, checking each raises the early warning it should. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
+| `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, a hanging playlist request, a chunk that hangs after its headers, reconnecting) through the real `/stream` route, checking each raises the early warning it should and that the Phase 3 fixes fire only where they should. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
 | `tools/check_health_render.py`, `tools/check_health_live.py` | The health UI driven in Chromium against scripted streams; and one real stream pulled through a scratch image inside gluetun's namespace (binds no port, own `/data`), reporting health and TS alignment. #29. |
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
 | `tools/check_multiview.py` | Multi-view checks with the feature **on**. A separate script because the slot map is derived once at import, so enabled and disabled cannot share a process. §12. |
@@ -288,7 +288,12 @@ docker run --rm -e STARTUP_DELAY=0 -v $PWD/tools/check_health.py:/tmp/h.py:ro \
 python3 tools/check_health.py --compare /tmp/health/new.json /tmp/health/old.json
 ```
 
-About eight minutes in all, most of it real time on purpose.
+About ten minutes in all, most of it real time on purpose. Since Phase 3 the
+comparison is one-sided in the scenarios where a fix fires (`FIX_SCENARIOS`):
+the new image may deliver earlier and may deliver chunks the old one skipped,
+but every chunk must be intact and in order, none the old one delivered may be
+missing, and nothing may arrive more than one 2s playlist poll later. With
+every fix switched off it must match the old image both ways.
 
 That covers the feature switched **off**. The multi-view half needs its own
 run, because the slot map is derived once at import and so enabled and
@@ -981,6 +986,39 @@ fetches (playlist, probe chunk, chunk downloads), read at call time;
 API and logos use plain `requests` and still pay the lookup; not on the stream
 path, left alone on purpose. Connection reuse would cut a further ~0.4s per
 poll, but it changes more (cookies, impersonation state) and is Phase 3.
+
+**31. Phase 3 fixes add a request; they never replace one.** Stream health
+Phase 3 (2026-10-14) acts in `stream_ts`, not in `streamhealth.py`, so a
+broken tracker cannot stop a fix and a fix never waits on the tracker
+(`H.recovery` only records). Three fixes, each a live setting:
+
+- **Backup chunk request** (`CHUNK_BACKUP_AFTER`, 4s). `_fetch_with_keepalive`
+  runs `_fetch_once` on a worker with its own state (`cancel`, `last`). At each
+  keepalive, if the download has received nothing for 4s, a second request for
+  the same chunk starts beside it. The first to bring back the whole chunk
+  wins and the other is cancelled. A slow download that keeps receiving bytes
+  never gets a backup: that is exactly what the 2026-10-10 attempt got wrong
+  when it threw away slow-but-working downloads. The "Segment dropped" log and
+  `segments_failed` moved to the caller, so a fetch whose backup succeeded does
+  not report a gap. Seen 2026-10-14 (lask): a chunk silent until the 30s
+  timeout froze 18.6s and skipped 5 chunks; its retry took 0.17s.
+- **Backup playlist request** (`PLAYLIST_BACKUP_AFTER`, 3s past the stream's
+  median request, 4s until ten are seen). `_playlist` runs `get_segments` on a
+  worker and returns the moment it does, so a healthy poll is not slowed. If
+  both requests fail, the *first* one's failure is reported, so fatal-status
+  handling (cache eviction, ending the stream) is unchanged.
+- **Quick first retry** (`PLAYLIST_RETRY_DELAY`, 0.5s) after the first
+  playlist error in a row. A failed quick retry does not count towards the six
+  that end a stream, and the next wait is `2 - delay`, so later retries land
+  on the old schedule: a source that keeps failing is given up on no sooner,
+  and no retry lands later than before. Both were real bugs in the first draft,
+  caught by the harness.
+
+Each outcome (started, won, not needed, failed, worked) is on the stream's
+timeline, in the log, in `recoveries` in the history record and in Recent
+streams' totals. Note what that does to Phase 2's score: a fix that prevents
+a freeze turns its warning into a "false alarm", so read the warning scores
+next to `recoveries`, not alone.
 
 ## 8. Endpoint reference
 

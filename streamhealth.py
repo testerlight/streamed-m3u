@@ -1,8 +1,9 @@
 """streamhealth: watch-only health tracking for proxied streams.
 
-Phases 1 and 2 of the stream-health work (.scratch/stream-health/spec.md).
+Phases 1-3 of the stream-health work (.scratch/stream-health/spec.md).
 It observes and never acts: nothing here may change what a stream sends, or
-when.
+when. The Phase 3 fixes live in app.py and decide on their own; this module
+only records what they did (`recovery`), so a broken tracker cannot stop them.
 
 Two rules follow from that, and both are load-bearing:
 
@@ -117,6 +118,20 @@ WARNINGS = {
                          "switch to a lower quality"),
     "source_quiet":     ("Source not publishing",
                          "check another source for this game"),
+}
+
+# Phase 3 fixes (app.py) -> how the timeline names them, and their outcomes.
+RECOVERIES = {
+    "chunk_backup":    "Backup chunk request",
+    "playlist_backup": "Backup playlist request",
+    "quick_retry":     "Quick playlist retry",
+}
+_OUTCOME_TEXT = {
+    "fired":  "started",
+    "won":    "won",
+    "lost":   "not needed",
+    "failed": "failed",
+    "ok":     "worked",
 }
 
 # What the loop is doing while frozen -> the warning whose remedy applies.
@@ -505,6 +520,7 @@ class StreamHealth:
         self._pl_slow = 0
         self._poll_empty = False
         self.download_quiet_max = 0.0
+        self.recoveries = {}         # Phase 3: kind -> outcome -> count
 
         self.end_reason = None
         self.end_detail = None
@@ -1046,6 +1062,20 @@ class StreamHealth:
         log.warning("%s: stream loop error, retrying in 2s: %s",
                     self._who(), msg, exc_info=exc)
 
+    # ── hooks: Phase 3 fixes (generator and download threads) ───────────────
+
+    @_guarded
+    def recovery(self, kind, outcome, detail=None):
+        """A Phase 3 fix acted, or finished. app.py decides; this records."""
+        with self._lock:
+            now = self._now()
+            c = self.recoveries.setdefault(kind, {})
+            c[outcome] = c.get(outcome, 0) + 1
+            text = "%s %s%s" % (RECOVERIES.get(kind, kind), _OUTCOME_TEXT.get(outcome, outcome),
+                                (": %s" % detail) if detail else "")
+            self._event("recovery", text, now)
+        log.info("%s: %s", self._who(), text)
+
     # ── the watcher (its own thread) ─────────────────────────────────────────
 
     @_guarded
@@ -1234,6 +1264,7 @@ class StreamHealth:
                 "slow": self._pl_slow,
             },
             "download_quiet_max_s": _r(self.download_quiet_max),
+            "recoveries": {k: dict(v) for k, v in self.recoveries.items()},
             "reconnect": None if r is None else {
                 k: (_r(v) if isinstance(v, float) else v)
                 for k, v in r.items() if not k.startswith("_")},
@@ -1343,6 +1374,13 @@ def _summary_line(rec):
                      % (det.get("raised", 0), det.get("hits", 0), det.get("false", 0),
                         det.get("warned_ahead", 0), det.get("freezes_scored", 0),
                         det.get("missed", 0)))
+    rv = rec.get("recoveries") or {}
+    if rv:
+        parts.append("fixes: " + ", ".join(
+            "%s %s" % (RECOVERIES.get(k, k).lower(),
+                       " ".join("%d %s" % (n, _OUTCOME_TEXT.get(o, o))
+                                for o, n in sorted(v.items())))
+            for k, v in sorted(rv.items())))
     pf = rec.get("playlist_fetch") or {}
     if pf.get("count"):
         parts.append("playlist requests %.2fs median, %.1fs worst"
@@ -1499,7 +1537,12 @@ def totals(records):
     det = {"streams": 0, "seconds": 0.0, "raised": 0, "hits": 0, "false": 0,
            "freezes_scored": 0, "missed": 0, "warned_ahead": 0, "by_kind": {}}
     noticed = []
+    fixes = {}
     for r in records:
+        for kind, v in (r.get("recoveries") or {}).items():
+            agg = fixes.setdefault(kind, {})
+            for o, n in v.items():
+                agg[o] = agg.get(o, 0) + (n or 0)
         d = r.get("detector")
         if d:   # streams from before Phase 2 have no detector figures
             det["streams"] += 1
@@ -1531,4 +1574,5 @@ def totals(records):
     det["seconds"] = round(det["seconds"], 1)
     det["noticed_median_s"] = _r(_median(noticed))
     out["detector"] = det
+    out["recoveries"] = fixes
     return out

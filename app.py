@@ -434,6 +434,24 @@ SEGMENT_MAX_MB = int(os.getenv("SEGMENT_MAX_MB", "64"))
 # IPv6 default route, which is Docker's bridge, not the VPN tunnel. Set to 0
 # to restore the library default without a rebuild.
 UPSTREAM_IPV4 = os.getenv("UPSTREAM_IPV4", "1") == "1"
+# Stream health Phase 3 (gotcha #31): backup requests. Neither abandons the
+# request it backs up - the first attempt (2026-10-10) made playback worse by
+# throwing away downloads that were slow but working - and whichever answers
+# first is used. Seen 2026-10-14: a chunk download went silent until its 30s
+# timeout, froze the picture 18.6s and skipped 16s of game, and the retry then
+# fetched the same chunk in 0.17s.
+# Seconds a chunk download may receive nothing before a second request for the
+# same chunk starts alongside it. 0 turns it off.
+CHUNK_BACKUP_AFTER = float(os.getenv("CHUNK_BACKUP_AFTER", "4"))
+# Seconds past a stream's typical playlist request (PLAYLIST_BACKUP_FIRST until
+# ten have been seen) before a second one is sent alongside it. 0 turns it off.
+PLAYLIST_BACKUP_AFTER = float(os.getenv("PLAYLIST_BACKUP_AFTER", "3"))
+PLAYLIST_BACKUP_FIRST = 4.0
+PLAYLIST_BACKUP_BASELINE = 10
+# Wait before retrying after the *first* playlist error in a row; later ones
+# keep the 2s wait, so a source that keeps failing is still given up on after
+# about as long as before (six in a row) rather than four times sooner.
+PLAYLIST_RETRY_DELAY = float(os.getenv("PLAYLIST_RETRY_DELAY", "0.5"))
 # Some sources publish a video elementary stream and no audio one at all -
 # observed on `admin`, which carries a raw MLB.TV feed. Playback looks fine and
 # is silent, and _rank_streams puts `admin` above `delta` (both HD, `admin`
@@ -2947,7 +2965,26 @@ def stream_proxy():
                         _active_streams[stream_id].get(field, 0) + n
 
         def fetch_segment(seg_url):
+            """_fetch_once, logging a chunk dropped after every attempt."""
+            f = {}
+            body = _fetch_once(seg_url, f)
+            if body is None and f.get("exhausted"):
+                _log_dropped(seg_url)
+            return body
+
+        def _log_dropped(seg_url):
+            log.warning("Segment dropped after %d attempt(s), leaving a gap: %s",
+                        SEGMENT_RETRIES + 1, seg_url)
+            _bump("segments_failed")
+
+        def _fetch_once(seg_url, f):
             """Download one chunk whole, or return None.
+
+            `f` is this fetch's own state: `cancel` (an Event) ends it early
+            when a backup request has already won; `last` is when it last
+            received anything; `backup` marks the second request; `exhausted`
+            is set when every attempt failed. The caller logs the drop, so a
+            fetch whose backup succeeds does not report a gap that never was.
 
             Buffered rather than streamed straight through on purpose. The old
             code forwarded bytes as they arrived, so a timeout partway meant a
@@ -2959,10 +2996,17 @@ def stream_proxy():
             Failures are logged, never swallowed: their invisibility is the
             reason this went undiagnosed for so long.
             """
+            cancel = f.get("cancel")
+
+            def ended():
+                return stop.is_set() or (cancel is not None and cancel.is_set())
+
             for attempt in range(1, SEGMENT_RETRIES + 2):
-                if stop.is_set():
+                if ended():
                     return None
-                H.download_attempt(attempt)
+                f["last"] = time.time()
+                if not f.get("backup"):
+                    H.download_attempt(attempt)
                 try:
                     seg = cf_requests.get(
                         seg_url,
@@ -2990,10 +3034,11 @@ def stream_proxy():
                     buf = bytearray()
                     cap = SEGMENT_MAX_MB * 1024 * 1024
                     for chunk in seg.iter_content(chunk_size=65536):
-                        if stop.is_set():
+                        if ended():
                             return None
                         if chunk:
                             buf.extend(chunk)
+                            f["last"] = time.time()
                             H.download_bytes(len(chunk))
                             if len(buf) > cap:
                                 log.warning("Segment exceeded %dMB while "
@@ -3021,15 +3066,86 @@ def stream_proxy():
                     return bytes(buf)
 
                 except Exception as exc:
+                    if ended():
+                        return None
                     log.warning("Segment fetch failed (attempt %d/%d, "
                                 "timeout=%ds): %s - %s",
                                 attempt, SEGMENT_RETRIES + 1, SEGMENT_TIMEOUT,
                                 seg_url, exc)
 
-            log.warning("Segment dropped after %d attempt(s), leaving a gap: %s",
-                        SEGMENT_RETRIES + 1, seg_url)
-            _bump("segments_failed")
+            f["exhausted"] = True
             return None
+
+        def _playlist(pl_times):
+            """get_segments, with a backup request if it runs long (Phase 3).
+
+            Returns (segments, status, info) exactly as one get_segments call
+            would, or None if the stream was stopped while waiting. The first
+            request is never abandoned: once PLAYLIST_BACKUP_AFTER past this
+            stream's typical request, a second starts alongside it and the
+            first success wins. If both fail, the first request's failure is
+            the one reported, so fatal-status handling is unchanged. With no
+            backup fired this returns the moment the request does, so a
+            healthy poll is not slowed by the thread.
+            """
+            if PLAYLIST_BACKUP_AFTER <= 0:
+                info = {}
+                segs, status = get_segments(m3u8_url, headers, cookies, info=info)
+                return segs, status, info
+            if len(pl_times) >= PLAYLIST_BACKUP_BASELINE:
+                ordered = sorted(pl_times)
+                wait = ordered[len(ordered) // 2] + PLAYLIST_BACKUP_AFTER
+            else:
+                wait = PLAYLIST_BACKUP_FIRST
+            results = queue.Queue()
+
+            def run(idx):
+                info = {}
+                try:
+                    segs, status = get_segments(m3u8_url, headers, cookies, info=info)
+                    results.put((idx, segs, status, info, None, time.time()))
+                except Exception as exc:   # re-raised below, as before
+                    results.put((idx, None, None, info, exc, time.time()))
+
+            began = time.time()
+            threading.Thread(target=run, args=(0,), daemon=True).start()
+            pending, backup_at, first = 1, None, None
+            while True:
+                if backup_at is None:
+                    timeout = max(0.01, began + wait - time.time())
+                else:
+                    timeout = 0.25
+                try:
+                    idx, segs, status, info, exc, at = results.get(timeout=timeout)
+                except queue.Empty:
+                    if stop.is_set():
+                        return None
+                    if backup_at is None and time.time() - began >= wait:
+                        backup_at = time.time()
+                        pending += 1
+                        H.recovery("playlist_backup", "fired",
+                                   "first request still running after %.1fs"
+                                   % (backup_at - began))
+                        threading.Thread(target=run, args=(1,), daemon=True).start()
+                    continue
+                pending -= 1
+                if exc is None and segs:
+                    if backup_at is not None:
+                        H.recovery("playlist_backup", "won" if idx == 1 else "lost",
+                                   "%s answered %.1fs after the backup started"
+                                   % ("backup" if idx == 1 else "first request",
+                                      at - backup_at))
+                    pl_times.append(at - (backup_at if idx == 1 else began))
+                    return segs, status, info
+                if idx == 0 or first is None:     # the first request's failure wins
+                    first = (segs, status, info, exc)
+                if pending == 0:
+                    if backup_at is not None:
+                        H.recovery("playlist_backup", "failed", "both requests failed")
+                    segs, status, info, exc = first
+                    if exc is not None:
+                        raise exc
+                    return segs, status, info
 
         def _generate():
             # Bounded set + deque so long-lived streams don't grow RAM unbounded
@@ -3085,28 +3201,66 @@ def stream_proxy():
                 on a 4 Mbit/s night. The fetch runs on a worker thread and this
                 generator pads the wait; the chunk comes back as the
                 generator's return value, so callers use `yield from`.
+
+                Phase 3: if the download has received nothing for
+                CHUNK_BACKUP_AFTER, a second request for the same chunk starts
+                alongside it. Neither is abandoned until one has the whole
+                chunk; then the other is cancelled. Checked at each keepalive,
+                so the cadence of what is sent while waiting is unchanged.
                 """
                 if STREAM_KEEPALIVE_INTERVAL <= 0:
                     return fetch_segment(seg_url)
-                result = {}
+                done = queue.Queue()
+                fetches = []
 
-                def _run():
-                    result["body"] = fetch_segment(seg_url)
+                def _start(backup):
+                    f = {"cancel": threading.Event(), "last": time.time(),
+                         "began": time.time(), "backup": backup}
+                    fetches.append(f)
 
-                t = threading.Thread(target=_run, daemon=True)
-                t.start()
+                    def _run():
+                        done.put((f, _fetch_once(seg_url, f)))
+                    threading.Thread(target=_run, daemon=True).start()
+
+                _start(False)
+                pending = 1
                 while True:
-                    t.join(STREAM_KEEPALIVE_INTERVAL)
-                    if not t.is_alive():
-                        break
-                    if stop.is_set():
-                        # fetch_segment checks stop itself and will unwind.
-                        return None
-                    _bump("keepalives_sent")
-                    yield TS_NULL_PACKET
-                return result.get("body")
+                    try:
+                        f, body = done.get(timeout=STREAM_KEEPALIVE_INTERVAL)
+                    except queue.Empty:
+                        if stop.is_set():
+                            # Both fetches check stop themselves and unwind.
+                            return None
+                        quiet = time.time() - fetches[0]["last"]
+                        if (CHUNK_BACKUP_AFTER > 0 and len(fetches) == 1
+                                and quiet >= CHUNK_BACKUP_AFTER):
+                            _start(True)
+                            pending += 1
+                            H.recovery("chunk_backup", "fired",
+                                       "download silent for %.0fs" % quiet)
+                        _bump("keepalives_sent")
+                        yield TS_NULL_PACKET
+                        continue
+                    pending -= 1
+                    if body is None and pending:
+                        continue          # the other request may still deliver
+                    for other in fetches:
+                        other["cancel"].set()
+                    if len(fetches) > 1:
+                        if body is None:
+                            H.recovery("chunk_backup", "failed", "both requests failed")
+                        else:
+                            H.recovery("chunk_backup", "won" if f["backup"] else "lost",
+                                       "%s finished %.1fs after the backup started"
+                                       % ("backup" if f["backup"] else "original",
+                                          time.time() - fetches[1]["began"]))
+                    if body is None and any(x.get("exhausted") for x in fetches):
+                        _log_dropped(seg_url)
+                    return body
 
             consecutive_failures = 0
+            pl_times = deque(maxlen=30)   # this stream's successful playlist requests
+            quick_retry = False           # the last failure was retried quickly
             last_data_at = time.time()  # tracks when we last yielded actual data
             delivered = 0               # segments that actually reached the player
 
@@ -3176,12 +3330,20 @@ def stream_proxy():
                     break
                 try:
                     H.playlist_begin()
-                    pl = {}
-                    segments, status = get_segments(m3u8_url, headers, cookies,
-                                                    info=pl)
+                    got = _playlist(pl_times)
+                    if got is None:
+                        return
+                    segments, status, pl = got
+                    was_quick, quick_retry = quick_retry, False
+                    if was_quick:
+                        H.recovery("quick_retry", "ok" if segments else "failed")
                     if not segments:
                         H.playlist_failed(status, empty=segments is not None)
-                        consecutive_failures += 1
+                        # A failed quick retry is an extra attempt, not one
+                        # of the six that end the stream: giving up must take
+                        # as long as it did before the quick retry existed.
+                        if not was_quick:
+                            consecutive_failures += 1
                         if status in FATAL_STATUS_CODES:
                             log.warning(
                                 "Fatal CDN error HTTP %d for %s - evicting cache",
@@ -3197,7 +3359,17 @@ def stream_proxy():
                             H.end("playlist_failures",
                                   "%d in a row" % consecutive_failures)
                             break
-                        yield from _idle(2)
+                        if was_quick:
+                            # Back on the old 2s schedule, counted from the
+                            # first failure, so the retry cannot land later.
+                            yield from _idle(max(0.0, 2 - PLAYLIST_RETRY_DELAY))
+                        elif consecutive_failures == 1 and 0 <= PLAYLIST_RETRY_DELAY < 2:
+                            quick_retry = True
+                            H.recovery("quick_retry", "fired",
+                                       "retrying in %.1fs" % PLAYLIST_RETRY_DELAY)
+                            yield from _idle(PLAYLIST_RETRY_DELAY)
+                        else:
+                            yield from _idle(2)
                         continue
                     consecutive_failures = 0
                     new_segments = [s for s in segments

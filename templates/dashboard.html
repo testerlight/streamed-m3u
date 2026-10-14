@@ -114,7 +114,7 @@
   <section id="history">
     <div class="section-head">
       <h2>Recent streams</h2>
-      <p class="section-note">Every finished stream: how often it froze and why, how fast its chunks downloaded against how fast they play, and how it ended. Freezes are estimated from what was sent, so a short one may never have reached the screen. Warned ahead counts freezes an early warning saw coming; a warning no freeze followed is a false alarm. Nothing acts on warnings yet. Kept across restarts; the last 500 are saved in <span class="mono">/data/stream_history.jsonl</span>.</p>
+      <p class="section-note">Every finished stream: how often it froze and why, how fast its chunks downloaded against how fast they play, and how it ended. Freezes are estimated from what was sent, so a short one may never have reached the screen. Warned ahead counts freezes an early warning saw coming; a warning no freeze followed is a false alarm. Two kinds now act: a silent chunk download or a hanging playlist request gets a backup request alongside it, never in place of it, and those are listed as automatic fixes. Kept across restarts; the last 500 are saved in <span class="mono">/data/stream_history.jsonl</span>.</p>
     </div>
     <div id="history-panel">
       <div class="table-wrap"><div class="empty"><p>Loading.</p></div></div>

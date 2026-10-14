@@ -451,6 +451,26 @@
       esc(text) + "</div>";
   }
 
+  var FIX_TEXT = { chunk_backup: "Backup chunk requests",
+                   playlist_backup: "Backup playlist requests",
+                   quick_retry: "Quick playlist retries" };
+
+  /* "Backup chunk requests 3 started, 2 won; Quick playlist retries 1 worked" */
+  function fixesText(rv) {
+    var kinds = Object.keys(rv || {});
+    if (!kinds.length) { return ""; }
+    return kinds.map(function (k) {
+      var v = rv[k];
+      var bits = [];
+      if (v.fired) { bits.push(num(v.fired) + " started"); }
+      if (v.won) { bits.push(num(v.won) + " won"); }
+      if (v.ok) { bits.push(num(v.ok) + " worked"); }
+      if (v.lost) { bits.push(num(v.lost) + " not needed"); }
+      if (v.failed) { bits.push(num(v.failed) + " failed"); }
+      return (FIX_TEXT[k] || k) + " " + bits.join(", ");
+    }).join("; ");
+  }
+
   function detectorText(d) {
     if (!d || (!d.raised && !d.freezes_scored)) { return "nothing raised yet"; }
     var parts = [plural(d.raised || 0, "warning") + " raised: " + num(d.hits || 0) +
@@ -483,7 +503,8 @@
       ["Warnings now", (h.warnings || []).length ? h.warnings.map(function (w) {
         return w.text + " (would " + w.would + ")";
       }).join("; ") : "none"],
-      ["Warnings so far", detectorText(h.detector)]
+      ["Warnings so far", detectorText(h.detector)],
+      ["Automatic fixes", fixesText(h.recoveries) || "none needed yet"]
     ];
     if (h.alarm) { facts.splice(1, 0, ["Would do", h.alarm.would + " (Phase 3; nothing acts yet)"]); }
     var pf = h.playlist_fetch;
@@ -559,7 +580,9 @@
       '<p class="section-note history-endings">' +
         (endings ? "How they ended: " + esc(endings) + ". " : "") +
         esc(plural(t.reconnects || 0, "reconnect") + ", " +
-            plural(t.replayed_chunks || 0, "replayed chunk")) + ".</p>";
+            plural(t.replayed_chunks || 0, "replayed chunk")) + "." +
+        (fixesText(t.recoveries) ? " Automatic fixes: " + esc(fixesText(t.recoveries)) + "." : "") +
+        "</p>";
     var rows = recs.map(function (r) {
       var top = "";
       var bc = r.by_cause || {};
@@ -574,6 +597,10 @@
       var d = r.detector;
       if (d && d.freezes_scored) { notes.push("warned ahead " + d.warned_ahead + "/" + d.freezes_scored); }
       if (d && d.false) { notes.push(plural(d.false, "false alarm")); }
+      var rv = r.recoveries || {};
+      var won = ((rv.chunk_backup || {}).won || 0) + ((rv.playlist_backup || {}).won || 0) +
+        ((rv.quick_retry || {}).ok || 0);
+      if (won) { notes.push(num(won) + (won === 1 ? " fix" : " fixes") + " worked"); }
       if (r.multiview) { notes.push("multi-view " + r.multiview); }
       if (r.endlist) { notes.push("broadcast ended"); }
       return "<tr>" +

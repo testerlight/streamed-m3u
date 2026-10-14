@@ -226,6 +226,16 @@ SCHEMA = [
     _s("UPSTREAM_IPV4", "UPSTREAM_IPV4", "Playback", "live", "bool",
        "Reach stream sources over IPv4 only. Behind the VPN, an IPv6 lookup costs "
        "about 2s per request and the IPv6 route bypasses the tunnel."),
+    _s("CHUNK_BACKUP_AFTER", "CHUNK_BACKUP_AFTER", "Playback", "live", "float",
+       "Seconds a chunk download may receive nothing before a second request for the "
+       "same chunk starts alongside it; the first to finish is used. 0 turns it off.",
+       min=0, max=60),
+    _s("PLAYLIST_BACKUP_AFTER", "PLAYLIST_BACKUP_AFTER", "Playback", "live", "float",
+       "Seconds past a stream's usual playlist request before a second one is sent "
+       "alongside it; the first answer is used. 0 turns it off.", min=0, max=30),
+    _s("PLAYLIST_RETRY_DELAY", "PLAYLIST_RETRY_DELAY", "Playback", "live", "float",
+       "Wait before retrying after the first playlist error in a row; later errors wait "
+       "2s. 2 or more restores the old behaviour.", min=0, max=10),
     _s("STREAM_IDLE_TIMEOUT", "STREAM_IDLE_TIMEOUT", "Playback", "live", "int",
        "Seconds without a new segment before a stream is treated as dead.", min=5, max=600),
     _s("STREAM_KEEPALIVE_INTERVAL", "STREAM_KEEPALIVE_INTERVAL", "Playback", "live", "float",

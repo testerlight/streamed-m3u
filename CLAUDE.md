@@ -7,7 +7,7 @@ Two documents, no overlap between them:
   `python settings.py --markdown`; regenerate it rather than editing by hand.
 - `instructions.md` is the maintainer handover: how the system works
   internally, the TrueNAS SCALE deployment specifics, the settings and auth
-  model, and a numbered list of gotchas (currently 30, plus 41 multi-view
+  model, and a numbered list of gotchas (currently 31, plus 41 multi-view
   pitfalls in §12) covering real bugs
   already hit here. **Read it before changing `app.py`.** Skipping it risks
   redoing debugging that has already been done.
@@ -24,11 +24,13 @@ Working notes and scoped-out plans live in `docs/internal/`. Check
 `docs/internal/PENDING_stream_quality.md` for anything touching playback
 quality (failover, buffering, startup latency); it is not yet implemented.
 
-Stream health is being built in three phases, one at a time, per
+Stream health was built in three phases, one at a time, per
 `.scratch/stream-health/spec.md`. Phase 1 (`streamhealth.py`, gotcha #29)
-only watches; Phase 2 adds early warnings that are scored but never acted
-on. Do not add automatic recovery (Phase 3) until that spec's gate is met:
-Phase 2 has run on real games and its scores have been read with the user.
+watches; Phase 2 scores early warnings; Phase 3 (gotcha #31) adds backup
+requests for silent chunk downloads and hanging playlist requests, and a quick
+first playlist retry. Any further fix follows the same pattern: evidence from
+the history first, a request added rather than replaced, its own off switch,
+its outcomes recorded, and the harness proving the video is unchanged.
 
 Verification runs inside the image, not on the host: see the docstring of
 `tools/check_console.py`. Build to a scratch tag for that; never retag the
