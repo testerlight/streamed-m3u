@@ -494,6 +494,13 @@ acts on it yet. Recent streams scores them: how many freezes were **warned
 ahead**, how many were missed, and how many warnings were **false alarms**
 because no freeze followed.
 
+**Empty chunks.** Some sources answer part of the time with an empty
+placeholder instead of a chunk; the picture pauses for that chunk's length,
+then carries on. Those placeholders are dropped rather than passed to the
+player, counted as missing video, and flagged on the stream's Health badge
+("Source sending empty chunks: 8 of the last 20"). Nothing can fill the gap;
+if it keeps happening, another source for the game is the only way round it.
+
 ## Limitations
 
 - No mid-stream failover. If a source dies during playback the stream ends and

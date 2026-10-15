@@ -86,7 +86,7 @@ class Scenario:
 
     def __init__(self, name, take, slow=None, stall=None, pl_errors=None,
                  seg_fail=None, restart=None, end=None, window=LONG_WINDOW,
-                 pl_hang=None):
+                 pl_hang=None, new_only=False):
         self.name = name
         self.take = take            # chunks to pull before hanging up
         self.slow = slow            # (first, last, seconds per chunk)
@@ -97,6 +97,7 @@ class Scenario:
         self.end = end              # time the broadcast ends (ENDLIST)
         self.window_len = window    # chunks listed once past the probe
         self.pl_hang = pl_hang      # (start_s, end_s, delay): requests in it hang
+        self.new_only = new_only    # not run against the old image
         self.reset()
 
     def reset(self):
@@ -149,6 +150,9 @@ class Scenario:
         return 200, "\n".join(lines) + "\n"
 
 
+# What one TikTok bucket sent instead of chunks on 2026-10-14: a 72-byte WebP.
+PLACEHOLDER = b"RIFF" + struct.pack("<I", 64) + b"WEBPVP8X" + b"\x00" * 56
+
 MASTER = ("#EXTM3U\n"
           "#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080\nv1/index.m3u8\n"
           "#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=960x540\nv2/index.m3u8\n")
@@ -191,7 +195,12 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, b"", "text/plain")
 
     def _segment(self, sc, seq, body, attempt):
-        fail = sc.seg_fail.get(seq) if attempt == 1 else None
+        fail = sc.seg_fail.get(seq)
+        if fail == "empty":
+            # The placeholder, on every attempt, as the real bucket does.
+            return self._send(200, PLACEHOLDER, "image/webp")
+        if attempt != 1:
+            fail = None
         if fail == "503":
             return self._send(503, b"busy", "text/plain")
         self.send_response(200)
@@ -253,6 +262,10 @@ def scenario_defs():
         # A playlist request hangs for 7s and then answers: the failure
         # behind all three long freezes of 2026-10-13 (there for ~15s).
         Scenario("hang", take=18, pl_hang=(6.0, 7.0, 7.0)),
+        # Chunks 6, 9 and 10 come back as 72-byte placeholders, every time.
+        # The old image forwards the junk, so this runs on the new one only.
+        Scenario("empty", take=12, seg_fail={6: "empty", 9: "empty", 10: "empty"},
+                 new_only=True),
     ]
 
 
@@ -295,6 +308,8 @@ def run_scenarios(app, client, port, label, only=None, health=True):
     out = {}
     for sc in scenario_defs():
         if only and sc.name not in only:
+            continue
+        if sc.new_only and label == "baseline":
             continue
         key = "%s-%s" % (sc.name, label)
         SCENARIOS[key] = sc
@@ -728,7 +743,8 @@ def unit_tests(app):
 
 HOOKS = ("download_begin", "download_attempt", "download_bytes", "download_end",
          "sending", "delivered", "playlist_begin", "playlist_failed",
-         "playlist_ok", "loop_error", "end", "finish", "snapshot", "tick")
+         "playlist_ok", "loop_error", "end", "finish", "snapshot", "tick",
+         "empty_chunk")
 
 
 def rig_hooks_raise(sh):
@@ -798,6 +814,22 @@ def expect(results):
     check("ended: ran out on the idle limit", en.get("end_reason") == "idle_timeout",
           en.get("end_reason"))
 
+    section("empty chunks")
+    em, er_ = h.get("empty", {}), results.get("empty", {})
+    segs = er_.get("segments") or []
+    check("empty: the three placeholders counted", em.get("empty_chunks") == 3,
+          em.get("empty_chunks"))
+    check("empty: two holes of their length, cause empty, counted once",
+          [(f["cause"], f["s"]) for f in em.get("freeze_list") or []]
+          == [("empty", 1.0), ("empty", 2.0)], em.get("freeze_list"))
+    check("empty: not counted as dropped or skipped",
+          em.get("downloads_failed") == 0 and em.get("skipped") == 0,
+          (em.get("downloads_failed"), em.get("skipped")))
+    check("empty: none of the junk reached the player, chunks in order",
+          er_.get("trailing_bytes") == 0 and not {"A6", "A9", "A10"} & set(segs)
+          and [int(x[1:]) for x in segs] == sorted(int(x[1:]) for x in segs)
+          and len(segs) == 12, segs)
+
     section("early warnings match what the origin did")
     hg = h.get("hang", {})
 
@@ -844,6 +876,8 @@ def compare(new, old, label_new, label_old, tol_max=1.0, tol_median=0.25):
     section("video: %s vs %s" % (label_new, label_old))
     for name in sorted(set(new) | set(old)):
         a, b = new.get(name), old.get(name)
+        if a and not b and name in {x.name for x in scenario_defs() if x.new_only}:
+            continue
         if not a or not b:
             check("%s: present in both" % name, False)
             continue

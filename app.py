@@ -885,6 +885,21 @@ def _ts_sync_offset(body, packets=10, limit=4096):
     return None
 
 
+# A chunk this small with no TS alignment in it is a placeholder, not video.
+# Seen 2026-10-14 on every channel served by the `admin` HD sources: one TikTok
+# bucket (tos-alisg-i-50979-sg) answering 200 with a 72-byte empty WebP
+# (`RIFF....WEBPVP8X`) for up to ~30% of chunks, every retry the same. The
+# picture skips the chunk's whole length. A real chunk here is megabytes, and
+# a wrapped one still aligns after its wrapper (gotcha #17), so neither can
+# match. Gotcha #31.
+EMPTY_CHUNK_MAX_BYTES = 65536
+
+
+def _is_empty_chunk(body):
+    """True if a downloaded chunk is a placeholder rather than video."""
+    return len(body) < EMPTY_CHUNK_MAX_BYTES and _ts_sync_offset(body) is None
+
+
 def _strip_ts_prefix(body):
     """Return (clean_body, bytes_removed) with any leading non-TS wrapper gone.
 
@@ -2946,6 +2961,14 @@ def stream_proxy():
                     _active_streams[stream_id][field] = \
                         _active_streams[stream_id].get(field, 0) + n
 
+        # Set by fetch_segment: the last chunk was an empty placeholder.
+        fetch_note = {"empty": False}
+
+        def _empty(seg_url):
+            """An empty placeholder instead of a chunk: drop it, record it."""
+            _bump("chunks_empty")
+            H.empty_chunk(seg_url)
+
         def fetch_segment(seg_url):
             """Download one chunk whole, or return None.
 
@@ -2958,7 +2981,13 @@ def stream_proxy():
 
             Failures are logged, never swallowed: their invisibility is the
             reason this went undiagnosed for so long.
+
+            An empty placeholder (gotcha #31) returns None at once with
+            fetch_note["empty"] set: not retried, because the source answers
+            the same every time, and not logged as a drop, because the caller
+            records it as what it is.
             """
+            fetch_note["empty"] = False
             for attempt in range(1, SEGMENT_RETRIES + 2):
                 if stop.is_set():
                     return None
@@ -3013,6 +3042,9 @@ def stream_proxy():
                         log.warning("Segment empty (attempt %d/%d): %s",
                                     attempt, SEGMENT_RETRIES + 1, seg_url)
                         continue
+                    if _is_empty_chunk(buf):
+                        fetch_note["empty"] = True
+                        return None
 
                     if attempt > 1:
                         log.info("Segment recovered on attempt %d: %s",
@@ -3117,7 +3149,11 @@ def stream_proxy():
                 # Already fetched during the segment probe - reuse it so the
                 # validation costs no extra round-trip.
                 if primed and seg_url in primed:
-                    body, cut = _strip_ts_prefix(primed.pop(seg_url))
+                    raw = primed.pop(seg_url)
+                    if _is_empty_chunk(raw):
+                        _empty(seg_url)
+                        continue
+                    body, cut = _strip_ts_prefix(raw)
                     if cut:
                         _note_prefix(cut)
                     delivered += 1
@@ -3135,7 +3171,10 @@ def stream_proxy():
                     continue
                 H.download_begin(seg_url)
                 body = yield from _fetch_with_keepalive(seg_url)
-                H.download_end(seg_url, body)
+                if body is None and fetch_note["empty"]:
+                    _empty(seg_url)
+                else:
+                    H.download_end(seg_url, body)
                 if body is None:
                     continue
                 body, cut = _strip_ts_prefix(body)
@@ -3209,7 +3248,10 @@ def stream_proxy():
                             return
                         H.download_begin(seg_url)
                         body = yield from _fetch_with_keepalive(seg_url)
-                        H.download_end(seg_url, body)
+                        if body is None and fetch_note["empty"]:
+                            _empty(seg_url)
+                        else:
+                            H.download_end(seg_url, body)
                         # Marked seen only after the attempts conclude, but
                         # marked either way: a chunk the CDN has genuinely
                         # dropped must not be retried forever while the live
@@ -3287,6 +3329,9 @@ def stream_proxy():
             # and had it removed before forwarding.
             "prefix_stripped":   0,
             "prefix_bytes":      0,
+            # Empty placeholders the source sent instead of chunks, dropped
+            # (gotcha #31). Each is a hole of that chunk's length.
+            "chunks_empty":      0,
             "hold_key":          hold_key,
             # Set when this stream is feeding a composite rather than a
             # viewer, as "<slot>/<role>". Sent as a header rather than a
@@ -3404,6 +3449,7 @@ def stream_status():
             "keepalives_sent":  s.get("keepalives_sent", 0),
             "prefix_stripped":  s.get("prefix_stripped", 0),
             "prefix_bytes":     s.get("prefix_bytes", 0),
+            "chunks_empty":     s.get("chunks_empty", 0),
             "bytes_sent":       s["bytes_sent"],
             "mb_sent":          round(s["bytes_sent"] / 1_048_576, 2),
             "mbit_per_s":       round(s["bytes_sent"] * 8 / 1e6 / elapsed, 2)

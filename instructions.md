@@ -982,6 +982,32 @@ API and logos use plain `requests` and still pay the lookup; not on the stream
 path, left alone on purpose. Connection reuse would cut a further ~0.4s per
 poll, but it changes more (cookies, impersonation state) and is Phase 3.
 
+**31. Some "chunks" are empty placeholders: dropped and counted, not filled.**
+Found 2026-10-14: the `admin` HD sources spread their chunks over several
+TikTok buckets, and one (`tos-alisg-i-50979-sg`) answers 200 with a 72-byte
+empty WebP (`RIFF....WEBPVP8X`) instead of video, the same on every retry.
+It hit every channel on those sources at once (Brewers-Dodgers ~24-30%, NFL
+Network ~30%: 45s of video missing in 113s). The picture's clock skips
+exactly that chunk's EXTINF (verified with ffprobe), so each one is a pause,
+then the stream carries on. It used to pass every check: a 200 whose length
+matches, forwarded as 72 junk bytes, and credited by the tracker as video,
+so health said "no freezes". The `admin` SD sources are served straight from
+strmd and were clean.
+
+`_is_empty_chunk`: under `EMPTY_CHUNK_MAX_BYTES` (64 KB) with no TS alignment.
+A real chunk here is megabytes, and a wrapped one still aligns after its
+wrapper (#17), so neither can match. `fetch_segment` returns None with
+`fetch_note["empty"]` set, without retrying and without the "dropped" log; the
+probe chunk is checked the same way. The chunk is dropped and
+`H.empty_chunk` records a hole of its length (cause `empty`; a run of empties
+is one freeze), credits the cushion with it because the player crosses the
+hole on a frozen frame (not crediting it counted the same seconds twice),
+and the badge says "Source sending empty chunks: N of the last 20". Nothing
+can fill the hole: the video does not exist at the source. Only another
+source can, and that is the user's call. A source picker and Phase 3's
+backup requests were built and then reverted at the user's request
+(2026-10-14); this detection was brought back on its own.
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when

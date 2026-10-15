@@ -375,6 +375,7 @@
   var CAUSE_TEXT = {
     slow: "Downloads too slow", stalled: "Download stalled or failing",
     source: "Source not publishing", playlist: "Playlist slow or failing",
+    empty: "Source sent empty chunks",
     internal: "Internal error", unknown: "Unknown"
   };
   var END_TEXT = {
@@ -443,6 +444,11 @@
   }
 
   function warningLine(h) {
+    var er = h.empty_recent || {};
+    if (er.empty) {
+      return '<div class="health-sub health-warning">' +
+        esc("Empty chunks: " + er.empty + " of the last " + er.of) + "</div>";
+    }
     var ws = h.warnings || [];
     if (!ws.length) { return ""; }
     var text = ws[0].title + (ws.length > 1 ? " +" + (ws.length - 1) : "");
@@ -480,6 +486,9 @@
       ["Errors", plural(h.playlist_errors || 0, "playlist error") + ", " +
         plural(h.downloads_failed || 0, "chunk") + " dropped, " +
         plural(h.internal_errors || 0, "internal error")],
+      ["Empty chunks", h.empty_chunks ? plural(h.empty_chunks, "chunk") + " (" +
+        secs(h.empty_s) + " of video missing); " + ((h.empty_recent || {}).empty || 0) +
+        " of the last " + ((h.empty_recent || {}).of || 0) : "none"],
       ["Warnings now", (h.warnings || []).length ? h.warnings.map(function (w) {
         return w.text + " (would " + w.would + ")";
       }).join("; ") : "none"],
@@ -570,6 +579,7 @@
           ? ", replayed " + r.reconnect.replayed_chunks : ""));
       }
       if (r.skipped) { notes.push(r.skipped + " skipped"); }
+      if (r.empty_chunks) { notes.push(plural(r.empty_chunks, "empty chunk")); }
       if ((r.backwards || 0) + (r.playlist_backwards || 0)) { notes.push("jumped back"); }
       var d = r.detector;
       if (d && d.freezes_scored) { notes.push("warned ahead " + d.warned_ahead + "/" + d.freezes_scored); }

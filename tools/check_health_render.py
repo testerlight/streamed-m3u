@@ -70,7 +70,8 @@ def scenario(sc, key):
 for sc, key in ((ch.Scenario("stall", take=13, stall=(5.0, 14.0, 8)), "phillies-stall"),
                 (ch.Scenario("errors", take=16, pl_errors=(4.5, 7.5),
                              seg_fail={9: "503", 11: "midstall", 13: "short"}), "eagles-errors"),
-                (ch.Scenario("steady", take=8), "flyers-steady")):
+                (ch.Scenario("steady", take=8), "flyers-steady"),
+                (ch.Scenario("empty", take=8, seg_fail={4: "empty", 5: "empty"}), "union-empty")):
     embed = scenario(sc, key)
     res = ch.pull(app, client, embed, sc.take)
     print("history stream %s: %d chunks" % (key, len(res.get("segments", []))), flush=True)
@@ -132,6 +133,8 @@ with sync_playwright() as pw:
     check("recent streams names causes",
           "Source not publishing" in hist and "Download stalled or failing" in hist, hist[:300])
     check("recent streams shows the skipped chunks", "7 skipped" in hist)
+    check("recent streams names the empty chunks",
+          "2 empty chunks" in hist and "Source sent empty chunks" in hist, hist[:500])
     check("recent streams scores the early warnings",
           "Warned ahead" in hist and "false alarm" in hist, hist[:400])
     page.locator("#streams").screenshot(path="/out/health-streams-dark.png")

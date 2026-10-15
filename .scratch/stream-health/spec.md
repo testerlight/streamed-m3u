@@ -186,3 +186,13 @@ Decisions (user, 2026-10-14):
 
 The Phase 3 gate is unchanged. The next games will show what freezes remain
 once polls are fast; the playlist 500s are the candidate after that.
+
+## Phase 3 reverted; empty-chunk detection kept (2026-10-14, evening)
+
+The user had Phase 3 (backup requests, quick retry), the source picker and
+the empty-chunk handling all reverted at 22:05, keeping IPv4. By 22:45 the
+pauses were "constant, across multiple streams": every channel on the
+`admin` HD sources was getting empty placeholders from the same TikTok bucket
+(Brewers-Dodgers, NFL Network ~30%). The user then asked for the empty-chunk
+detection alone to come back: dropped, counted as holes, flagged on the
+badge. No source switching, automatic or manual. Instructions gotcha #31.
