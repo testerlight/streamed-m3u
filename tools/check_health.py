@@ -93,17 +93,18 @@ class Scenario:
 
     def __init__(self, name, take, slow=None, stall=None, pl_errors=None,
                  seg_fail=None, restart=None, end=None, window=LONG_WINDOW,
-                 pl_hang=None):
+                 pl_hang=None, new_only=False):
         self.name = name
         self.take = take            # chunks to pull before hanging up
         self.slow = slow            # (first, last, seconds per chunk)
         self.stall = stall          # (start_s, end_s, jump)
         self.pl_errors = pl_errors  # (start_s, end_s)
-        self.seg_fail = seg_fail or {}   # seq -> "503" | "midstall" | "short" | "hang"
+        self.seg_fail = seg_fail or {}   # seq -> "503" | "midstall" | "short" | "hang" | "empty"
         self.restart = restart      # time the sequence restarts lower
         self.end = end              # time the broadcast ends (ENDLIST)
         self.window_len = window    # chunks listed once past the probe
         self.pl_hang = pl_hang      # (start_s, end_s, delay): requests in it hang
+        self.new_only = new_only    # not run against the old image
         self.reset()
 
     def reset(self):
@@ -156,6 +157,8 @@ class Scenario:
         return 200, "\n".join(lines) + "\n"
 
 
+PLACEHOLDER = b"RIFF" + struct.pack("<I", 64) + b"WEBPVP8X" + b"\x00" * 56
+
 MASTER = ("#EXTM3U\n"
           "#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080\nv1/index.m3u8\n"
           "#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=960x540\nv2/index.m3u8\n")
@@ -198,7 +201,12 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, b"", "text/plain")
 
     def _segment(self, sc, seq, body, attempt):
-        fail = sc.seg_fail.get(seq) if attempt == 1 else None
+        fail = sc.seg_fail.get(seq)
+        if fail == "empty":
+            # 2026-10-14: a 200 with a 72-byte empty WebP, every attempt.
+            return self._send(200, PLACEHOLDER, "image/webp")
+        if attempt != 1:
+            fail = None
         if fail == "503":
             return self._send(503, b"busy", "text/plain")
         self.send_response(200)
@@ -268,6 +276,10 @@ def scenario_defs():
         # A chunk's first request sends headers, then nothing for 25s: the
         # 2026-10-14 stall that froze lask for 18.6s (its retry took 0.17s).
         Scenario("chunkhang", take=14, seg_fail={8: "hang"}),
+        # Chunks 6, 9 and 10 come back as 72-byte placeholders, every time.
+        # The old image forwards the junk, so this runs on the new one only.
+        Scenario("empty", take=12, seg_fail={6: "empty", 9: "empty", 10: "empty"},
+                 new_only=True),
     ]
 
 
@@ -318,6 +330,8 @@ def run_scenarios(app, client, port, label, only=None, health=True):
     out = {}
     for sc in scenario_defs():
         if only and sc.name not in only:
+            continue
+        if sc.new_only and label == "baseline":
             continue
         key = "%s-%s" % (sc.name, label)
         SCENARIOS[key] = sc
@@ -768,12 +782,156 @@ def unit_tests(app):
     check("the stand-in swallows every hook", n.delivered("x", 1) is None and n.snapshot() is None)
 
 
+# ─── Manual source choice ─────────────────────────────────────────────────────
+
+def source_choice_tests(app, client, port):
+    """The console picker against four fake sources for one match: A works,
+    B works, C sends only empty placeholders, D cannot be extracted."""
+    base = "http://127.0.0.1:%d/" % port
+    for key, fail in (("srcA", None), ("srcB", None),
+                      ("srcC", {n: "empty" for n in range(400)})):
+        SCENARIOS[key] = Scenario(key, take=10 ** 6, seg_fail=fail)
+        SCENARIOS[key].reset()
+    E = {k: "http://fake-embed.test/source-%s" % k for k in "ABCD"}
+    urls = {E["A"]: base + "srcA/master.m3u8", E["B"]: base + "srcB/master.m3u8",
+            E["C"]: base + "srcC/master.m3u8", E["D"]: None}
+    app.extract_m3u8_via_browser = (
+        lambda e, *a, **k: {"url": urls[e], "headers": {}, "cookies": {},
+                            "browser_m3u8_status": 200} if urls.get(e) else None)
+    with app._team_lock:
+        app._team_roster["srcteam"] = {"name": "Src Team", "kind": "team", "sport": "test"}
+        app._team_map["srcteam"] = {
+            "team": "Src Team", "away": "Test", "category": "Live", "sport": "test",
+            "poster": "", "starts": int(time.time() * 1000), "kind": "team", "side": "home",
+            "match_id": "m1", "match_title": "Src vs Test",
+            "streams": [{"embed_url": E["A"], "source": "admin", "stream_no": 1, "hd": True},
+                        {"embed_url": E["B"], "source": "golf", "stream_no": 1, "hd": True},
+                        {"embed_url": E["C"], "source": "hotel", "stream_no": 1, "hd": True},
+                        {"embed_url": E["D"], "source": "admin", "stream_no": 2, "hd": False}]}
+
+    def reader():
+        out = {"first": None, "done": threading.Event(), "stop": threading.Event(),
+               "t0": time.time()}
+
+        def run():
+            resp = client.get("/stream?team=srcteam", buffered=False)
+            out["status"] = resp.status_code
+            try:
+                for item in resp.response:
+                    if item != app.TS_NULL_PACKET and out["first"] is None:
+                        out["first"] = time.time() - out["t0"]
+                    if out["stop"].is_set():
+                        break
+            finally:
+                resp.close()
+                out["done"].set()
+        threading.Thread(target=run, daemon=True).start()
+        return out
+
+    def active(timeout=20.0, label=None):
+        end = time.time() + timeout
+        while time.time() < end:
+            with app._active_streams_lock:
+                for r in app._active_streams.values():
+                    if r.get("hold_key") == "team:srcteam" and (
+                            label is None or r.get("source_label") == label):
+                        return r["stream_id"], r.get("source_label")
+            time.sleep(0.1)
+        return None, None
+
+    def job(states, timeout=40.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            j = app._source_jobs.get("srcteam")
+            if j and j["state"] in states:
+                return dict(j)
+            time.sleep(0.1)
+        return dict(app._source_jobs.get("srcteam") or {})
+
+    r1 = reader()
+    sid, label = active()
+    check("a channel starts on the first source", label == "admin1-HD", label)
+    st = client.get("/stream/status").get_json()
+    view = next((x.get("source") for x in st["streams"] if x["stream_id"] == sid), None) or {}
+    check("/stream/status lists the match's four sources, the playing one marked",
+          len(view.get("options") or []) == 4
+          and [o["label"] for o in view["options"] if o["playing"]] == ["admin1-HD"], view)
+
+    check("a dead source is accepted for checking", app._switch_source(sid, E["D"])[0] == "ok")
+    j = job(("failed", "switching", "done"))
+    check("a dead source fails its check, in words", j.get("state") == "failed"
+          and "no stream link" in j.get("detail", ""), j)
+    check("and the stream is untouched", active(1)[0] == sid and not r1["done"].is_set())
+
+    app._switch_source(sid, E["C"])
+    j = job(("failed", "switching", "done"))
+    check("a source sending empty placeholders fails its check",
+          j.get("state") == "failed" and "empty" in j.get("detail", ""), j)
+    check("and the stream is still untouched", active(1)[0] == sid and not r1["done"].is_set())
+
+    check("an unknown source is refused", app._switch_source(sid, "http://elsewhere/x")[0]
+          == "unknown_source")
+    r = client.post("/api/streams/%s/source" % sid, json={})
+    check("the API wants an embed_url", r.status_code == 400, r.status_code)
+
+    check("a good source is accepted", app._switch_source(sid, E["B"])[0] == "ok")
+    check("a second switch while one runs is refused",
+          app._switch_source(sid, E["A"])[0] == "busy")
+    j = job(("switching", "failed", "done"))
+    check("the good source passes its check", j.get("state") in ("switching", "done"), j)
+    r1["done"].wait(10)
+    check("the old stream ended", r1["done"].is_set())
+    check("without a disconnect hold, so the reconnect is let in",
+          not app._disconnect_held("team:srcteam"))
+    r2 = reader()                                   # what Dispatcharr does next
+    sid2, label = active(label="golf1-HD")
+    deadline = time.time() + 5
+    while r2["first"] is None and time.time() < deadline:
+        time.sleep(0.05)
+    check("the reconnect plays the picked source", label == "golf1-HD", label)
+    check("from the checked payload: first video within 1s",
+          r2["first"] is not None and r2["first"] < 1.0, r2["first"])
+    check("the switch reports done", job(("done",), 5).get("detail") == "Now playing golf1-HD",
+          app._source_jobs.get("srcteam"))
+
+    r2["stop"].set(); r2["done"].wait(10)
+    r3 = reader()
+    sid3, label = active()
+    check("the pick sticks across a later reconnect", label == "golf1-HD", label)
+    check("picking what is already playing just keeps it",
+          app._switch_source(sid3, E["B"])[0] == "ok"
+          and "already playing" in job(("done",), 2).get("detail", ""))
+    check("back to the normal order", app._clear_source_choice(sid3) == "ok"
+          and app._source_pins.get("srcteam") is None)
+    r3["stop"].set(); r3["done"].wait(10)
+    r4 = reader()
+    sid4, label = active()
+    check("the next start uses the normal order again", label == "admin1-HD", label)
+    r4["stop"].set(); r4["done"].wait(10)
+
+    app._source_pins["srcteam"] = {"embed_url": E["B"], "label": "golf1-HD",
+                                   "match_id": "m1", "set_at": time.time(),
+                                   "prepared": None, "prepared_at": 0}
+    with app._team_lock:
+        app._team_map["srcteam"]["match_id"] = "m2"
+    check("a new match drops the pick", app._source_pin("srcteam", "m2") is None)
+    with app._active_streams_lock:
+        app._active_streams["abcdef01"] = {"stream_id": "abcdef01", "hold_key": "url:x",
+                                           "embed_url": "x", "multiview": None}
+    try:
+        check("a ?url= stream has no source choice",
+              app._switch_source("abcdef01", E["A"])[0] == "not_team")
+    finally:
+        with app._active_streams_lock:
+            app._active_streams.pop("abcdef01", None)
+
+
 # ─── Rigs ─────────────────────────────────────────────────────────────────────
 
 HOOKS = ("download_begin", "download_attempt", "download_bytes", "download_end",
          "sending", "delivered", "playlist_begin", "playlist_failed",
          "playlist_ok", "loop_error", "end", "finish", "snapshot", "tick",
-         "recovery")
+         "recovery", "empty_chunk")
 
 
 def rig_hooks_raise(sh):
@@ -859,6 +1017,21 @@ def expect(results):
           not hg.get("by_cause") or max(hg["by_cause"].items(), key=lambda kv: kv[1])[0] == "playlist",
           hg.get("by_cause"))
 
+    section("empty chunks")
+    em, er_ = h.get("empty", {}), results.get("empty", {})
+    segs = er_.get("segments") or []
+    check("empty: the three placeholders counted", em.get("empty_chunks") == 3, em.get("empty_chunks"))
+    check("empty: two holes of their length, cause empty",
+          [(f["cause"], f["s"]) for f in em.get("freeze_list") or [] if f["cause"] == "empty"]
+          == [("empty", 1.0), ("empty", 2.0)], em.get("freeze_list"))
+    check("empty: not counted as dropped or skipped",
+          em.get("downloads_failed") == 0 and em.get("skipped") == 0,
+          (em.get("downloads_failed"), em.get("skipped")))
+    check("empty: none of the junk reached the player, chunks intact and in order",
+          er_.get("intact") is True and er_.get("trailing_bytes") == 0
+          and not {"A6", "A9", "A10"} & set(segs)
+          and [int(x[1:]) for x in segs] == sorted(int(x[1:]) for x in segs), segs)
+
     section("Phase 3 fixes did what the origin called for")
     ch = h.get("chunkhang", {})
 
@@ -916,6 +1089,8 @@ def compare(new, old, label_new, label_old, tol_max=1.0, tol_median=0.25, earlie
     section("video: %s vs %s" % (label_new, label_old))
     for name in sorted(set(new) | set(old)):
         a, b = new.get(name), old.get(name)
+        if a and not b and name in {x.name for x in scenario_defs() if x.new_only}:
+            continue
         if not a or not b:
             check("%s: present in both" % name, False)
             continue
@@ -1025,7 +1200,8 @@ def main():
         saved = (app.CHUNK_BACKUP_AFTER, app.PLAYLIST_BACKUP_AFTER, app.PLAYLIST_RETRY_DELAY)
         app.CHUNK_BACKUP_AFTER, app.PLAYLIST_BACKUP_AFTER, app.PLAYLIST_RETRY_DELAY = 0, 0, 2
         try:
-            off = run_scenarios(app, client, port, "fixes-off", FIX_SCENARIOS & (only or FIX_SCENARIOS))
+            off_names = FIX_SCENARIOS & (only or FIX_SCENARIOS)
+            off = run_scenarios(app, client, port, "fixes-off", off_names) if off_names else {}
         finally:
             app.CHUNK_BACKUP_AFTER, app.PLAYLIST_BACKUP_AFTER, app.PLAYLIST_RETRY_DELAY = saved
         result["runs"]["fixes_off"] = off
@@ -1035,13 +1211,17 @@ def main():
                   (rec.get("health") or {}).get("recoveries"))
 
         section("scenario, tracker fails to start")
+        if only and "errors" not in only:
+            print("  (skipped: --only)")
         undo = rig_tracker_fails(sh)
         try:
-            nostart = run_scenarios(app, client, port, "nostart", {"errors"}, health=False)
+            nostart = (run_scenarios(app, client, port, "nostart", {"errors"}, health=False)
+                       if not only or "errors" in only else {})
         finally:
             undo()
         result["runs"]["nostart"] = nostart
-        compare({"errors": tracked["errors"]}, nostart, "tracked", "no tracker")
+        if "errors" in tracked:
+            compare({"errors": tracked["errors"]}, nostart, "tracked", "no tracker")
 
         section("reconnect")
         sc = Scenario("reconnect", take=8)
@@ -1095,6 +1275,9 @@ def main():
         check("every one of them was IPv4 only",
               all(o == {CurlOpt.IPRESOLVE: 1} for _u, o in seen),
               [x for x in seen if x[1] != {CurlOpt.IPRESOLVE: 1}][:3])
+
+        section("manual source choice")
+        source_choice_tests(app, client, port)
 
         section("status endpoint")
         r = client.get("/api/streams/history?limit=5")

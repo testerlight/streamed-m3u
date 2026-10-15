@@ -79,6 +79,9 @@ LOW_CUSHION_S = 2.0
 # Used only when a playlist gives neither EXTINF nor a target duration.
 DEFAULT_DURATION_S = 4.0
 TIMELINE_MAX = 60
+# Recent chunks considered for the "sending empty chunks" warning.
+EMPTY_WINDOW = 20
+EMPTY_LOG_EVERY_S = 60.0
 FREEZE_LIST_MAX = 50
 SAMPLES_MAX = 5000
 HISTORY_KEEP = 500
@@ -149,6 +152,7 @@ CAUSES = {
     "source":   "Source not publishing",
     "playlist": "Playlist slow or failing",
     "internal": "Internal error",
+    "empty":    "Source sent empty chunks",
     "unknown":  "Unknown",
 }
 
@@ -158,6 +162,7 @@ END_REASONS = {
     "idle_timeout":      "Idle limit: no new video",
     "playlist_failures": "Playlist failed repeatedly",
     "fatal":             "Source link dead",
+    "source_switch":     "Switched source from the console",
 }
 
 # What the loop was doing -> what a freeze during it is blamed on. "sending"
@@ -521,6 +526,14 @@ class StreamHealth:
         self._poll_empty = False
         self.download_quiet_max = 0.0
         self.recoveries = {}         # Phase 3: kind -> outcome -> count
+        # Empty chunks: a 200 whose body is a tiny placeholder, not video
+        # (2026-10-14: one TikTok bucket answering with a 72-byte WebP). The
+        # picture skips the chunk's length, so each is a hole, never video.
+        self.empty_chunks = 0
+        self.empty_s = 0.0
+        self._recent = deque(maxlen=EMPTY_WINDOW)   # True = empty, per chunk
+        self._empty_run = False
+        self._empty_logged = None     # [last logged at, count since]
 
         self.end_reason = None
         self.end_detail = None
@@ -910,6 +923,8 @@ class StreamHealth:
                     and now - self._episode["last_end"] > self._merge_window()):
                 self._close_episode()
             self._last_dur = dur
+            self._recent.append(False)
+            self._empty_run = False
             self._cushion = cushion
             self._cushion_at = now
             self.video_s += dur
@@ -1062,6 +1077,75 @@ class StreamHealth:
         log.warning("%s: stream loop error, retrying in 2s: %s",
                     self._who(), msg, exc_info=exc)
 
+    # ── hooks: empty chunks (generator thread) ───────────────────────────────
+
+    @_guarded
+    def empty_chunk(self, url):
+        """The source answered with a placeholder instead of this chunk.
+
+        app.py drops it. The hole is the freeze: a run of empties is one
+        freeze of their combined length, cause "empty". The cushion *is*
+        credited with the hole, because the player's clock crosses it on a
+        frozen frame without needing data; leaving it out would count the
+        same seconds twice, once as the hole and again as starvation.
+        Logged once, then once a minute.
+        """
+        with self._lock:
+            now = self._now()
+            self._dl = None
+            dur, _seq, _disc = self._duration(_key(url))
+            if self._cushion_at is None:
+                cushion = dur
+            else:
+                empty_at = self._cushion_at + self._cushion
+                if now > empty_at:
+                    self._starved(empty_at, now)
+                    cushion = dur
+                else:
+                    cushion = (empty_at - now) + dur
+            self._cushion, self._cushion_at = cushion, now
+            self.empty_chunks += 1
+            self.empty_s += dur
+            self._failed_since += 1    # a known gap, not a skip
+            self._recent.append(True)
+            last = self.freezes[-1] if self.freezes else None
+            if self._empty_run and last is not None and last.get("cause") == "empty":
+                last["s"] = round(last["s"] + dur, 1)
+                last["span_s"] = round(last["span_s"] + dur, 1)
+                last["stalls"] += 1
+            else:
+                self.freeze_count += 1
+                if len(self.freezes) < FREEZE_LIST_MAX:
+                    self.freezes.append({"at_s": round(now - self.started, 1),
+                                         "s": round(dur, 1), "span_s": round(dur, 1),
+                                         "stalls": 1, "cause": "empty", "open": False,
+                                         "noticed_s": 0.0, "warned_by": []})
+            self._empty_run = True
+            self.frozen_s += dur
+            self.by_cause["empty"] = self.by_cause.get("empty", 0.0) + dur
+            run = self.freezes[-1]["s"] if self.freezes and self.freezes[-1].get("cause") == "empty" else dur
+            self.longest_freeze = max(self.longest_freeze, run)
+            seen = self._empty_logged
+            if seen is None:
+                self._empty_logged = [now, 0]
+                msg = ("Source sent an empty chunk (a placeholder, not video): dropped, "
+                       "the picture skips %.1fs. If it keeps happening, switch source "
+                       "in the console." % dur)
+                self._event("empty", msg, now)
+                text, level = msg, "warning"
+            elif now - seen[0] >= EMPTY_LOG_EVERY_S:
+                n = seen[1] + 1
+                self._empty_logged = [now, 0]
+                text = ("%d more empty chunk(s) in the last %.0fs (%d in total, %.0fs of "
+                        "video missing)" % (n, now - seen[0], self.empty_chunks, self.empty_s))
+                self._event("empty", text, now)
+                level = "info"
+            else:
+                seen[1] += 1
+                text = None
+        if text:
+            (log.warning if level == "warning" else log.info)("%s: %s", self._who(), text)
+
     # ── hooks: Phase 3 fixes (generator and download threads) ───────────────
 
     @_guarded
@@ -1162,6 +1246,10 @@ class StreamHealth:
             if self._label == "sending":
                 return "struggling", self._activity_text(now)
             return "frozen", self._activity_text(now)
+        empties = sum(1 for x in self._recent if x)
+        if empties:
+            return "struggling", ("Source sending empty chunks: %d of the last %d"
+                                  % (empties, len(self._recent)))
         if self._pl_run:
             return "struggling", self._activity_text(now)
         if self._active:
@@ -1264,6 +1352,10 @@ class StreamHealth:
                 "slow": self._pl_slow,
             },
             "download_quiet_max_s": _r(self.download_quiet_max),
+            "empty_chunks": self.empty_chunks,
+            "empty_s": _r(self.empty_s),
+            "empty_recent": {"empty": sum(1 for x in self._recent if x),
+                             "of": len(self._recent)},
             "recoveries": {k: dict(v) for k, v in self.recoveries.items()},
             "reconnect": None if r is None else {
                 k: (_r(v) if isinstance(v, float) else v)
@@ -1360,6 +1452,9 @@ def _summary_line(rec):
         parts.append("video %.1f Mbit/s over a %.1f Mbit/s link"
                      % (rec["video_mbit"], rec["link_mbit_median"]))
     jumps = (rec.get("backwards") or 0) + (rec.get("playlist_backwards") or 0)
+    if rec.get("empty_chunks"):
+        parts.append("%d empty chunk(s), %.0fs of video missing"
+                     % (rec["empty_chunks"], rec.get("empty_s") or 0))
     for n, label in ((rec.get("skipped"), "chunk(s) skipped"),
                      (jumps, "jump(s) back"),
                      (rec.get("downloads_failed"), "chunk(s) dropped"),
@@ -1533,7 +1628,8 @@ def totals(records):
     """Roll a list of history records up into what the console headlines."""
     out = {"streams": len(records), "seconds": 0.0, "freezes": 0,
            "frozen_s": 0.0, "by_cause": {}, "ended": {}, "reconnects": 0,
-           "replayed_chunks": 0, "skipped": 0, "with_freezes": 0}
+           "replayed_chunks": 0, "skipped": 0, "with_freezes": 0,
+           "empty_chunks": 0}
     det = {"streams": 0, "seconds": 0.0, "raised": 0, "hits": 0, "false": 0,
            "freezes_scored": 0, "missed": 0, "warned_ahead": 0, "by_kind": {}}
     noticed = []
@@ -1559,6 +1655,7 @@ def totals(records):
         out["freezes"] += r.get("freezes") or 0
         out["frozen_s"] += r.get("frozen_s") or 0
         out["skipped"] += r.get("skipped") or 0
+        out["empty_chunks"] += r.get("empty_chunks") or 0
         if r.get("freezes"):
             out["with_freezes"] += 1
         for k, v in (r.get("by_cause") or {}).items():

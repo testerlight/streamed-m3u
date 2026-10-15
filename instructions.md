@@ -1020,6 +1020,42 @@ streams' totals. Note what that does to Phase 2's score: a fix that prevents
 a freeze turns its warning into a "false alarm", so read the warning scores
 next to `recoveries`, not alone.
 
+**32. Some "chunks" are empty placeholders; the fix is a manual source pick.**
+Found 2026-10-14 on Brewers-Dodgers (admin 1): the source spreads chunks over
+several TikTok buckets, and one (`tos-alisg-i-50979-sg`) answers 200 with a
+72-byte empty WebP (`RIFF....WEBPVP8X`) instead of video, for ~30% of chunks,
+the same on every retry. The picture's clock skips exactly that chunk's EXTINF
+(verified with ffprobe: 4.00s, 8.01s for two, 4.96s for a 4.955s chunk), so
+each one is a pause, then the stream carries on. It used to pass every check:
+the response is a 200 whose length matches, so it was forwarded as 72 junk
+bytes and the tracker credited 4s of video ("no freezes"). The same thing on
+NFL Network had been misread as an unstripped wrapper.
+
+- `_is_empty_chunk`: under `EMPTY_CHUNK_MAX_BYTES` (64 KB) with no TS alignment.
+  A real chunk here is megabytes, and a wrapped one still aligns after its
+  wrapper (#17), so neither can match. `_fetch_once` returns None with
+  `empty` set, without retrying; the probe chunk is checked the same way. The
+  chunk is dropped and `H.empty_chunk` records a hole of its length (cause
+  `empty`, a run of empties is one freeze) and credits the cushion with it,
+  because the player crosses the hole on a frozen frame; not crediting it
+  counted the same seconds twice. The console warns "Empty chunks: N of the
+  last 20".
+- Only another source can fill the hole, and the user chose a manual pick
+  over automatic fallback. `POST /api/streams/<id>/source` checks the chosen
+  source on a thread (`_check_source`: the normal `_validate_candidate`, then
+  three chunks that must be real video, kept as primed) while the current
+  stream plays on. If it passes, the pick is stored for the channel and match
+  (`_source_pins`, with the checked payload) and the session ends *without*
+  the disconnect hold. Dispatcharr's own retry reconnects at once, the cascade
+  puts the pick first and takes the prepared payload, so no extraction runs
+  (first video in milliseconds in the harness). Every later reconnect tries
+  the pick first until the match id changes; `.../source/auto` clears it. A
+  pick that fails at a later reconnect falls back to the normal order. Picks
+  live in memory: a restart forgets them.
+- A next-source button was rejected: on the game that found this, the next
+  two sources down were dead (golf 1, hotel 1) and the good one was fourth
+  (admin 2, SD).
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when

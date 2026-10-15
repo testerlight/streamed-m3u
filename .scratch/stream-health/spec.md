@@ -233,8 +233,21 @@ count towards giving up, and puts the schedule back on the old 2s rhythm.
 - Real stream (NFL Network, 3 min): no freezes, no fix needed, playlist polls
   0.54s.
 
-### Found on the way, not fixed here
+### Found on the way
 
-Some chunks carry a 72-byte `RIFF....WEBPVP8X` wrapper that reaches the player
-unstripped (2-6 per 150s on NFL Network). The live image does the same, so it
-predates Phase 3. Worth its own look: `_strip_ts_prefix` should catch it.
+What looked like an unstripped 72-byte wrapper was a whole chunk: see below.
+
+## Empty chunks and the manual source pick (2026-10-14)
+
+Brewers-Dodgers, admin 1: "pausing a lot and then starting back up". Not this
+app's delivery (no freezes, cushion ~18s), not Dispatcharr or Jellyfin: one
+TikTok bucket answers ~30% of the source's chunks with a 72-byte empty WebP,
+every retry the same. Confirmed with ffprobe: the picture clock skips exactly
+each empty chunk's EXTINF. Sources for that game: admin 1 HD (30% empty), golf
+1 and 2 (no stream link), hotel 1 (no chunks), admin 2 SD (29/29 clean).
+
+Decisions (user): no automatic fallback. A source picker on the active stream
+(rather than a next-source button, which would have hit two dead sources
+first); check first, then switch; the pick sticks for the rest of the game;
+empty chunks detected, counted and flagged, never forwarded. Instructions
+gotcha #32.

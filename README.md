@@ -457,6 +457,8 @@ showing, and the old file is kept as `lineup.json.pre-allowlist`.
 | `/prewarm` | Pre-warm state per favourite |
 | `/stream/status` | Active streams with throughput and health |
 | `GET /api/streams/history` | Finished streams, newest first, with their health and totals |
+| `POST /api/streams/<id>/source` | Check one of the stream's match sources (`{"embed_url": ...}`) and, if its chunks are real video, restart the stream on it for the rest of the game (session and CSRF). Answers 202; progress is in `/stream/status`. |
+| `POST /api/streams/<id>/source/auto` | Forget the channel's source pick; the normal order applies from its next start (session and CSRF) |
 | `/api/overview`, `/api/config`, `/api/cache`, `/api/events` | Console data |
 | `PUT /api/settings` | Change settings (session and CSRF token required) |
 | `/playlist.m3u` | Legacy per-match playlist, kept as a fallback |
@@ -511,6 +513,16 @@ same chunks the original would have. Each stream's timeline and Recent streams
 list what fired and whether it won. Set `CHUNK_BACKUP_AFTER` or
 `PLAYLIST_BACKUP_AFTER` to 0, or `PLAYLIST_RETRY_DELAY` to 2, to switch one
 off.
+
+**Empty chunks and picking a source.** Some sources answer part of the time
+with an empty placeholder instead of a chunk; the picture pauses for that
+chunk's length, then carries on. Those are now dropped, counted as missing
+video, and flagged on the stream ("Empty chunks: 7 of the last 20"). Nothing
+switches by itself: the stream's **Source** button lists the game's sources,
+and **Switch** checks the one you pick while the current one keeps playing. Only
+if its chunks are real video does the stream restart on it, with a pause of a
+few seconds; it then stays that channel's source until the game ends, or until
+**Back to the normal order**.
 
 ## Limitations
 
