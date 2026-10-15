@@ -1,6 +1,6 @@
 # Stream health
 
-Status: Phases 1 and 2 deployed 2026-10-13/14; Phase 3 built 2026-10-14.
+Status: Phase 1 deployed 2026-10-13; Phase 2 built 2026-10-14. Phase 3 gated.
 
 Second attempt. The first (2026-10-10) shipped detection and automatic
 recovery together with the lineup allowlist, made buffering worse, and was
@@ -10,8 +10,9 @@ time, each running on real games before the next starts.
 1. **Show what's happening** (this spec): watch only.
 2. **Notice freezes faster**: early warnings, scored, never acted on. See
    "Phase 2" below.
-3. **Fix it without dropping the viewer**: backup requests and a quick first
-   retry. See "Phase 3" below.
+3. **Fix it without dropping the viewer**: not designed yet. Also depends on
+   Phase 1's data; if freezes turn out to be mostly VPN slowness, the right fix
+   may not be in this code at all.
 
 ## Lessons from the first attempt
 
@@ -185,69 +186,3 @@ Decisions (user, 2026-10-14):
 
 The Phase 3 gate is unchanged. The next games will show what freezes remain
 once polls are fast; the playlist 500s are the candidate after that.
-
-## Phase 3: fix it without dropping the viewer (2026-10-14)
-
-### Evidence it was built on
-
-After the IPv4 change: four streams, ~75 minutes, playlist polls 0.53s.
-
-- lask, 14:33: one chunk download went silent until its 30s timeout. 18.6s
-  freeze, 5 chunks (16s) skipped. `download_quiet` warned 6s ahead; the
-  automatic retry then fetched the same chunk in 0.17s.
-- lask, 13:34: playlist request hung, then HTTP 500 twice; 2s waits between
-  retries. 5.5s freeze. Same pattern as 6 of NFL Network's 7 freezes.
-- Scores: `playlist_slow` 2/2 hits, `playlist_failing` 2/2, `download_quiet`
-  1/5, `source_quiet` 1/33, `too_slow` 0/1.
-
-### Decisions (user, 2026-10-14)
-
-- Fixes: backup chunk request, backup playlist request, quick first retry.
-  Not: keepalives during playlist polls (no video, low value at 0.5s), lower
-  quality or another source (their warnings scored 0/1 and 1/33, and switching
-  mid-stream is what made the first attempt worse).
-- Shipped together, each with its own live off switch and its outcomes
-  recorded per stream, so each one's effect is measured directly.
-- Gate accepted as met on the evidence above. Deploy when idle.
-
-### What it does
-
-| Fix | When | Setting |
-|-----|------|---------|
-| Backup chunk request | download received nothing for 4s | `CHUNK_BACKUP_AFTER` (0 = off) |
-| Backup playlist request | 3s past the stream's median request (4s until ten seen) | `PLAYLIST_BACKUP_AFTER` (0 = off) |
-| Quick first retry | first playlist error in a row: 0.5s, not 2s | `PLAYLIST_RETRY_DELAY` (2 = off) |
-
-Rules: a request is added, never replaced; the first complete answer wins; if
-both fail the original's failure is what counts; a failed quick retry does not
-count towards giving up, and puts the schedule back on the old 2s rhythm.
-
-### Proof before deploy
-
-- Every scenario: chunks intact and in order. Where no fix fires, byte-identical
-  and timing-identical to the live image. Where one fires: never a chunk
-  missing that the old code delivered, never later by more than one poll, up
-  to 21s earlier (chunkhang: 25s stall froze 2.1s instead, and the 5 chunks the
-  old code skipped were delivered). Every fix off: identical to the live image.
-- Slow-but-flowing downloads, a quiet source and a steady stream fire nothing.
-- Real stream (NFL Network, 3 min): no freezes, no fix needed, playlist polls
-  0.54s.
-
-### Found on the way
-
-What looked like an unstripped 72-byte wrapper was a whole chunk: see below.
-
-## Empty chunks and the manual source pick (2026-10-14)
-
-Brewers-Dodgers, admin 1: "pausing a lot and then starting back up". Not this
-app's delivery (no freezes, cushion ~18s), not Dispatcharr or Jellyfin: one
-TikTok bucket answers ~30% of the source's chunks with a 72-byte empty WebP,
-every retry the same. Confirmed with ffprobe: the picture clock skips exactly
-each empty chunk's EXTINF. Sources for that game: admin 1 HD (30% empty), golf
-1 and 2 (no stream link), hotel 1 (no chunks), admin 2 SD (29/29 clean).
-
-Decisions (user): no automatic fallback. A source picker on the active stream
-(rather than a next-source button, which would have hit two dead sources
-first); check first, then switch; the pick sticks for the rest of the game;
-empty chunks detected, counted and flagged, never forwarded. Instructions
-gotcha #32.

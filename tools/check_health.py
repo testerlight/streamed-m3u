@@ -1,4 +1,4 @@
-"""Stream health (Phases 1-3) verification. Not shipped.
+"""Stream health (Phases 1 and 2) verification. Not shipped.
 
 Runs inside an image, with the script bind mounted, against the real app.py:
 
@@ -18,14 +18,7 @@ Runs inside an image, with the script bind mounted, against the real app.py:
 Both phases are watch-only, so the claim to prove is that **nothing the
 proxy sends changed**. Phase 2 adds a watcher thread raising early warnings;
 the tracked run checks each misbehaviour raises the warning it should, and
-the rigged run makes the watcher's tick() raise too.
-
-Phase 3 does change *when* video arrives, never *what*: backup requests fetch
-the same chunk or playlist, so the video must still be byte-identical to the
-old image's in every scenario. In the scenarios where a fix should fire
-(FIX_SCENARIOS) the new image may deliver earlier, never later; everywhere
-else timing must match both ways. With every fix switched off, timing must
-match the old image in the fix scenarios too. Each scenario pulls the real /stream route from a fake HLS
+the rigged run makes the watcher's tick() raise too. Each scenario pulls the real /stream route from a fake HLS
 origin on 127.0.0.1 that misbehaves the messy way real sources do: slow
 chunks, a source that stalls and then jumps ahead, playlist error bursts, a
 chunk that stalls halfway, a truncated chunk, a sequence that restarts lower,
@@ -93,18 +86,17 @@ class Scenario:
 
     def __init__(self, name, take, slow=None, stall=None, pl_errors=None,
                  seg_fail=None, restart=None, end=None, window=LONG_WINDOW,
-                 pl_hang=None, new_only=False):
+                 pl_hang=None):
         self.name = name
         self.take = take            # chunks to pull before hanging up
         self.slow = slow            # (first, last, seconds per chunk)
         self.stall = stall          # (start_s, end_s, jump)
         self.pl_errors = pl_errors  # (start_s, end_s)
-        self.seg_fail = seg_fail or {}   # seq -> "503" | "midstall" | "short" | "hang" | "empty"
+        self.seg_fail = seg_fail or {}   # seq -> "503" | "midstall" | "short"
         self.restart = restart      # time the sequence restarts lower
         self.end = end              # time the broadcast ends (ENDLIST)
         self.window_len = window    # chunks listed once past the probe
         self.pl_hang = pl_hang      # (start_s, end_s, delay): requests in it hang
-        self.new_only = new_only    # not run against the old image
         self.reset()
 
     def reset(self):
@@ -157,8 +149,6 @@ class Scenario:
         return 200, "\n".join(lines) + "\n"
 
 
-PLACEHOLDER = b"RIFF" + struct.pack("<I", 64) + b"WEBPVP8X" + b"\x00" * 56
-
 MASTER = ("#EXTM3U\n"
           "#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080\nv1/index.m3u8\n"
           "#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=960x540\nv2/index.m3u8\n")
@@ -201,12 +191,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, b"", "text/plain")
 
     def _segment(self, sc, seq, body, attempt):
-        fail = sc.seg_fail.get(seq)
-        if fail == "empty":
-            # 2026-10-14: a 200 with a 72-byte empty WebP, every attempt.
-            return self._send(200, PLACEHOLDER, "image/webp")
-        if attempt != 1:
-            fail = None
+        fail = sc.seg_fail.get(seq) if attempt == 1 else None
         if fail == "503":
             return self._send(503, b"busy", "text/plain")
         self.send_response(200)
@@ -224,11 +209,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            return
-        if fail == "hang":
-            self.wfile.flush()
-            time.sleep(25.0)
-            self.wfile.write(body)
             return
         if fail == "midstall":
             self.wfile.write(body[:half])
@@ -273,18 +253,7 @@ def scenario_defs():
         # A playlist request hangs for 7s and then answers: the failure
         # behind all three long freezes of 2026-10-13 (there for ~15s).
         Scenario("hang", take=18, pl_hang=(6.0, 7.0, 7.0)),
-        # A chunk's first request sends headers, then nothing for 25s: the
-        # 2026-10-14 stall that froze lask for 18.6s (its retry took 0.17s).
-        Scenario("chunkhang", take=14, seg_fail={8: "hang"}),
-        # Chunks 6, 9 and 10 come back as 72-byte placeholders, every time.
-        # The old image forwards the junk, so this runs on the new one only.
-        Scenario("empty", take=12, seg_fail={6: "empty", 9: "empty", 10: "empty"},
-                 new_only=True),
     ]
-
-
-# Scenarios where a Phase 3 fix should fire, so the new image may be earlier.
-FIX_SCENARIOS = {"errors", "hang", "chunkhang"}
 
 
 # ─── Pulling through the real app ─────────────────────────────────────────────
@@ -310,11 +279,7 @@ def pull(app, client, embed, take, max_s=60.0):
     finally:
         resp.close()
     whole = bytes(data[:len(marks) * SEG_BYTES])
-    ids = [seg_id(whole[i:i + SEG_BYTES]) for i in range(0, len(whole), SEG_BYTES)]
-    intact = all(whole[i * SEG_BYTES:(i + 1) * SEG_BYTES]
-                 == seg_body(int(sid[1:]), sid[0].encode()) for i, sid in enumerate(ids))
     return {
-        "intact": intact,
         "status": 200,
         "segments": [seg_id(whole[i:i + SEG_BYTES])
                      for i in range(0, len(whole), SEG_BYTES)],
@@ -330,8 +295,6 @@ def run_scenarios(app, client, port, label, only=None, health=True):
     out = {}
     for sc in scenario_defs():
         if only and sc.name not in only:
-            continue
-        if sc.new_only and label == "baseline":
             continue
         key = "%s-%s" % (sc.name, label)
         SCENARIOS[key] = sc
@@ -736,27 +699,6 @@ def unit_tests(app):
     check("frozen in playlist errors: would fetch a fresh link, not try another source",
           r._alarm is not None and "fresh stream link" in r._alarm["would"], r._alarm)
 
-    section("Phase 3 records")
-    T[0] = 8000.0
-    k = sh.StreamHealth("k1", "", "k", "", clock=clock)
-    k.recovery("chunk_backup", "fired", "download silent for 4s")
-    k.recovery("chunk_backup", "won", "backup finished 0.2s after the backup started")
-    k.recovery("quick_retry", "fired"); k.recovery("quick_retry", "ok")
-    snap = k.snapshot()
-    check("fixes counted by kind and outcome",
-          snap["recoveries"] == {"chunk_backup": {"fired": 1, "won": 1},
-                                 "quick_retry": {"fired": 1, "ok": 1}}, snap["recoveries"])
-    check("fixes on the timeline",
-          any(e["kind"] == "recovery" and "Backup chunk request won" in e["text"]
-              for e in snap["timeline"]), [e["text"] for e in snap["timeline"]])
-    k.finish(); sh.HISTORY.flush()
-    kr = [r for r in sh.HISTORY.read(50) if r["id"] == "k1"][0]
-    check("fixes in the record and the summary line",
-          kr["recoveries"]["chunk_backup"]["won"] == 1
-          and "backup chunk request" in sh._summary_line(kr), sh._summary_line(kr))
-    check("totals add fixes across streams",
-          sh.totals([kr, kr])["recoveries"]["chunk_backup"] == {"fired": 2, "won": 2})
-
     section("watcher")
     t = sh.track("w3", "team:z", "z", "", clock=time.time)
     check("track() registers with the watcher", t in sh._live and sh._watcher.is_alive())
@@ -782,156 +724,11 @@ def unit_tests(app):
     check("the stand-in swallows every hook", n.delivered("x", 1) is None and n.snapshot() is None)
 
 
-# ─── Manual source choice ─────────────────────────────────────────────────────
-
-def source_choice_tests(app, client, port):
-    """The console picker against four fake sources for one match: A works,
-    B works, C sends only empty placeholders, D cannot be extracted."""
-    base = "http://127.0.0.1:%d/" % port
-    for key, fail in (("srcA", None), ("srcB", None),
-                      ("srcC", {n: "empty" for n in range(400)})):
-        SCENARIOS[key] = Scenario(key, take=10 ** 6, seg_fail=fail)
-        SCENARIOS[key].reset()
-    E = {k: "http://fake-embed.test/source-%s" % k for k in "ABCD"}
-    urls = {E["A"]: base + "srcA/master.m3u8", E["B"]: base + "srcB/master.m3u8",
-            E["C"]: base + "srcC/master.m3u8", E["D"]: None}
-    app.extract_m3u8_via_browser = (
-        lambda e, *a, **k: {"url": urls[e], "headers": {}, "cookies": {},
-                            "browser_m3u8_status": 200} if urls.get(e) else None)
-    with app._team_lock:
-        app._team_roster["srcteam"] = {"name": "Src Team", "kind": "team", "sport": "test"}
-        app._team_map["srcteam"] = {
-            "team": "Src Team", "away": "Test", "category": "Live", "sport": "test",
-            "poster": "", "starts": int(time.time() * 1000), "kind": "team", "side": "home",
-            "match_id": "m1", "match_title": "Src vs Test",
-            "streams": [{"embed_url": E["A"], "source": "admin", "stream_no": 1, "hd": True},
-                        {"embed_url": E["B"], "source": "golf", "stream_no": 1, "hd": True},
-                        {"embed_url": E["C"], "source": "hotel", "stream_no": 1, "hd": True},
-                        {"embed_url": E["D"], "source": "admin", "stream_no": 2, "hd": False}]}
-
-    def reader():
-        out = {"first": None, "done": threading.Event(), "stop": threading.Event(),
-               "t0": time.time()}
-
-        def run():
-            resp = client.get("/stream?team=srcteam", buffered=False)
-            out["status"] = resp.status_code
-            try:
-                for item in resp.response:
-                    if item != app.TS_NULL_PACKET and out["first"] is None:
-                        out["first"] = time.time() - out["t0"]
-                    if out["stop"].is_set():
-                        break
-            finally:
-                resp.close()
-                out["done"].set()
-        threading.Thread(target=run, daemon=True).start()
-        return out
-
-    def active(timeout=20.0, label=None):
-        end = time.time() + timeout
-        while time.time() < end:
-            with app._active_streams_lock:
-                for r in app._active_streams.values():
-                    if r.get("hold_key") == "team:srcteam" and (
-                            label is None or r.get("source_label") == label):
-                        return r["stream_id"], r.get("source_label")
-            time.sleep(0.1)
-        return None, None
-
-    def job(states, timeout=40.0):
-        end = time.time() + timeout
-        while time.time() < end:
-            j = app._source_jobs.get("srcteam")
-            if j and j["state"] in states:
-                return dict(j)
-            time.sleep(0.1)
-        return dict(app._source_jobs.get("srcteam") or {})
-
-    r1 = reader()
-    sid, label = active()
-    check("a channel starts on the first source", label == "admin1-HD", label)
-    st = client.get("/stream/status").get_json()
-    view = next((x.get("source") for x in st["streams"] if x["stream_id"] == sid), None) or {}
-    check("/stream/status lists the match's four sources, the playing one marked",
-          len(view.get("options") or []) == 4
-          and [o["label"] for o in view["options"] if o["playing"]] == ["admin1-HD"], view)
-
-    check("a dead source is accepted for checking", app._switch_source(sid, E["D"])[0] == "ok")
-    j = job(("failed", "switching", "done"))
-    check("a dead source fails its check, in words", j.get("state") == "failed"
-          and "no stream link" in j.get("detail", ""), j)
-    check("and the stream is untouched", active(1)[0] == sid and not r1["done"].is_set())
-
-    app._switch_source(sid, E["C"])
-    j = job(("failed", "switching", "done"))
-    check("a source sending empty placeholders fails its check",
-          j.get("state") == "failed" and "empty" in j.get("detail", ""), j)
-    check("and the stream is still untouched", active(1)[0] == sid and not r1["done"].is_set())
-
-    check("an unknown source is refused", app._switch_source(sid, "http://elsewhere/x")[0]
-          == "unknown_source")
-    r = client.post("/api/streams/%s/source" % sid, json={})
-    check("the API wants an embed_url", r.status_code == 400, r.status_code)
-
-    check("a good source is accepted", app._switch_source(sid, E["B"])[0] == "ok")
-    check("a second switch while one runs is refused",
-          app._switch_source(sid, E["A"])[0] == "busy")
-    j = job(("switching", "failed", "done"))
-    check("the good source passes its check", j.get("state") in ("switching", "done"), j)
-    r1["done"].wait(10)
-    check("the old stream ended", r1["done"].is_set())
-    check("without a disconnect hold, so the reconnect is let in",
-          not app._disconnect_held("team:srcteam"))
-    r2 = reader()                                   # what Dispatcharr does next
-    sid2, label = active(label="golf1-HD")
-    deadline = time.time() + 5
-    while r2["first"] is None and time.time() < deadline:
-        time.sleep(0.05)
-    check("the reconnect plays the picked source", label == "golf1-HD", label)
-    check("from the checked payload: first video within 1s",
-          r2["first"] is not None and r2["first"] < 1.0, r2["first"])
-    check("the switch reports done", job(("done",), 5).get("detail") == "Now playing golf1-HD",
-          app._source_jobs.get("srcteam"))
-
-    r2["stop"].set(); r2["done"].wait(10)
-    r3 = reader()
-    sid3, label = active()
-    check("the pick sticks across a later reconnect", label == "golf1-HD", label)
-    check("picking what is already playing just keeps it",
-          app._switch_source(sid3, E["B"])[0] == "ok"
-          and "already playing" in job(("done",), 2).get("detail", ""))
-    check("back to the normal order", app._clear_source_choice(sid3) == "ok"
-          and app._source_pins.get("srcteam") is None)
-    r3["stop"].set(); r3["done"].wait(10)
-    r4 = reader()
-    sid4, label = active()
-    check("the next start uses the normal order again", label == "admin1-HD", label)
-    r4["stop"].set(); r4["done"].wait(10)
-
-    app._source_pins["srcteam"] = {"embed_url": E["B"], "label": "golf1-HD",
-                                   "match_id": "m1", "set_at": time.time(),
-                                   "prepared": None, "prepared_at": 0}
-    with app._team_lock:
-        app._team_map["srcteam"]["match_id"] = "m2"
-    check("a new match drops the pick", app._source_pin("srcteam", "m2") is None)
-    with app._active_streams_lock:
-        app._active_streams["abcdef01"] = {"stream_id": "abcdef01", "hold_key": "url:x",
-                                           "embed_url": "x", "multiview": None}
-    try:
-        check("a ?url= stream has no source choice",
-              app._switch_source("abcdef01", E["A"])[0] == "not_team")
-    finally:
-        with app._active_streams_lock:
-            app._active_streams.pop("abcdef01", None)
-
-
 # ─── Rigs ─────────────────────────────────────────────────────────────────────
 
 HOOKS = ("download_begin", "download_attempt", "download_bytes", "download_end",
          "sending", "delivered", "playlist_begin", "playlist_failed",
-         "playlist_ok", "loop_error", "end", "finish", "snapshot", "tick",
-         "recovery", "empty_chunk")
+         "playlist_ok", "loop_error", "end", "finish", "snapshot", "tick")
 
 
 def rig_hooks_raise(sh):
@@ -990,8 +787,8 @@ def expect(results):
           sa.get("skipped"))
     check("errors: playlist errors counted", (er.get("playlist_errors") or 0) >= 1,
           er.get("playlist_errors"))
-    check("errors: any freeze is blamed on the download or the playlist",
-          set(er.get("by_cause") or {}) <= {"stalled", "slow", "playlist"}, er.get("by_cause"))
+    check("errors: the halfway stall is blamed as stalled",
+          (er.get("by_cause") or {}).get("stalled", 0) > 0, er.get("by_cause"))
     check("errors: nothing dropped", er.get("downloads_failed") == 0, er.get("downloads_failed"))
     check("restart: playlist went backwards", (rs.get("playlist_backwards") or 0) >= 1,
           rs.get("playlist_backwards"))
@@ -1013,55 +810,13 @@ def expect(results):
           sa.get("warning_list"))
     check("errors: the halfway stall raised download_quiet", "download_quiet" in kinds(er),
           er.get("warning_list"))
-    check("hang: any freeze is blamed on the playlist",
-          not hg.get("by_cause") or max(hg["by_cause"].items(), key=lambda kv: kv[1])[0] == "playlist",
+    check("hang: froze, blamed on the playlist",
+          max((hg.get("by_cause") or {"x": 0}).items(), key=lambda kv: kv[1])[0] == "playlist",
           hg.get("by_cause"))
-
-    section("empty chunks")
-    em, er_ = h.get("empty", {}), results.get("empty", {})
-    segs = er_.get("segments") or []
-    check("empty: the three placeholders counted", em.get("empty_chunks") == 3, em.get("empty_chunks"))
-    check("empty: two holes of their length, cause empty",
-          [(f["cause"], f["s"]) for f in em.get("freeze_list") or [] if f["cause"] == "empty"]
-          == [("empty", 1.0), ("empty", 2.0)], em.get("freeze_list"))
-    check("empty: not counted as dropped or skipped",
-          em.get("downloads_failed") == 0 and em.get("skipped") == 0,
-          (em.get("downloads_failed"), em.get("skipped")))
-    check("empty: none of the junk reached the player, chunks intact and in order",
-          er_.get("intact") is True and er_.get("trailing_bytes") == 0
-          and not {"A6", "A9", "A10"} & set(segs)
-          and [int(x[1:]) for x in segs] == sorted(int(x[1:]) for x in segs), segs)
-
-    section("Phase 3 fixes did what the origin called for")
-    ch = h.get("chunkhang", {})
-
-    def fixes(rec, kind):
-        return (rec.get("recoveries") or {}).get(kind) or {}
-    check("chunkhang: a backup chunk request started and won",
-          fixes(ch, "chunk_backup").get("won", 0) >= 1, ch.get("recoveries"))
-    check("chunkhang: the 25s stall froze for under 4s",
-          (ch.get("longest_freeze_s") or 0) < 4, ch.get("freeze_list"))
-    check("every pull delivered intact chunks",
-          all(v.get("intact") is True for v in results.values()),
-          [k for k, v in results.items() if v.get("intact") is not True])
-    check("chunkhang: nothing dropped, nothing skipped",
-          ch.get("downloads_failed") == 0 and ch.get("skipped") == 0,
-          (ch.get("downloads_failed"), ch.get("skipped")))
-    check("hang: a backup playlist request started and won",
-          fixes(hg, "playlist_backup").get("won", 0) >= 1, hg.get("recoveries"))
-    check("hang: the 7s hang froze for under 4.5s (6s without the fix)",
-          (hg.get("longest_freeze_s") or 0) < 4.5, hg.get("freeze_list"))
-    check("errors: the first playlist error was retried quickly",
-          fixes(er, "quick_retry").get("fired", 0) >= 1, er.get("recoveries"))
-    check("errors: the halfway stall got a backup that won",
-          fixes(er, "chunk_backup").get("won", 0) >= 1, er.get("recoveries"))
-    check("slow: slow but flowing downloads never get a backup",
-          not fixes(sl, "chunk_backup"), sl.get("recoveries"))
-    check("steady: no fix fired", not st.get("recoveries"), st.get("recoveries"))
-    check("stall: a source with nothing new triggers no backup",
-          not fixes(sa, "chunk_backup") and not fixes(sa, "playlist_backup"), sa.get("recoveries"))
-    check("hang: the slow poll is in the playlist figures",
-          ((hg.get("playlist_fetch") or {}).get("max_s") or 0) >= 3.9, hg.get("playlist_fetch"))
+    check("hang: playlist_slow raised and hit", "playlist_slow" in kinds(hg, True),
+          hg.get("warning_list"))
+    check("hang: the slow request is in the playlist figures",
+          ((hg.get("playlist_fetch") or {}).get("max_s") or 0) >= 6, hg.get("playlist_fetch"))
     # A single stall raises the alarm within FREEZE_MIN_S plus a tick or two.
     # One barely over FREEZE_MIN_S can end before any tick sees it: a miss,
     # recorded as such. A stutter of sub-second stalls never trips the alarm;
@@ -1085,45 +840,18 @@ def expect(results):
               and det.get("missed") == sum(1 for f in fl if f.get("noticed_s") is None), det)
 
 
-def compare(new, old, label_new, label_old, tol_max=1.0, tol_median=0.25, earlier_ok=()):
+def compare(new, old, label_new, label_old, tol_max=1.0, tol_median=0.25):
     section("video: %s vs %s" % (label_new, label_old))
     for name in sorted(set(new) | set(old)):
         a, b = new.get(name), old.get(name)
-        if a and not b and name in {x.name for x in scenario_defs() if x.new_only}:
-            continue
         if not a or not b:
             check("%s: present in both" % name, False)
             continue
         same = a.get("digest") == b.get("digest") and a.get("segments") == b.get("segments")
-        if not same and name in earlier_ok:
-            # A fix may fetch chunks the old code let slide out of the
-            # playlist. Allowed: every chunk intact, in order, and none the
-            # old code delivered (up to where the new pull stopped) missing.
-            sa, sb = a.get("segments") or [], b.get("segments") or []
-            seq = [int(x[1:]) for x in sa]
-            last = max(seq) if seq else -1
-            missing = [x for x in sb if x[0] == "A" and int(x[1:]) <= last and x not in sa]
-            ok = (a.get("intact") is True and seq == sorted(set(seq)) and not missing)
-            check("%s: same chunks, intact and in order, plus %d the old code skipped"
-                  % (name, len(set(sa) - set(sb))), ok,
-                  "missing %s; new %s; old %s" % (missing, sa[:20], sb[:20]))
-        else:
-            check("%s: byte-identical video (%d chunks)" % (name, len(a.get("segments") or [])),
-                  same, "%s vs %s" % ((a.get("segments") or [])[:30], (b.get("segments") or [])[:30])
-                  if not same else "")
+        check("%s: byte-identical video (%d chunks)" % (name, len(a.get("segments") or [])),
+              same, "%s vs %s" % ((a.get("segments") or [])[:30], (b.get("segments") or [])[:30])
+              if not same else "")
         ma, mb = a.get("marks") or [], b.get("marks") or []
-        if name in earlier_ok:
-            # Once a fix has caught up, the 2s playlist polls fall at other
-            # moments than the old code's, so a chunk published just before
-            # an old poll can land one poll later than it did. Allowed: no
-            # chunk later than one poll interval, and earlier on the median.
-            late = sorted(x - y for x, y in zip(ma, mb))
-            if late:
-                med = late[len(late) // 2]
-                check("%s: earlier on the median (%+.2fs), never a poll later (worst %+.2fs), "
-                      "up to %.1fs earlier" % (name, med, late[-1], -late[0]),
-                      med <= tol_median and late[-1] <= 2.0 + tol_median)
-            continue
         deltas = sorted(abs(x - y) for x, y in zip(ma, mb))
         if deltas:
             med = deltas[len(deltas) // 2]
@@ -1145,12 +873,7 @@ def main():
     if args.compare:
         new = json.load(open(args.compare[0]))
         old = json.load(open(args.compare[1]))
-        compare(new["runs"]["tracked"], old["runs"]["baseline"], "new image", "old image",
-                earlier_ok=FIX_SCENARIOS)
-        if "fixes_off" in new["runs"]:
-            compare(new["runs"]["fixes_off"], {k: v for k, v in old["runs"]["baseline"].items()
-                                               if k in new["runs"]["fixes_off"]},
-                    "new image, every fix off", "old image")
+        compare(new["runs"]["tracked"], old["runs"]["baseline"], "new image", "old image")
         print("\n%s" % ("ALL PASS" if not fails else "FAILED: %s" % ", ".join(fails)))
         sys.exit(1 if fails else 0)
 
@@ -1196,32 +919,14 @@ def main():
         result["runs"]["rigged"] = rigged
         compare(tracked, rigged, "tracked", "hooks raising")
 
-        section("scenarios with every Phase 3 fix switched off")
-        saved = (app.CHUNK_BACKUP_AFTER, app.PLAYLIST_BACKUP_AFTER, app.PLAYLIST_RETRY_DELAY)
-        app.CHUNK_BACKUP_AFTER, app.PLAYLIST_BACKUP_AFTER, app.PLAYLIST_RETRY_DELAY = 0, 0, 2
-        try:
-            off_names = FIX_SCENARIOS & (only or FIX_SCENARIOS)
-            off = run_scenarios(app, client, port, "fixes-off", off_names) if off_names else {}
-        finally:
-            app.CHUNK_BACKUP_AFTER, app.PLAYLIST_BACKUP_AFTER, app.PLAYLIST_RETRY_DELAY = saved
-        result["runs"]["fixes_off"] = off
-        for name, rec in off.items():
-            check("%s with fixes off: none fired" % name,
-                  not ((rec.get("health") or {}).get("recoveries")),
-                  (rec.get("health") or {}).get("recoveries"))
-
         section("scenario, tracker fails to start")
-        if only and "errors" not in only:
-            print("  (skipped: --only)")
         undo = rig_tracker_fails(sh)
         try:
-            nostart = (run_scenarios(app, client, port, "nostart", {"errors"}, health=False)
-                       if not only or "errors" in only else {})
+            nostart = run_scenarios(app, client, port, "nostart", {"errors"}, health=False)
         finally:
             undo()
         result["runs"]["nostart"] = nostart
-        if "errors" in tracked:
-            compare({"errors": tracked["errors"]}, nostart, "tracked", "no tracker")
+        compare({"errors": tracked["errors"]}, nostart, "tracked", "no tracker")
 
         section("reconnect")
         sc = Scenario("reconnect", take=8)
@@ -1275,9 +980,6 @@ def main():
         check("every one of them was IPv4 only",
               all(o == {CurlOpt.IPRESOLVE: 1} for _u, o in seen),
               [x for x in seen if x[1] != {CurlOpt.IPRESOLVE: 1}][:3])
-
-        section("manual source choice")
-        source_choice_tests(app, client, port)
 
         section("status endpoint")
         r = client.get("/api/streams/history?limit=5")

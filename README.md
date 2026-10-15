@@ -390,9 +390,6 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `SEGMENT_RETRIES` | `1` | live | Extra attempts for a failed chunk. Small on purpose: retries drag the live edge. |
 | `SEGMENT_MAX_MB` | `64` | live | Sanity cap on a buffered chunk, since chunks are held in RAM before forwarding. |
 | `UPSTREAM_IPV4` | `on` | live | Reach stream sources over IPv4 only. Behind the VPN, an IPv6 lookup costs about 2s per request and the IPv6 route bypasses the tunnel. |
-| `CHUNK_BACKUP_AFTER` | `4.0` | live | Seconds a chunk download may receive nothing before a second request for the same chunk starts alongside it; the first to finish is used. 0 turns it off. |
-| `PLAYLIST_BACKUP_AFTER` | `3.0` | live | Seconds past a stream's usual playlist request before a second one is sent alongside it; the first answer is used. 0 turns it off. |
-| `PLAYLIST_RETRY_DELAY` | `0.5` | live | Wait before retrying after the first playlist error in a row; later errors wait 2s. 2 or more restores the old behaviour. |
 | `STREAM_IDLE_TIMEOUT` | `45` | live | Seconds without a new segment before a stream is treated as dead. |
 | `STREAM_KEEPALIVE_INTERVAL` | `1.0` | live | Seconds between null packets sent while waiting on a slow chunk, so the client does not give up. |
 | `STREAM_SEEN_MAX` | `300` | live | Segment URLs remembered per stream, bounding memory on long sessions. |
@@ -457,8 +454,6 @@ showing, and the old file is kept as `lineup.json.pre-allowlist`.
 | `/prewarm` | Pre-warm state per favourite |
 | `/stream/status` | Active streams with throughput and health |
 | `GET /api/streams/history` | Finished streams, newest first, with their health and totals |
-| `POST /api/streams/<id>/source` | Check one of the stream's match sources (`{"embed_url": ...}`) and, if its chunks are real video, restart the stream on it for the rest of the game (session and CSRF). Answers 202; progress is in `/stream/status`. |
-| `POST /api/streams/<id>/source/auto` | Forget the channel's source pick; the normal order applies from its next start (session and CSRF) |
 | `/api/overview`, `/api/config`, `/api/cache`, `/api/events` | Console data |
 | `PUT /api/settings` | Change settings (session and CSRF token required) |
 | `/playlist.m3u` | Legacy per-match playlist, kept as a fallback |
@@ -498,31 +493,6 @@ Health badge and in the log, with what an automatic fix *would* do. Nothing
 acts on it yet. Recent streams scores them: how many freezes were **warned
 ahead**, how many were missed, and how many warnings were **false alarms**
 because no freeze followed.
-
-**Automatic fixes.** Two warnings now act, each with its own setting:
-
-- A chunk download that has received nothing for 4 seconds gets a **backup
-  request** for the same chunk, alongside it. Whichever finishes first is used.
-  A download that is slow but still receiving data is left alone.
-- A playlist request running 3 seconds longer than usual for that stream gets
-  a backup request alongside it, and after the first playlist error the retry
-  comes after half a second instead of two.
-
-Neither ever abandons the original request, and the video they deliver is the
-same chunks the original would have. Each stream's timeline and Recent streams
-list what fired and whether it won. Set `CHUNK_BACKUP_AFTER` or
-`PLAYLIST_BACKUP_AFTER` to 0, or `PLAYLIST_RETRY_DELAY` to 2, to switch one
-off.
-
-**Empty chunks and picking a source.** Some sources answer part of the time
-with an empty placeholder instead of a chunk; the picture pauses for that
-chunk's length, then carries on. Those are now dropped, counted as missing
-video, and flagged on the stream ("Empty chunks: 7 of the last 20"). Nothing
-switches by itself: the stream's **Source** button lists the game's sources,
-and **Switch** checks the one you pick while the current one keeps playing. Only
-if its chunks are real video does the stream restart on it, with a pause of a
-few seconds; it then stays that channel's source until the game ends, or until
-**Back to the normal order**.
 
 ## Limitations
 

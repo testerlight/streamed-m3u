@@ -51,7 +51,6 @@
     saving: false,
     disconnecting: {},      // stream_id -> true while a stop is in flight
     healthOpen: {},         // stream_id -> true while its timeline is shown
-    sourcesOpen: {},        // stream_id -> channel, while its source picker is shown
     lastStreams: null,      // last /stream/status payload, for local re-renders
     streamIds: "",          // ids seen last poll; a change refreshes history
     cacheBusy: {}           // embed_url -> "refresh" | "clear" while in flight
@@ -314,17 +313,6 @@
         delete state.healthOpen[id];
       }
     });
-    /* A switch ends this stream and a new one starts for the same channel,
-     * so an open picker follows the channel, not the stream id. */
-    Object.keys(state.sourcesOpen).forEach(function (id) {
-      if (!streams.some(function (s) { return s.stream_id === id; })) {
-        var chan = state.sourcesOpen[id];
-        delete state.sourcesOpen[id];
-        streams.forEach(function (s) {
-          if (s.source && sourceChannel(s) === chan) { state.sourcesOpen[s.stream_id] = chan; }
-        });
-      }
-    });
     if (!streams.length) {
       $("streams-panel").innerHTML = emptyState(
         "Nothing playing",
@@ -344,11 +332,7 @@
           '<span class="mono">' + esc(s.stream_id) + "</span></td>" +
         healthCell(s) +
         '<td><span class="cell-truncate mono" title="' + esc(s.m3u8_url || s.embed_url) +
-          '">' + esc(shortUrl(s.m3u8_url || s.embed_url)) + "</span>" +
-          (s.source && s.source.playing ? '<div class="health-sub">' +
-            esc(sourceName(s.source.playing) +
-                (s.source.pinned === s.source.playing ? " · your pick" : "")) + "</div>" : "") +
-          "</td>" +
+          '">' + esc(shortUrl(s.m3u8_url || s.embed_url)) + "</span></td>" +
         '<td class="right nowrap">' + dur(s.elapsed_seconds) + "</td>" +
         '<td class="right nowrap cell-strong">' +
           (s.mbit_per_s === null ? "n/a" : s.mbit_per_s + " Mbit/s") + "</td>" +
@@ -360,18 +344,13 @@
         '<td class="right nowrap">' + num(s.segments_retried) + "</td>" +
         '<td class="right nowrap">' +
           (s.last_segment_ago === null ? "n/a" : s.last_segment_ago + "s") + "</td>" +
-        '<td class="right nowrap"><div class="stream-actions">' +
-          (s.source && s.source.options.length > 1
-            ? '<button type="button" class="btn source-toggle" data-sources="' +
-                esc(s.stream_id) + '" aria-expanded="' +
-                (state.sourcesOpen[s.stream_id] ? "true" : "false") + '">Source</button>'
-            : "") +
+        '<td class="right nowrap">' +
           '<button type="button" class="btn btn-danger" data-disconnect="' +
             esc(s.stream_id) + '"' +
             (stopping ? " disabled" : "") + ">" +
             (stopping ? "Stopping" : "Disconnect") +
-          "</button></div></td>" +
-        "</tr>" + healthRow(s, 11) + sourceRow(s, 11);
+          "</button></td>" +
+        "</tr>" + healthRow(s, 11);
     });
     $("streams-panel").innerHTML = table([
       { label: "Stream" }, { label: "Health" }, { label: "Source" },
@@ -396,13 +375,12 @@
   var CAUSE_TEXT = {
     slow: "Downloads too slow", stalled: "Download stalled or failing",
     source: "Source not publishing", playlist: "Playlist slow or failing",
-    empty: "Source sent empty chunks",
     internal: "Internal error", unknown: "Unknown"
   };
   var END_TEXT = {
     client_left: "Player disconnected", console: "Stopped from the console",
     idle_timeout: "Idle limit", playlist_failures: "Playlist failed repeatedly",
-    fatal: "Source link dead", source_switch: "Switched source from the console"
+    fatal: "Source link dead"
   };
 
   function fx(v) {
@@ -465,37 +443,12 @@
   }
 
   function warningLine(h) {
-    var er = h.empty_recent || {};
-    if (er.empty) {
-      return '<div class="health-sub health-warning">' +
-        esc("Empty chunks: " + er.empty + " of the last " + er.of) + "</div>";
-    }
     var ws = h.warnings || [];
     if (!ws.length) { return ""; }
     var text = ws[0].title + (ws.length > 1 ? " +" + (ws.length - 1) : "");
     return '<div class="health-sub health-warning" title="' +
       esc(ws.map(function (w) { return w.text + "; would " + w.would; }).join("\n")) + '">' +
       esc(text) + "</div>";
-  }
-
-  var FIX_TEXT = { chunk_backup: "Backup chunk requests",
-                   playlist_backup: "Backup playlist requests",
-                   quick_retry: "Quick playlist retries" };
-
-  /* "Backup chunk requests 3 started, 2 won; Quick playlist retries 1 worked" */
-  function fixesText(rv) {
-    var kinds = Object.keys(rv || {});
-    if (!kinds.length) { return ""; }
-    return kinds.map(function (k) {
-      var v = rv[k];
-      var bits = [];
-      if (v.fired) { bits.push(num(v.fired) + " started"); }
-      if (v.won) { bits.push(num(v.won) + " won"); }
-      if (v.ok) { bits.push(num(v.ok) + " worked"); }
-      if (v.lost) { bits.push(num(v.lost) + " not needed"); }
-      if (v.failed) { bits.push(num(v.failed) + " failed"); }
-      return (FIX_TEXT[k] || k) + " " + bits.join(", ");
-    }).join("; ");
   }
 
   function detectorText(d) {
@@ -527,14 +480,10 @@
       ["Errors", plural(h.playlist_errors || 0, "playlist error") + ", " +
         plural(h.downloads_failed || 0, "chunk") + " dropped, " +
         plural(h.internal_errors || 0, "internal error")],
-      ["Empty chunks", h.empty_chunks ? plural(h.empty_chunks, "chunk") + " (" +
-        secs(h.empty_s) + " of video missing); " + ((h.empty_recent || {}).empty || 0) +
-        " of the last " + ((h.empty_recent || {}).of || 0) : "none"],
       ["Warnings now", (h.warnings || []).length ? h.warnings.map(function (w) {
         return w.text + " (would " + w.would + ")";
       }).join("; ") : "none"],
-      ["Warnings so far", detectorText(h.detector)],
-      ["Automatic fixes", fixesText(h.recoveries) || "none needed yet"]
+      ["Warnings so far", detectorText(h.detector)]
     ];
     if (h.alarm) { facts.splice(1, 0, ["Would do", h.alarm.would + " (Phase 3; nothing acts yet)"]); }
     var pf = h.playlist_fetch;
@@ -566,101 +515,6 @@
     return '<tr class="health-row"><td colspan="' + colspan + '">' +
       '<div class="health-detail">' + healthFacts(s.health) +
       healthTimeline(s.health.timeline) + "</div></td></tr>";
-  }
-
-  /* ── Source picker ──────────────────────────────────────────────────── */
-  /* Manual only (app.py gotcha #32): a pick is checked while the current
-   * source keeps playing, and only a source whose chunks are real video
-   * replaces it. It then stays the channel's pick for the rest of the match. */
-
-  function sourceName(label) {
-    var m = /^([a-z]+)(\d+)-(HD|SD)$/i.exec(label || "");
-    return m ? m[1] + " " + m[2] + " · " + m[3].toUpperCase() : (label || "");
-  }
-
-  function sourceChannel(s) {
-    return (s.source && s.source.options[0] && s.source.options[0].embed_url) || s.stream_id;
-  }
-
-  function sourceJobText(job) {
-    if (!job) { return ""; }
-    if (job.state === "checking") {
-      return "Checking " + sourceName(job.label) + ": loading it and testing its newest " +
-        "chunks while this stream keeps playing";
-    }
-    return job.detail ? job.detail.replace(/[a-z]+\d+-(HD|SD)/gi, function (l) {
-      return sourceName(l);
-    }) : "";
-  }
-
-  function sourceRow(s, colspan) {
-    var src = s.source;
-    if (!src || !state.sourcesOpen[s.stream_id]) { return ""; }
-    var busy = src.job && (src.job.state === "checking" || src.job.state === "switching");
-    var tone = !src.job ? "" : src.job.state === "failed" ? " error" :
-      src.job.state === "done" ? " ok" : "";
-    var items = src.options.map(function (o) {
-      var tags = [];
-      if (o.playing) { tags.push('<span class="badge ok">Playing</span>'); }
-      if (o.pinned) { tags.push('<span class="badge">Your pick</span>'); }
-      return '<li class="source-option">' +
-        '<span class="source-name">' + esc(sourceName(o.label)) + "</span>" +
-        tags.join(" ") +
-        (o.playing ? "" :
-          '<button type="button" class="btn" data-switch-source="' + esc(s.stream_id) +
-            '" data-embed="' + esc(o.embed_url) + '"' + (busy ? " disabled" : "") +
-            ">Switch</button>") +
-        "</li>";
-    }).join("");
-    return '<tr class="source-row"><td colspan="' + colspan + '">' +
-      '<div class="source-picker">' +
-      '<p class="section-note">Pick a source for this game. It is checked first while this ' +
-        "stream keeps playing; only if its chunks are real video does the stream restart on " +
-        "it, a few seconds' pause. It then stays this channel's source until the game ends.</p>" +
-      (src.job ? '<p class="source-status' + tone + '">' + esc(sourceJobText(src.job)) + "</p>" : "") +
-      '<ul class="source-options">' + items + "</ul>" +
-      (src.pinned ? '<button type="button" class="btn" data-source-auto="' + esc(s.stream_id) +
-        '"' + (busy ? " disabled" : "") + ">Back to the normal order</button>" : "") +
-      "</div></td></tr>";
-  }
-
-  function toggleSources(id) {
-    var s = ((state.lastStreams || {}).streams || []).filter(function (x) {
-      return x.stream_id === id;
-    })[0];
-    if (state.sourcesOpen[id]) { delete state.sourcesOpen[id]; }
-    else if (s) { state.sourcesOpen[id] = sourceChannel(s); }
-    if (state.lastStreams) { renderStreams(state.lastStreams); }
-  }
-
-  function refreshStreams() {
-    get("/stream/status").then(renderStreams).catch(guard("streams-panel", "streams"));
-  }
-
-  function switchSource(id, embedUrl) {
-    document.querySelectorAll("[data-switch-source]").forEach(function (b) { b.disabled = true; });
-    send("POST", "/api/streams/" + encodeURIComponent(id) + "/source", { embed_url: embedUrl })
-      .then(function () {
-        refreshStreams();
-        /* The check takes 10-20s and the restart a few more: poll faster
-         * than the normal cadence until it settles. */
-        var n = 0;
-        var t = setInterval(function () {
-          refreshStreams();
-          n += 1;
-          var still = ((state.lastStreams || {}).streams || []).some(function (x) {
-            return x.source && x.source.job &&
-              (x.source.job.state === "checking" || x.source.job.state === "switching");
-          });
-          if (!still || n > 30) { clearInterval(t); }
-        }, 2000);
-      })
-      .catch(refreshStreams);
-  }
-
-  function sourceAuto(id) {
-    send("POST", "/api/streams/" + encodeURIComponent(id) + "/source/auto", {})
-      .then(refreshStreams).catch(refreshStreams);
   }
 
   function toggleHealth(id) {
@@ -705,9 +559,7 @@
       '<p class="section-note history-endings">' +
         (endings ? "How they ended: " + esc(endings) + ". " : "") +
         esc(plural(t.reconnects || 0, "reconnect") + ", " +
-            plural(t.replayed_chunks || 0, "replayed chunk")) + "." +
-        (fixesText(t.recoveries) ? " Automatic fixes: " + esc(fixesText(t.recoveries)) + "." : "") +
-        "</p>";
+            plural(t.replayed_chunks || 0, "replayed chunk")) + ".</p>";
     var rows = recs.map(function (r) {
       var top = "";
       var bc = r.by_cause || {};
@@ -718,15 +570,10 @@
           ? ", replayed " + r.reconnect.replayed_chunks : ""));
       }
       if (r.skipped) { notes.push(r.skipped + " skipped"); }
-      if (r.empty_chunks) { notes.push(plural(r.empty_chunks, "empty chunk")); }
       if ((r.backwards || 0) + (r.playlist_backwards || 0)) { notes.push("jumped back"); }
       var d = r.detector;
       if (d && d.freezes_scored) { notes.push("warned ahead " + d.warned_ahead + "/" + d.freezes_scored); }
       if (d && d.false) { notes.push(plural(d.false, "false alarm")); }
-      var rv = r.recoveries || {};
-      var won = ((rv.chunk_backup || {}).won || 0) + ((rv.playlist_backup || {}).won || 0) +
-        ((rv.quick_retry || {}).ok || 0);
-      if (won) { notes.push(num(won) + (won === 1 ? " fix" : " fixes") + " worked"); }
       if (r.multiview) { notes.push("multi-view " + r.multiview); }
       if (r.endlist) { notes.push("broadcast ended"); }
       return "<tr>" +
@@ -2448,22 +2295,6 @@
       var healthToggle = target.closest("[data-health]");
       if (healthToggle) {
         toggleHealth(healthToggle.getAttribute("data-health"));
-        return;
-      }
-      var srcToggle = target.closest("[data-sources]");
-      if (srcToggle) {
-        toggleSources(srcToggle.getAttribute("data-sources"));
-        return;
-      }
-      var srcSwitch = target.closest("[data-switch-source]");
-      if (srcSwitch) {
-        switchSource(srcSwitch.getAttribute("data-switch-source"),
-                     srcSwitch.getAttribute("data-embed"));
-        return;
-      }
-      var srcAuto = target.closest("[data-source-auto]");
-      if (srcAuto) {
-        sourceAuto(srcAuto.getAttribute("data-source-auto"));
         return;
       }
       var stop = target.closest("[data-disconnect]");

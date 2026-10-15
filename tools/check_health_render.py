@@ -52,8 +52,6 @@ URLS = {}
 
 
 def fake_extract(embed, *a, **k):
-    if not URLS.get(embed):
-        return None
     return {"url": URLS[embed], "headers": {}, "cookies": {}, "browser_m3u8_status": 200}
 
 
@@ -82,26 +80,14 @@ threading.Thread(target=lambda: app.app.run(host="127.0.0.1", port=8899, threade
                                             use_reloader=False), daemon=True).start()
 time.sleep(1.5)
 
-# One live stream that cannot keep up: 1s chunks taking 1.6s each. It plays as
-# a team channel whose match has three sources, so the source picker shows.
+# One live stream that cannot keep up: 1s chunks taking 1.6s each.
 live = scenario(ch.Scenario("live", take=10 ** 6, slow=(4, 10 ** 6, 1.6)), "sixers-live")
-spare = scenario(ch.Scenario("spare", take=10 ** 6), "sixers-spare")
-dead = "https://embedsports.top/embed/golf/sixers-dead/1"
-URLS[dead] = None
-with app._team_lock:
-    app._team_roster["sixers"] = {"name": "Sixers", "kind": "team", "sport": "basketball"}
-    app._team_map["sixers"] = {
-        "team": "Sixers", "away": "Render", "category": "Live", "sport": "basketball",
-        "poster": "", "starts": int(time.time() * 1000), "kind": "team", "side": "home",
-        "match_id": "r1", "match_title": "Sixers vs Render",
-        "streams": [{"embed_url": live, "source": "admin", "stream_no": 1, "hd": True},
-                    {"embed_url": dead, "source": "golf", "stream_no": 1, "hd": True},
-                    {"embed_url": spare, "source": "admin", "stream_no": 2, "hd": False}]}
 stop_live = threading.Event()
 
 
 def keep_reading():
-    req = urllib.request.urlopen("http://127.0.0.1:8899/stream?team=sixers", timeout=60)
+    req = urllib.request.urlopen("http://127.0.0.1:8899/stream?url=" + quote(live, safe=""),
+                                 timeout=60)
     while not stop_live.is_set():
         if not req.read(65536):
             break
@@ -139,30 +125,6 @@ with sync_playwright() as pw:
           "Warnings now" in facts and "would switch to 960x540" in facts, facts[-400:])
     time.sleep(5.5)   # one fast poll: the row must survive a re-render
     check("open timeline survives a poll", page.locator("tr.health-row").count() == 1)
-    page.click("[data-health]")            # close the timeline: picker alone below
-    page.click("[data-sources]")
-    page.wait_for_selector("tr.source-row", timeout=5000)
-    picker = page.inner_text("tr.source-row")
-    check("source picker lists the match's sources, the playing one marked",
-          "admin 1 · HD" in picker and "golf 1 · HD" in picker and "admin 2 · SD" in picker
-          and "Playing" in picker, picker[:300])
-    check("only the other sources offer Switch",
-          page.locator("tr.source-row [data-switch-source]").count() == 2)
-    page.locator("tr.source-row [data-switch-source]").first.click()
-    page.wait_for_function(
-        "() => (document.querySelector('tr.source-row .source-status') || {}).textContent"
-        " && document.querySelector('tr.source-row .source-status').textContent"
-        ".indexOf('did not pass') >= 0", timeout=20000)
-    status = page.inner_text("tr.source-row .source-status")
-    check("a dead source's check fails in words, the stream untouched",
-          "golf 1 · HD did not pass: no stream link" in status
-          and page.locator("[data-health]").count() == 1, status)
-    page.locator("#streams").screenshot(path="/out/source-picker-dark.png")
-    clipped = page.evaluate(
-        "() => { const b = document.querySelector('[data-disconnect]').getBoundingClientRect();"
-        " const w = document.querySelector('#streams-panel').getBoundingClientRect();"
-        " return b.right > w.right + 1; }")
-    check("Disconnect is not pushed off the table", not clipped)
     page.wait_for_selector("#history-panel table", timeout=25000)
     rows = page.locator("#history-panel tbody tr").count()
     check("recent streams lists the finished streams", rows >= 3, rows)
@@ -170,8 +132,6 @@ with sync_playwright() as pw:
     check("recent streams names causes",
           "Source not publishing" in hist and "Download stalled or failing" in hist, hist[:300])
     check("recent streams shows the skipped chunks", "7 skipped" in hist)
-    check("recent streams lists the automatic fixes",
-          "Automatic fixes: Backup chunk requests 1 started, 1 won" in hist, hist[:600])
     check("recent streams scores the early warnings",
           "Warned ahead" in hist and "false alarm" in hist, hist[:400])
     page.locator("#streams").screenshot(path="/out/health-streams-dark.png")

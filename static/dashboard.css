@@ -1240,18 +1240,7 @@ tr.health-row td { background: var(--surface-step); padding: var(--s-md) var(--s
 .health-timeline .kind-playlist_error span, .health-timeline .kind-dropped span,
 .health-timeline .kind-replay span, .health-timeline .kind-warn span { color: var(--warn); }
 .health-timeline .kind-alarm span { color: var(--error); }
-.health-timeline .kind-recovery span { color: var(--accent); }
 .health-sub.health-warning { color: var(--warn); }
-/* Source sits above Disconnect, so the actions column is no wider than it was. */
-.stream-actions { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
-tr.source-row td { background: var(--surface-step); padding: var(--s-md) var(--s-lg); }
-.source-picker .section-note { margin: 0 0 var(--s-sm); }
-.source-options { list-style: none; margin: 0 0 var(--s-sm); padding: 0; display: grid; gap: var(--s-xs, 6px); }
-.source-option { display: flex; align-items: center; gap: var(--s-sm); }
-.source-name { min-width: 12ch; font-weight: 600; }
-.source-status { margin: 0 0 var(--s-sm); color: var(--text-dim); }
-.source-status.error { color: var(--error); }
-.source-status.ok { color: var(--ok, var(--text)); }
 
 .history-stats { margin-bottom: var(--s-sm); }
 .history-endings { margin: 0 0 var(--s-sm); }

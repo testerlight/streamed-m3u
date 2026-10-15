@@ -51,16 +51,6 @@ stay usable from curl. The endpoints here cover what had no endpoint at all:
                       event the generator already watches for a client
                       hangup. Needs a session and CSRF when a password is
                       set; open on a passwordless LAN console.
-  POST /api/streams/<id>/source
-                      Body {"embed_url": ...}, one of the stream's match
-                      sources. Checks it while the current one keeps playing;
-                      if its chunks are real video, the stream restarts on it
-                      and it stays the channel's pick for the rest of the
-                      match. Answers 202 at once; progress is in
-                      /stream/status. Same operator gate as disconnect.
-  POST /api/streams/<id>/source/auto
-                      Forget the channel's pick; the normal order applies from
-                      its next start. Same gate.
   POST /api/restart   Restart streamed-m3u and streamed-m3u-sync. Same
                       operator gate as disconnect. Needs the Docker socket.
 
@@ -121,8 +111,6 @@ _multiview_view = None
 _multiview_update = None
 _multiview_stop = None
 _stream_history = None
-_switch_source = None
-_clear_source = None
 
 
 # ─── Event ring buffer ────────────────────────────────────────────────────────
@@ -465,50 +453,6 @@ def api_stream_disconnect(stream_id):
     return jsonify({"ok": True, "stream_id": stream_id})
 
 
-_SOURCE_ERRORS = {
-    "invalid": ("invalid_id", 400),
-    "missing": ("not_found", 404),
-    "not_team": ("not_a_channel_stream", 409),
-    "unknown_source": ("unknown_source", 400),
-    "busy": ("switch_in_progress", 409),
-}
-
-
-@bp.route("/api/streams/<stream_id>/source", methods=["POST"])
-def api_stream_source(stream_id):
-    """Move one stream to another of its match's sources, after a check.
-    Same gate as disconnect."""
-    denied = _require_operator()
-    if denied:
-        return denied
-    if _switch_source is None:
-        return jsonify({"ok": False, "error": "unavailable"}), 503
-    body = request.get_json(silent=True) or {}
-    embed_url = body.get("embed_url")
-    if not isinstance(embed_url, str) or not embed_url.strip():
-        return jsonify({"ok": False, "error": "missing_embed_url"}), 400
-    status, label = _switch_source(stream_id, embed_url.strip())
-    if status in _SOURCE_ERRORS:
-        err, code = _SOURCE_ERRORS[status]
-        return jsonify({"ok": False, "error": err}), code
-    return jsonify({"ok": True, "stream_id": stream_id, "label": label}), 202
-
-
-@bp.route("/api/streams/<stream_id>/source/auto", methods=["POST"])
-def api_stream_source_auto(stream_id):
-    """Forget the channel's pick. Same gate as disconnect."""
-    denied = _require_operator()
-    if denied:
-        return denied
-    if _clear_source is None:
-        return jsonify({"ok": False, "error": "unavailable"}), 503
-    status = _clear_source(stream_id)
-    if status in _SOURCE_ERRORS:
-        err, code = _SOURCE_ERRORS[status]
-        return jsonify({"ok": False, "error": err}), code
-    return jsonify({"ok": True, "stream_id": stream_id})
-
-
 @bp.route("/api/events")
 def api_events():
     try:
@@ -537,7 +481,6 @@ def api_stream_history():
 
 def register_dashboard(flask_app, *, runtime, caches, config_values,
                        apply_settings=None, stop_stream=None,
-                       switch_source=None, clear_source=None,
                        refresh_extract=None, clear_extract=None,
                        restart_services=None,
                        lineup_view=None, lineup_update=None,
@@ -558,14 +501,12 @@ def register_dashboard(flask_app, *, runtime, caches, config_values,
     multiview_update / multiview_stop are the multi-view coupling; the view is
     deliberately URL-free, so the read endpoint needs no gate of its own.
     stream_history is limit -> dict, used by GET /api/streams/history.
-    switch_source is (stream_id, embed_url) -> (status, label) and
-    clear_source stream_id -> status, for the source picker.
     """
     global _runtime_provider, _caches_provider, _config_provider
     global _apply_settings, _stop_stream, _refresh_extract, _clear_extract
     global _restart_services, _lineup_view, _lineup_update
     global _multiview_view, _multiview_update, _multiview_stop
-    global _stream_history, _switch_source, _clear_source
+    global _stream_history
     _runtime_provider = runtime
     _caches_provider = caches
     _config_provider = config_values
@@ -580,8 +521,6 @@ def register_dashboard(flask_app, *, runtime, caches, config_values,
     _multiview_update = multiview_update
     _multiview_stop = multiview_stop
     _stream_history = stream_history
-    _switch_source = switch_source
-    _clear_source = clear_source
 
     if capture_logs:
         root = logging.getLogger()

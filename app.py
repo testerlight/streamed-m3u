@@ -434,24 +434,6 @@ SEGMENT_MAX_MB = int(os.getenv("SEGMENT_MAX_MB", "64"))
 # IPv6 default route, which is Docker's bridge, not the VPN tunnel. Set to 0
 # to restore the library default without a rebuild.
 UPSTREAM_IPV4 = os.getenv("UPSTREAM_IPV4", "1") == "1"
-# Stream health Phase 3 (gotcha #31): backup requests. Neither abandons the
-# request it backs up - the first attempt (2026-10-10) made playback worse by
-# throwing away downloads that were slow but working - and whichever answers
-# first is used. Seen 2026-10-14: a chunk download went silent until its 30s
-# timeout, froze the picture 18.6s and skipped 16s of game, and the retry then
-# fetched the same chunk in 0.17s.
-# Seconds a chunk download may receive nothing before a second request for the
-# same chunk starts alongside it. 0 turns it off.
-CHUNK_BACKUP_AFTER = float(os.getenv("CHUNK_BACKUP_AFTER", "4"))
-# Seconds past a stream's typical playlist request (PLAYLIST_BACKUP_FIRST until
-# ten have been seen) before a second one is sent alongside it. 0 turns it off.
-PLAYLIST_BACKUP_AFTER = float(os.getenv("PLAYLIST_BACKUP_AFTER", "3"))
-PLAYLIST_BACKUP_FIRST = 4.0
-PLAYLIST_BACKUP_BASELINE = 10
-# Wait before retrying after the *first* playlist error in a row; later ones
-# keep the 2s wait, so a source that keeps failing is still given up on after
-# about as long as before (six in a row) rather than four times sooner.
-PLAYLIST_RETRY_DELAY = float(os.getenv("PLAYLIST_RETRY_DELAY", "0.5"))
 # Some sources publish a video elementary stream and no audio one at all -
 # observed on `admin`, which carries a raw MLB.TV feed. Playback looks fine and
 # is silent, and _rank_streams puts `admin` above `delta` (both HD, `admin`
@@ -901,20 +883,6 @@ def _ts_sync_offset(body, packets=10, limit=4096):
                for n in range(packets)):
             return i
     return None
-
-
-# A chunk this small with no TS alignment in it is a placeholder, not video.
-# Seen 2026-10-14: one TikTok bucket answering 200 with a 72-byte empty WebP
-# (`RIFF....WEBPVP8X`) for ~30% of a game's chunks, every retry the same. The
-# picture skips the chunk's whole length. A real chunk here is megabytes, and
-# a wrapped one still aligns after its wrapper (gotcha #17), so neither can
-# match. Gotcha #32.
-EMPTY_CHUNK_MAX_BYTES = 65536
-
-
-def _is_empty_chunk(body):
-    """True if a downloaded chunk is a placeholder rather than video."""
-    return len(body) < EMPTY_CHUNK_MAX_BYTES and _ts_sync_offset(body) is None
 
 
 def _strip_ts_prefix(body):
@@ -2000,11 +1968,6 @@ def update_team_index(matches: list[dict], streams_per_match: list[list[dict]]):
              total, added)
 
 
-def _source_label(s):
-    """'admin1-HD' for one of a match's streams."""
-    return "%s%s-%s" % (s["source"], s["stream_no"], "HD" if s["hd"] else "SD")
-
-
 def _team_candidates(team: str, slot: str):
     """Candidate streams for ?team=..., best first.
 
@@ -2034,7 +1997,9 @@ def _team_candidates(team: str, slot: str):
             "'%s' is listed for %s but has no streams available\n"
             % (slug, entry.get("match_title", "?")), status=503)
 
-    label = _source_label
+    def label(s):
+        return "%s%s-%s" % (s["source"], s["stream_no"],
+                            "HD" if s["hd"] else "SD")
 
     if slot:
         try:
@@ -2903,19 +2868,6 @@ def stream_proxy():
     # Sources already known to carry no audio go to the back rather than being
     # dropped: still usable as a last resort, but no longer worth a full chunk
     # download and a browser extraction ahead of a source that has sound.
-    # A source picked in the console goes first for the rest of the game
-    # (gotcha #32); if it was just checked, its payload is used as is.
-    pin = None
-    if team_arg and not slot_arg and not request.args.get("url"):
-        pin_slug = _slugify(team_arg)
-        pin = _source_pin(pin_slug, _team_match_id(pin_slug))
-        if pin and any(c["embed_url"] == pin["embed_url"] for c in candidates):
-            candidates.sort(key=lambda c: c["embed_url"] != pin["embed_url"])
-            log.info("Console pick for %s: trying %s first", pin_slug, pin["label"])
-        elif pin:
-            _drop_source_pin(pin_slug, "no longer listed for this match")
-            pin = None
-
     if REQUIRE_AUDIO:
         candidates.sort(key=lambda c: _known_silent(c["embed_url"]))
 
@@ -2940,13 +2892,7 @@ def stream_proxy():
         log.info("Resolving stream for: %s (attempt %d/%d, %s)",
                  cand_url, n, tried, cand["label"])
 
-        prepared = (_take_prepared_source(pin_slug, cand_url)
-                    if pin and cand_url == pin["embed_url"] else None)
-        if prepared is not None:
-            ok, payload, detail = True, prepared, "%s:ok" % cand["label"]
-            log.info("Using the source the console just checked: %s", cand["label"])
-        else:
-            ok, payload, detail = _validate_candidate(cand_url, cand["label"])
+        ok, payload, detail = _validate_candidate(cand_url, cand["label"])
         if not ok:
             attempts.append(detail)
             if detail.endswith(":no-audio") and silent_fallback is None:
@@ -2975,9 +2921,6 @@ def stream_proxy():
         log.warning("No source with audio for this match - falling back to "
                     "silent %s (%s)", cand_label, cand_url)
 
-    if pin:
-        _source_switch_landed(pin_slug, pin, source_label if probe_segments is not None else None)
-
     if probe_segments is None:
         detail = ", ".join(attempts) or "none tried"
         log.warning("No playable stream after %d attempt(s) in %.1fs: %s",
@@ -3003,38 +2946,8 @@ def stream_proxy():
                     _active_streams[stream_id][field] = \
                         _active_streams[stream_id].get(field, 0) + n
 
-        # Set by the fetch helpers: the last chunk was an empty placeholder.
-        fetch_note = {"empty": False}
-
-        def _empty(seg_url):
-            """An empty placeholder instead of a chunk: drop it, record it."""
-            _bump("chunks_empty")
-            H.empty_chunk(seg_url)
-
         def fetch_segment(seg_url):
-            """_fetch_once, logging a chunk dropped after every attempt."""
-            f = {}
-            body = _fetch_once(seg_url, f)
-            fetch_note["empty"] = bool(f.get("empty"))
-            if body is None and f.get("exhausted"):
-                _log_dropped(seg_url)
-            return body
-
-        def _log_dropped(seg_url):
-            log.warning("Segment dropped after %d attempt(s), leaving a gap: %s",
-                        SEGMENT_RETRIES + 1, seg_url)
-            _bump("segments_failed")
-
-        def _fetch_once(seg_url, f):
             """Download one chunk whole, or return None.
-
-            `f` is this fetch's own state: `cancel` (an Event) ends it early
-            when a backup request has already won; `last` is when it last
-            received anything; `backup` marks the second request; `exhausted`
-            is set when every attempt failed; `empty` when the source answered
-            with a placeholder instead of video (not retried: it answers the
-            same every time). The caller logs the drop, so a
-            fetch whose backup succeeds does not report a gap that never was.
 
             Buffered rather than streamed straight through on purpose. The old
             code forwarded bytes as they arrived, so a timeout partway meant a
@@ -3046,17 +2959,10 @@ def stream_proxy():
             Failures are logged, never swallowed: their invisibility is the
             reason this went undiagnosed for so long.
             """
-            cancel = f.get("cancel")
-
-            def ended():
-                return stop.is_set() or (cancel is not None and cancel.is_set())
-
             for attempt in range(1, SEGMENT_RETRIES + 2):
-                if ended():
+                if stop.is_set():
                     return None
-                f["last"] = time.time()
-                if not f.get("backup"):
-                    H.download_attempt(attempt)
+                H.download_attempt(attempt)
                 try:
                     seg = cf_requests.get(
                         seg_url,
@@ -3084,11 +2990,10 @@ def stream_proxy():
                     buf = bytearray()
                     cap = SEGMENT_MAX_MB * 1024 * 1024
                     for chunk in seg.iter_content(chunk_size=65536):
-                        if ended():
+                        if stop.is_set():
                             return None
                         if chunk:
                             buf.extend(chunk)
-                            f["last"] = time.time()
                             H.download_bytes(len(chunk))
                             if len(buf) > cap:
                                 log.warning("Segment exceeded %dMB while "
@@ -3108,9 +3013,6 @@ def stream_proxy():
                         log.warning("Segment empty (attempt %d/%d): %s",
                                     attempt, SEGMENT_RETRIES + 1, seg_url)
                         continue
-                    if _is_empty_chunk(buf):
-                        f["empty"] = True
-                        return None
 
                     if attempt > 1:
                         log.info("Segment recovered on attempt %d: %s",
@@ -3119,86 +3021,15 @@ def stream_proxy():
                     return bytes(buf)
 
                 except Exception as exc:
-                    if ended():
-                        return None
                     log.warning("Segment fetch failed (attempt %d/%d, "
                                 "timeout=%ds): %s - %s",
                                 attempt, SEGMENT_RETRIES + 1, SEGMENT_TIMEOUT,
                                 seg_url, exc)
 
-            f["exhausted"] = True
+            log.warning("Segment dropped after %d attempt(s), leaving a gap: %s",
+                        SEGMENT_RETRIES + 1, seg_url)
+            _bump("segments_failed")
             return None
-
-        def _playlist(pl_times):
-            """get_segments, with a backup request if it runs long (Phase 3).
-
-            Returns (segments, status, info) exactly as one get_segments call
-            would, or None if the stream was stopped while waiting. The first
-            request is never abandoned: once PLAYLIST_BACKUP_AFTER past this
-            stream's typical request, a second starts alongside it and the
-            first success wins. If both fail, the first request's failure is
-            the one reported, so fatal-status handling is unchanged. With no
-            backup fired this returns the moment the request does, so a
-            healthy poll is not slowed by the thread.
-            """
-            if PLAYLIST_BACKUP_AFTER <= 0:
-                info = {}
-                segs, status = get_segments(m3u8_url, headers, cookies, info=info)
-                return segs, status, info
-            if len(pl_times) >= PLAYLIST_BACKUP_BASELINE:
-                ordered = sorted(pl_times)
-                wait = ordered[len(ordered) // 2] + PLAYLIST_BACKUP_AFTER
-            else:
-                wait = PLAYLIST_BACKUP_FIRST
-            results = queue.Queue()
-
-            def run(idx):
-                info = {}
-                try:
-                    segs, status = get_segments(m3u8_url, headers, cookies, info=info)
-                    results.put((idx, segs, status, info, None, time.time()))
-                except Exception as exc:   # re-raised below, as before
-                    results.put((idx, None, None, info, exc, time.time()))
-
-            began = time.time()
-            threading.Thread(target=run, args=(0,), daemon=True).start()
-            pending, backup_at, first = 1, None, None
-            while True:
-                if backup_at is None:
-                    timeout = max(0.01, began + wait - time.time())
-                else:
-                    timeout = 0.25
-                try:
-                    idx, segs, status, info, exc, at = results.get(timeout=timeout)
-                except queue.Empty:
-                    if stop.is_set():
-                        return None
-                    if backup_at is None and time.time() - began >= wait:
-                        backup_at = time.time()
-                        pending += 1
-                        H.recovery("playlist_backup", "fired",
-                                   "first request still running after %.1fs"
-                                   % (backup_at - began))
-                        threading.Thread(target=run, args=(1,), daemon=True).start()
-                    continue
-                pending -= 1
-                if exc is None and segs:
-                    if backup_at is not None:
-                        H.recovery("playlist_backup", "won" if idx == 1 else "lost",
-                                   "%s answered %.1fs after the backup started"
-                                   % ("backup" if idx == 1 else "first request",
-                                      at - backup_at))
-                    pl_times.append(at - (backup_at if idx == 1 else began))
-                    return segs, status, info
-                if idx == 0 or first is None:     # the first request's failure wins
-                    first = (segs, status, info, exc)
-                if pending == 0:
-                    if backup_at is not None:
-                        H.recovery("playlist_backup", "failed", "both requests failed")
-                    segs, status, info, exc = first
-                    if exc is not None:
-                        raise exc
-                    return segs, status, info
 
         def _generate():
             # Bounded set + deque so long-lived streams don't grow RAM unbounded
@@ -3254,68 +3085,28 @@ def stream_proxy():
                 on a 4 Mbit/s night. The fetch runs on a worker thread and this
                 generator pads the wait; the chunk comes back as the
                 generator's return value, so callers use `yield from`.
-
-                Phase 3: if the download has received nothing for
-                CHUNK_BACKUP_AFTER, a second request for the same chunk starts
-                alongside it. Neither is abandoned until one has the whole
-                chunk; then the other is cancelled. Checked at each keepalive,
-                so the cadence of what is sent while waiting is unchanged.
                 """
                 if STREAM_KEEPALIVE_INTERVAL <= 0:
                     return fetch_segment(seg_url)
-                fetch_note["empty"] = False
-                done = queue.Queue()
-                fetches = []
+                result = {}
 
-                def _start(backup):
-                    f = {"cancel": threading.Event(), "last": time.time(),
-                         "began": time.time(), "backup": backup}
-                    fetches.append(f)
+                def _run():
+                    result["body"] = fetch_segment(seg_url)
 
-                    def _run():
-                        done.put((f, _fetch_once(seg_url, f)))
-                    threading.Thread(target=_run, daemon=True).start()
-
-                _start(False)
-                pending = 1
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
                 while True:
-                    try:
-                        f, body = done.get(timeout=STREAM_KEEPALIVE_INTERVAL)
-                    except queue.Empty:
-                        if stop.is_set():
-                            # Both fetches check stop themselves and unwind.
-                            return None
-                        quiet = time.time() - fetches[0]["last"]
-                        if (CHUNK_BACKUP_AFTER > 0 and len(fetches) == 1
-                                and quiet >= CHUNK_BACKUP_AFTER):
-                            _start(True)
-                            pending += 1
-                            H.recovery("chunk_backup", "fired",
-                                       "download silent for %.0fs" % quiet)
-                        _bump("keepalives_sent")
-                        yield TS_NULL_PACKET
-                        continue
-                    pending -= 1
-                    if body is None and pending:
-                        continue          # the other request may still deliver
-                    for other in fetches:
-                        other["cancel"].set()
-                    if len(fetches) > 1:
-                        if body is None:
-                            H.recovery("chunk_backup", "failed", "both requests failed")
-                        else:
-                            H.recovery("chunk_backup", "won" if f["backup"] else "lost",
-                                       "%s finished %.1fs after the backup started"
-                                       % ("backup" if f["backup"] else "original",
-                                          time.time() - fetches[1]["began"]))
-                    if body is None and any(x.get("exhausted") for x in fetches):
-                        _log_dropped(seg_url)
-                    fetch_note["empty"] = body is None and any(x.get("empty") for x in fetches)
-                    return body
+                    t.join(STREAM_KEEPALIVE_INTERVAL)
+                    if not t.is_alive():
+                        break
+                    if stop.is_set():
+                        # fetch_segment checks stop itself and will unwind.
+                        return None
+                    _bump("keepalives_sent")
+                    yield TS_NULL_PACKET
+                return result.get("body")
 
             consecutive_failures = 0
-            pl_times = deque(maxlen=30)   # this stream's successful playlist requests
-            quick_retry = False           # the last failure was retried quickly
             last_data_at = time.time()  # tracks when we last yielded actual data
             delivered = 0               # segments that actually reached the player
 
@@ -3326,11 +3117,7 @@ def stream_proxy():
                 # Already fetched during the segment probe - reuse it so the
                 # validation costs no extra round-trip.
                 if primed and seg_url in primed:
-                    raw = primed.pop(seg_url)
-                    if _is_empty_chunk(raw):
-                        _empty(seg_url)
-                        continue
-                    body, cut = _strip_ts_prefix(raw)
+                    body, cut = _strip_ts_prefix(primed.pop(seg_url))
                     if cut:
                         _note_prefix(cut)
                     delivered += 1
@@ -3348,10 +3135,7 @@ def stream_proxy():
                     continue
                 H.download_begin(seg_url)
                 body = yield from _fetch_with_keepalive(seg_url)
-                if fetch_note["empty"]:
-                    _empty(seg_url)
-                else:
-                    H.download_end(seg_url, body)
+                H.download_end(seg_url, body)
                 if body is None:
                     continue
                 body, cut = _strip_ts_prefix(body)
@@ -3392,20 +3176,12 @@ def stream_proxy():
                     break
                 try:
                     H.playlist_begin()
-                    got = _playlist(pl_times)
-                    if got is None:
-                        return
-                    segments, status, pl = got
-                    was_quick, quick_retry = quick_retry, False
-                    if was_quick:
-                        H.recovery("quick_retry", "ok" if segments else "failed")
+                    pl = {}
+                    segments, status = get_segments(m3u8_url, headers, cookies,
+                                                    info=pl)
                     if not segments:
                         H.playlist_failed(status, empty=segments is not None)
-                        # A failed quick retry is an extra attempt, not one
-                        # of the six that end the stream: giving up must take
-                        # as long as it did before the quick retry existed.
-                        if not was_quick:
-                            consecutive_failures += 1
+                        consecutive_failures += 1
                         if status in FATAL_STATUS_CODES:
                             log.warning(
                                 "Fatal CDN error HTTP %d for %s - evicting cache",
@@ -3421,17 +3197,7 @@ def stream_proxy():
                             H.end("playlist_failures",
                                   "%d in a row" % consecutive_failures)
                             break
-                        if was_quick:
-                            # Back on the old 2s schedule, counted from the
-                            # first failure, so the retry cannot land later.
-                            yield from _idle(max(0.0, 2 - PLAYLIST_RETRY_DELAY))
-                        elif consecutive_failures == 1 and 0 <= PLAYLIST_RETRY_DELAY < 2:
-                            quick_retry = True
-                            H.recovery("quick_retry", "fired",
-                                       "retrying in %.1fs" % PLAYLIST_RETRY_DELAY)
-                            yield from _idle(PLAYLIST_RETRY_DELAY)
-                        else:
-                            yield from _idle(2)
+                        yield from _idle(2)
                         continue
                     consecutive_failures = 0
                     new_segments = [s for s in segments
@@ -3443,10 +3209,7 @@ def stream_proxy():
                             return
                         H.download_begin(seg_url)
                         body = yield from _fetch_with_keepalive(seg_url)
-                        if fetch_note["empty"]:
-                            _empty(seg_url)
-                        else:
-                            H.download_end(seg_url, body)
+                        H.download_end(seg_url, body)
                         # Marked seen only after the attempts conclude, but
                         # marked either way: a chunk the CDN has genuinely
                         # dropped must not be retried forever while the live
@@ -3524,10 +3287,6 @@ def stream_proxy():
             # and had it removed before forwarding.
             "prefix_stripped":   0,
             "prefix_bytes":      0,
-            # Empty placeholders the source sent instead of chunks, dropped.
-            "chunks_empty":      0,
-            # Which of the match's streams this is, e.g. "admin1-HD".
-            "source_label":      source_label,
             "hold_key":          hold_key,
             # Set when this stream is feeding a composite rather than a
             # viewer, as "<slot>/<role>". Sent as a header rather than a
@@ -3622,264 +3381,6 @@ def _stop_active_stream(stream_id: str) -> str:
     return "ok"
 
 
-# ─── Manual source choice (console) ──────────────────────────────────────────
-# Gotcha #32. No automatic switching mid-stream: the operator picks a source,
-# it is checked while the current one keeps playing, and only a source whose
-# chunks are real video replaces it. The session then ends *without* the
-# disconnect hold, so the player's reconnect (Dispatcharr retries at once)
-# finds the checked source ready and skips the cascade. The pick sticks for
-# the rest of that match: every reconnect on the channel tries it first.
-# In memory only: a restart forgets picks.
-
-SOURCE_PREPARED_TTL = 60.0   # a checked source waits this long for the reconnect
-SOURCE_CHECK_CHUNKS = 3      # chunks that must be real video, the first included
-SOURCE_JOB_KEEP_S = 120.0    # how long a finished check stays on the console
-
-_source_pins = {}   # slug -> {embed_url, label, match_id, set_at, prepared, prepared_at}
-_source_jobs = {}   # slug -> {state, label, detail, at}
-_source_lock = threading.Lock()
-
-_CHECK_FAILURES = (
-    ("no-extract", "no stream link"),
-    ("no-segments", "its playlist is empty"),
-    ("no-audio", "no audio track"),
-)
-
-
-def _team_match_id(slug):
-    with _team_lock:
-        return (_team_map.get(slug) or {}).get("match_id")
-
-
-def _match_sources(slug):
-    """(match_id, [{embed_url, label, hd}]) for what this channel is showing."""
-    with _team_lock:
-        entry = _team_map.get(slug)
-        entry = dict(entry) if entry else None
-    if not entry:
-        return None, []
-    return entry.get("match_id"), [
-        {"embed_url": s["embed_url"], "label": _source_label(s), "hd": bool(s.get("hd"))}
-        for s in entry.get("streams") or []]
-
-
-def _source_pin(slug, match_id):
-    """The console's pick for this channel, if it is still the same match."""
-    with _source_lock:
-        pin = _source_pins.get(slug)
-        if pin and pin["match_id"] != match_id:
-            _source_pins.pop(slug, None)
-            log.info("Console pick for %s dropped: the match has changed", slug)
-            pin = None
-        return dict(pin) if pin else None
-
-
-def _drop_source_pin(slug, why):
-    with _source_lock:
-        pin = _source_pins.pop(slug, None)
-    if pin:
-        log.info("Console pick for %s (%s) dropped: %s", slug, pin["label"], why)
-
-
-def _take_prepared_source(slug, embed_url):
-    """The payload the console's check produced, once, if still fresh."""
-    with _source_lock:
-        pin = _source_pins.get(slug)
-        if not pin or pin["embed_url"] != embed_url or not pin.get("prepared"):
-            return None
-        payload, pin["prepared"] = pin["prepared"], None
-        if time.time() - pin["prepared_at"] > SOURCE_PREPARED_TTL:
-            return None
-        return payload
-
-
-def _set_source_job(slug, state, label, detail=""):
-    with _source_lock:
-        _source_jobs[slug] = {"state": state, "label": label, "detail": detail,
-                              "at": time.time()}
-
-
-def _source_switch_landed(slug, pin, playing_label):
-    """A stream started while a pick was set: close out a pending switch."""
-    with _source_lock:
-        job = _source_jobs.get(slug)
-        pending = job is not None and job["state"] == "switching"
-    if not pending:
-        return
-    if playing_label == pin["label"]:
-        _set_source_job(slug, "done", pin["label"], "Now playing %s" % pin["label"])
-    elif playing_label:
-        _set_source_job(slug, "failed", pin["label"],
-                        "%s failed when the stream restarted; playing %s instead"
-                        % (pin["label"], playing_label))
-    else:
-        _set_source_job(slug, "failed", pin["label"],
-                        "%s failed when the stream restarted, and so did every "
-                        "other source" % pin["label"])
-
-
-def _check_source(embed_url, label):
-    """The startup check, plus proof that the newest chunks are real video.
-
-    Returns (payload, detail): payload as _validate_candidate's, with every
-    chunk it downloaded primed so the switch does not fetch them twice; or
-    (None, why it failed) in words for the console.
-    """
-    ok, payload, detail = _validate_candidate(embed_url, label)
-    if not ok:
-        reason = detail.split(":", 1)[-1]
-        for key, text in _CHECK_FAILURES:
-            if reason == key:
-                return None, text
-        if reason.startswith("probe-"):
-            return None, "its playlist answered HTTP %s" % reason[6:]
-        if reason.startswith("segment-"):
-            return None, "its first chunk failed (HTTP %s)" % reason[8:]
-        return None, reason
-    d, h, c, segs, primed = payload
-    primed = dict(primed)
-    tested, empty = 0, 0
-    for body in primed.values():
-        tested += 1
-        empty += 1 if _is_empty_chunk(body) else 0
-    for u in [u for u in segs[::-1] if u not in primed][:max(0, SOURCE_CHECK_CHUNKS - tested)]:
-        try:
-            r = cf_requests.get(u, headers=_headers_for_url(u, h),
-                                cookies=_cookies_for_url(u, c),
-                                timeout=SEGMENT_PROBE_TIMEOUT, impersonate="chrome",
-                                curl_options=_upstream_curl_options())
-            body = r.content if r.status_code == 200 else b""
-        except Exception:
-            body = b""
-        tested += 1
-        if not body or _is_empty_chunk(body):
-            empty += 1
-        else:
-            primed[u] = body
-    if empty:
-        return None, "%d of %d test chunks were empty or missing" % (empty, tested)
-    return (d, h, c, segs, primed), "%d test chunks were real video" % tested
-
-
-def _run_source_switch(stream_id, slug, match_id, src):
-    label = src["label"]
-    log.info("Console source switch for %s: checking %s", slug, label)
-    payload, detail = _check_source(src["embed_url"], label)
-    if payload is None:
-        _set_source_job(slug, "failed", label, "%s did not pass: %s" % (label, detail))
-        log.warning("Console source switch for %s: %s did not pass (%s); "
-                    "the current stream is untouched", slug, label, detail)
-        return
-    now = time.time()
-    with _source_lock:
-        _source_pins[slug] = {"embed_url": src["embed_url"], "label": label,
-                              "match_id": match_id, "set_at": now,
-                              "prepared": payload, "prepared_at": now}
-    _set_source_job(slug, "switching", label,
-                    "%s passed (%s); restarting the stream on it" % (label, detail))
-    with _active_streams_lock:
-        rec = _active_streams.get(stream_id)
-        ev = rec.get("stop") if rec else None
-        health = rec.get("health") if rec else None
-    if ev is not None:
-        # No disconnect hold: the reconnect must be let straight back in.
-        (health or streamhealth.NULL).end("source_switch", label)
-        ev.set()
-    log.info("Console source switch for %s: %s passed (%s); stream %s ended so "
-             "the player reconnects onto it", slug, label, detail, stream_id)
-
-
-def _switch_source(stream_id, embed_url):
-    """Console: check one of this stream's match sources, then move to it.
-
-    Returns (status, label): 'ok', 'invalid', 'missing', 'not_team',
-    'unknown_source' or 'busy'. The check runs on its own thread.
-    """
-    if not _STREAM_ID_RE.match(stream_id or ""):
-        return "invalid", None
-    with _active_streams_lock:
-        rec = _active_streams.get(stream_id)
-        hold_key = (rec or {}).get("hold_key") or ""
-        playing = (rec or {}).get("embed_url")
-        mv = (rec or {}).get("multiview")
-    if rec is None:
-        return "missing", None
-    if mv or not hold_key.startswith("team:"):
-        return "not_team", None
-    slug = hold_key[len("team:"):]
-    match_id, sources = _match_sources(slug)
-    src = next((x for x in sources if x["embed_url"] == embed_url), None)
-    if src is None:
-        return "unknown_source", None
-    with _source_lock:
-        job = _source_jobs.get(slug)
-        if (job and job["state"] in ("checking", "switching")
-                and time.time() - job["at"] < SOURCE_PREPARED_TTL + 30):
-            return "busy", None
-    if embed_url == playing:
-        with _source_lock:
-            _source_pins[slug] = {"embed_url": embed_url, "label": src["label"],
-                                  "match_id": match_id, "set_at": time.time(),
-                                  "prepared": None, "prepared_at": 0}
-        _set_source_job(slug, "done", src["label"],
-                        "%s is already playing; it stays for the rest of this game"
-                        % src["label"])
-        return "ok", src["label"]
-    _set_source_job(slug, "checking", src["label"])
-    threading.Thread(target=_run_source_switch, args=(stream_id, slug, match_id, src),
-                     daemon=True, name="source-switch").start()
-    return "ok", src["label"]
-
-
-def _clear_source_choice(stream_id):
-    """Console: forget this channel's pick; the normal order applies from
-    the next start. The current stream is left alone."""
-    if not _STREAM_ID_RE.match(stream_id or ""):
-        return "invalid"
-    with _active_streams_lock:
-        rec = _active_streams.get(stream_id)
-        hold_key = (rec or {}).get("hold_key") or ""
-    if rec is None:
-        return "missing"
-    if not hold_key.startswith("team:"):
-        return "not_team"
-    slug = hold_key[len("team:"):]
-    _drop_source_pin(slug, "cleared from the console")
-    _set_source_job(slug, "done", "", "Back to the normal order from the next start")
-    return "ok"
-
-
-def _stream_source_view(rec):
-    """The picker's data for one active stream, or None if it has no choice.
-    Not `_source_view`: that name is the multi-view panel's (one side of a
-    slot), and reusing it broke that panel."""
-    hold_key = rec.get("hold_key") or ""
-    if rec.get("multiview") or not hold_key.startswith("team:"):
-        return None
-    slug = hold_key[len("team:"):]
-    match_id, sources = _match_sources(slug)
-    pin = _source_pin(slug, match_id)
-    now = time.time()
-    with _source_lock:
-        job = dict(_source_jobs.get(slug) or {}) or None
-    if job and job["state"] in ("done", "failed") and now - job["at"] > SOURCE_JOB_KEEP_S:
-        job = None
-    if job and job["state"] == "switching" and now - job["at"] > SOURCE_PREPARED_TTL:
-        job = dict(job, state="waiting",
-                   detail="No reconnect yet; %s will be used when the channel next "
-                          "starts" % job["label"])
-    if job:
-        job["age_s"] = round(now - job.pop("at"), 1)
-    return {
-        "playing": rec.get("source_label"),
-        "pinned": pin["label"] if pin else None,
-        "options": [dict(x, playing=x["embed_url"] == rec.get("embed_url"),
-                         pinned=bool(pin and x["embed_url"] == pin["embed_url"]))
-                    for x in sources],
-        "job": job,
-    }
-
-
 @app.route("/stream/status")
 def stream_status():
     if auth.enabled() and not auth.logged_in():
@@ -3903,9 +3404,6 @@ def stream_status():
             "keepalives_sent":  s.get("keepalives_sent", 0),
             "prefix_stripped":  s.get("prefix_stripped", 0),
             "prefix_bytes":     s.get("prefix_bytes", 0),
-            "chunks_empty":     s.get("chunks_empty", 0),
-            # The match's sources for the console's picker (gotcha #32).
-            "source":           _stream_source_view(s),
             "bytes_sent":       s["bytes_sent"],
             "mb_sent":          round(s["bytes_sent"] / 1_048_576, 2),
             "mbit_per_s":       round(s["bytes_sent"] * 8 / 1e6 / elapsed, 2)
@@ -4501,8 +3999,6 @@ dashboard.register_dashboard(
     config_values=lambda: globals(),
     apply_settings=lambda s, o: _settings.apply_live(globals(), s, o),
     stop_stream=_stop_active_stream,
-    switch_source=_switch_source,
-    clear_source=_clear_source_choice,
     stream_history=_stream_history,
     refresh_extract=_refresh_extract_entry,
     clear_extract=_clear_extract_entry,
