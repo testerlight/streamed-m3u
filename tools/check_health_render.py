@@ -52,6 +52,8 @@ URLS = {}
 
 
 def fake_extract(embed, *a, **k):
+    if not URLS.get(embed):
+        return None
     return {"url": URLS[embed], "headers": {}, "cookies": {}, "browser_m3u8_status": 200}
 
 
@@ -81,14 +83,26 @@ threading.Thread(target=lambda: app.app.run(host="127.0.0.1", port=8899, threade
                                             use_reloader=False), daemon=True).start()
 time.sleep(1.5)
 
-# One live stream that cannot keep up: 1s chunks taking 1.6s each.
+# One live stream that cannot keep up: 1s chunks taking 1.6s each. It plays as
+# a team channel whose match has three sources, so the source picker shows.
 live = scenario(ch.Scenario("live", take=10 ** 6, slow=(4, 10 ** 6, 1.6)), "sixers-live")
+spare = scenario(ch.Scenario("spare", take=10 ** 6), "sixers-spare")
+dead = "https://embedsports.top/embed/golf/sixers-dead/1"
+URLS[dead] = None
+with app._team_lock:
+    app._team_roster["sixers"] = {"name": "Sixers", "kind": "team", "sport": "basketball"}
+    app._team_map["sixers"] = {
+        "team": "Sixers", "away": "Render", "category": "Live", "sport": "basketball",
+        "poster": "", "starts": int(time.time() * 1000), "kind": "team", "side": "home",
+        "match_id": "r1", "match_title": "Sixers vs Render",
+        "streams": [{"embed_url": live, "source": "admin", "stream_no": 1, "hd": True},
+                    {"embed_url": dead, "source": "golf", "stream_no": 1, "hd": True},
+                    {"embed_url": spare, "source": "admin", "stream_no": 2, "hd": False}]}
 stop_live = threading.Event()
 
 
 def keep_reading():
-    req = urllib.request.urlopen("http://127.0.0.1:8899/stream?url=" + quote(live, safe=""),
-                                 timeout=60)
+    req = urllib.request.urlopen("http://127.0.0.1:8899/stream?team=sixers", timeout=60)
     while not stop_live.is_set():
         if not req.read(65536):
             break
@@ -126,6 +140,23 @@ with sync_playwright() as pw:
           "Warnings now" in facts and "would switch to 960x540" in facts, facts[-400:])
     time.sleep(5.5)   # one fast poll: the row must survive a re-render
     check("open timeline survives a poll", page.locator("tr.health-row").count() == 1)
+    picker = page.inner_text("tr.health-row .source-picker")
+    check("the stats drop-down holds the source picker, the playing source marked",
+          "admin 1 · HD" in picker and "golf 1 · HD" in picker and "admin 2 · SD" in picker
+          and "Playing" in picker, picker[:300])
+    check("only the other sources offer Switch",
+          page.locator("tr.health-row [data-switch-source]").count() == 2)
+    check("no separate Source button in the row", page.locator("[data-sources]").count() == 0)
+    page.locator("tr.health-row [data-switch-source]").first.click()
+    page.wait_for_function(
+        "() => (document.querySelector('tr.health-row .source-status') || {}).textContent"
+        " && document.querySelector('tr.health-row .source-status').textContent"
+        ".indexOf('did not pass') >= 0", timeout=20000)
+    status = page.inner_text("tr.health-row .source-status")
+    check("a dead source's check fails in words, the stream untouched",
+          "golf 1 · HD did not pass: no stream link" in status
+          and page.locator("[data-health]").count() == 1, status)
+    page.locator("#streams").screenshot(path="/out/source-picker-dark.png")
     page.wait_for_selector("#history-panel table", timeout=25000)
     rows = page.locator("#history-panel tbody tr").count()
     check("recent streams lists the finished streams", rows >= 3, rows)
@@ -149,6 +180,26 @@ with sync_playwright() as pw:
     overflow = page.evaluate(
         "() => document.documentElement.scrollWidth > document.documentElement.clientWidth")
     check("narrow window: the page itself does not scroll sideways", not overflow)
+    # The phone case: swipe the Active streams table sideways, let a poll
+    # re-render it, and it must still be where it was left.
+    page.click("[data-health]")            # close the drop-down: just the table
+    time.sleep(0.5)
+    sel = "#streams-panel .table-scroll"
+    room = page.evaluate("s => { const e = document.querySelector(s);"
+                         " return e.scrollWidth - e.clientWidth; }", sel)
+    check("narrow window: the streams table has more to swipe to", room > 50, room)
+    page.evaluate("s => { document.querySelector(s).scrollLeft = 120; }", sel)
+    time.sleep(0.3)
+    before = page.inner_text("#streams-panel tbody tr td:nth-child(4)")
+    marker = page.evaluate("s => { const e = document.querySelector(s); e.dataset.mark = 'old';"
+                           " return e.scrollLeft; }", sel)
+    time.sleep(6.5)                        # one fast poll at least
+    replaced = page.evaluate("s => !document.querySelector(s).dataset.mark", sel)
+    after = page.evaluate("s => document.querySelector(s).scrollLeft", sel)
+    check("a poll replaced the table", replaced)
+    check("the swiped table stays where it was left across the poll",
+          abs(after - marker) <= 1 and marker >= 100, (marker, after, before))
+    page.locator("#streams").screenshot(path="/out/health-streams-narrow-scrolled.png")
     browser.close()
 
 stop_live.set()

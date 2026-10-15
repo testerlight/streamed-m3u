@@ -201,6 +201,42 @@
       '</div>';
   }
 
+  /* ── Scroll memory ──────────────────────────────────────────────────── */
+  /* Every poll replaces a panel's HTML, and a replaced scroller starts at 0:
+   * a table swiped sideways on a phone jumped back every five seconds. Each
+   * scroller is remembered by the panel it sits in and its position among
+   * that panel's scrollers, and restored as soon as a re-render replaces it
+   * (a MutationObserver runs before the browser paints). No render function
+   * needs to know about it. */
+  var SCROLLERS = ".table-scroll, .events, .health-timeline, .mv-picker-list";
+  var scrollMemory = {};
+
+  function scrollKey(el) {
+    var panel = el.parentElement && el.parentElement.closest("[id]");
+    if (!panel) { return el.id || null; }
+    var list = panel.querySelectorAll(SCROLLERS);
+    return panel.id + "#" + Array.prototype.indexOf.call(list, el);
+  }
+
+  document.addEventListener("scroll", function (ev) {
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || !el.matches(SCROLLERS)) { return; }
+    var key = scrollKey(el);
+    if (key) { scrollMemory[key] = [el.scrollLeft, el.scrollTop]; }
+  }, true);
+
+  if (window.MutationObserver) {
+    new MutationObserver(function () {
+      document.querySelectorAll(SCROLLERS).forEach(function (el) {
+        var key = scrollKey(el);
+        var at = key && scrollMemory[key];
+        if (!at) { return; }
+        if (el.scrollLeft !== at[0]) { el.scrollLeft = at[0]; }
+        if (el.scrollTop !== at[1]) { el.scrollTop = at[1]; }
+      });
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+
   function table(headers, rows) {
     if (!rows.length) { return null; }
     var head = headers.map(function (h) {
@@ -310,7 +346,11 @@
     });
     Object.keys(state.healthOpen).forEach(function (id) {
       if (!streams.some(function (s) { return s.stream_id === id; })) {
+        var chan = state.healthOpen[id];
         delete state.healthOpen[id];
+        streams.forEach(function (s) {
+          if (chan && s.channel === chan) { state.healthOpen[s.stream_id] = chan; }
+        });
       }
     });
     if (!streams.length) {
@@ -332,7 +372,11 @@
           '<span class="mono">' + esc(s.stream_id) + "</span></td>" +
         healthCell(s) +
         '<td><span class="cell-truncate mono" title="' + esc(s.m3u8_url || s.embed_url) +
-          '">' + esc(shortUrl(s.m3u8_url || s.embed_url)) + "</span></td>" +
+          '">' + esc(shortUrl(s.m3u8_url || s.embed_url)) + "</span>" +
+          (s.source && s.source.playing ? '<div class="health-sub">' +
+            esc(sourceName(s.source.playing) +
+                (s.source.pinned === s.source.playing ? " · your pick" : "")) + "</div>" : "") +
+          "</td>" +
         '<td class="right nowrap">' + dur(s.elapsed_seconds) + "</td>" +
         '<td class="right nowrap cell-strong">' +
           (s.mbit_per_s === null ? "n/a" : s.mbit_per_s + " Mbit/s") + "</td>" +
@@ -381,7 +425,7 @@
   var END_TEXT = {
     client_left: "Player disconnected", console: "Stopped from the console",
     idle_timeout: "Idle limit", playlist_failures: "Playlist failed repeatedly",
-    fatal: "Source link dead"
+    fatal: "Source link dead", source_switch: "Switched source from the console"
   };
 
   function fx(v) {
@@ -520,16 +564,106 @@
   }
 
   function healthRow(s, colspan) {
-    if (!s.health || !state.healthOpen[s.stream_id]) { return ""; }
+    if (!state.healthOpen[s.stream_id] || (!s.health && !s.source)) { return ""; }
     return '<tr class="health-row"><td colspan="' + colspan + '">' +
-      '<div class="health-detail">' + healthFacts(s.health) +
-      healthTimeline(s.health.timeline) + "</div></td></tr>";
+      (s.health ? '<div class="health-detail">' + healthFacts(s.health) +
+        healthTimeline(s.health.timeline) + "</div>" : "") +
+      sourcePicker(s) + "</td></tr>";
   }
 
   function toggleHealth(id) {
+    var s = ((state.lastStreams || {}).streams || []).filter(function (x) {
+      return x.stream_id === id;
+    })[0];
     if (state.healthOpen[id]) { delete state.healthOpen[id]; }
-    else { state.healthOpen[id] = true; }
+    else { state.healthOpen[id] = (s && s.channel) || true; }
     if (state.lastStreams) { renderStreams(state.lastStreams); }
+  }
+
+  /* ── Source picker (in the stats drop-down) ──────────────────────────── */
+  /* Manual only (app.py gotcha #32): a pick is checked while the current
+   * source keeps playing, and only a source whose chunks are real video
+   * replaces it. It then stays the channel's pick for the rest of the match. */
+
+  function sourceName(label) {
+    var m = /^([a-z]+)(\d+)-(HD|SD)$/i.exec(label || "");
+    return m ? m[1] + " " + m[2] + " · " + m[3].toUpperCase() : (label || "");
+  }
+
+  function sourceJobText(job) {
+    if (!job) { return ""; }
+    if (job.state === "checking") {
+      return "Checking " + sourceName(job.label) + ": loading it and testing its newest " +
+        "chunks while this stream keeps playing";
+    }
+    return job.detail ? job.detail.replace(/[a-z]+\d+-(HD|SD)/gi, function (l) {
+      return sourceName(l);
+    }) : "";
+  }
+
+  function sourcePicker(s) {
+    var src = s.source;
+    if (!src) { return ""; }
+    if (src.options.length < 2) {
+      return '<div class="source-picker"><h4 class="source-title">Source</h4>' +
+        '<p class="section-note">Only one source is listed for this game.</p></div>';
+    }
+    var busy = src.job && (src.job.state === "checking" || src.job.state === "switching");
+    var tone = !src.job ? "" : src.job.state === "failed" ? " error" :
+      src.job.state === "done" ? " ok" : "";
+    var items = src.options.map(function (o) {
+      var tags = [];
+      if (o.playing) { tags.push('<span class="badge ok">Playing</span>'); }
+      if (o.pinned) { tags.push('<span class="badge">Your pick</span>'); }
+      return '<li class="source-option">' +
+        '<span class="source-name">' + esc(sourceName(o.label)) + "</span>" +
+        tags.join(" ") +
+        (o.playing ? "" :
+          '<button type="button" class="btn" data-switch-source="' + esc(s.stream_id) +
+            '" data-embed="' + esc(o.embed_url) + '"' + (busy ? " disabled" : "") +
+            ">Switch</button>") +
+        "</li>";
+    }).join("");
+    return '<div class="source-picker">' +
+      '<h4 class="source-title">Source</h4>' +
+      '<p class="section-note">Pick a source for this game. It is checked first while this ' +
+        "stream keeps playing; only if its chunks are real video does the stream restart on " +
+        "it, a few seconds' pause. It then stays this channel's source until the game ends.</p>" +
+      (src.job ? '<p class="source-status' + tone + '">' + esc(sourceJobText(src.job)) + "</p>" : "") +
+      '<ul class="source-options">' + items + "</ul>" +
+      (src.pinned ? '<button type="button" class="btn" data-source-auto="' + esc(s.stream_id) +
+        '"' + (busy ? " disabled" : "") + ">Back to the normal order</button>" : "") +
+      "</div>";
+  }
+
+  function refreshStreams() {
+    get("/stream/status").then(renderStreams).catch(guard("streams-panel", "streams"));
+  }
+
+  function switchSource(id, embedUrl) {
+    document.querySelectorAll("[data-switch-source]").forEach(function (b) { b.disabled = true; });
+    send("POST", "/api/streams/" + encodeURIComponent(id) + "/source", { embed_url: embedUrl })
+      .then(function () {
+        refreshStreams();
+        /* The check takes 10-20s and the restart a few more: poll faster
+         * than the normal cadence until it settles. */
+        var n = 0;
+        var t = setInterval(function () {
+          refreshStreams();
+          n += 1;
+          var still = ((state.lastStreams || {}).streams || []).some(function (x) {
+            return x.source && x.source.job &&
+              (x.source.job.state === "checking" || x.source.job.state === "switching");
+          });
+          if (!still || n > 30) { clearInterval(t); }
+        }, 2000);
+      })
+      .catch(refreshStreams);
+  }
+
+  function sourceAuto(id) {
+    send("POST", "/api/streams/" + encodeURIComponent(id) + "/source/auto", {})
+      .then(refreshStreams).catch(refreshStreams);
   }
 
   /* ── Recent streams ───────────────────────────────────────────────────── */
@@ -2305,6 +2439,17 @@
       var healthToggle = target.closest("[data-health]");
       if (healthToggle) {
         toggleHealth(healthToggle.getAttribute("data-health"));
+        return;
+      }
+      var srcSwitch = target.closest("[data-switch-source]");
+      if (srcSwitch) {
+        switchSource(srcSwitch.getAttribute("data-switch-source"),
+                     srcSwitch.getAttribute("data-embed"));
+        return;
+      }
+      var srcAuto = target.closest("[data-source-auto]");
+      if (srcAuto) {
+        sourceAuto(srcAuto.getAttribute("data-source-auto"));
         return;
       }
       var stop = target.closest("[data-disconnect]");

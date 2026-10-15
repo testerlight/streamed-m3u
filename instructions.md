@@ -1008,6 +1008,38 @@ source can, and that is the user's call. A source picker and Phase 3's
 backup requests were built and then reverted at the user's request
 (2026-10-14); this detection was brought back on its own.
 
+**32. Picking a source is manual, from the stream's stats drop-down.**
+Empty chunks (#31) cannot be filled; only another source can, and the user
+chose a manual pick over automatic fallback. Clicking a stream's Health badge
+opens its stats, which end with the match's sources. Switch calls
+`POST /api/streams/<id>/source`: `_check_source` runs on a thread (the normal
+`_validate_candidate`, then three chunks that must be real video, kept as
+primed) while the current stream plays on. If it passes, the pick is stored
+for the channel and match (`_source_pins`, with the checked payload) and the
+session ends *without* the disconnect hold. Dispatcharr's own retry (3 tries
+within ~1s, then it drops the viewer) reconnects at once; the cascade puts
+the pick first and takes the prepared payload, so no extraction runs. Live
+test 2026-10-14 through the real Dispatcharr: the viewer stayed connected,
+the retry landed 0.35s after the session ended, ~6s pause on the wire. Every
+later reconnect tries the pick first until the match id changes;
+`.../source/auto` clears it; a pick that fails at a later reconnect falls back
+to the normal order. Picks live in memory: a restart forgets them. The
+drop-down follows the channel (`channel` in /stream/status) across the
+switch, since the stream id changes. A next-source button was rejected: on
+the game that found #31, the next two sources down were dead and the clean
+one was fourth. The status helper is `_stream_source_view`: a first draft
+named it `_source_view`, which already belongs to the multi-view panel, and
+took that panel and the console page down.
+
+**33. Scrolled tables keep their place across polls.** Polls replace each
+panel's HTML, and a replaced scroller starts at 0, so a table swiped
+sideways on a phone jumped back every five seconds. `dashboard.js` remembers
+every element matching `SCROLLERS` (key: nearest ancestor with an id, plus
+its index among that panel's scrollers) on each scroll event, and a
+MutationObserver restores it when a re-render replaces it, before the
+browser paints. No render function knows about it; a new scrollable
+container must be added to `SCROLLERS` or it will jump again.
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when

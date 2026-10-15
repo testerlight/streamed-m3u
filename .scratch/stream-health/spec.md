@@ -196,3 +196,14 @@ pauses were "constant, across multiple streams": every channel on the
 (Brewers-Dodgers, NFL Network ~30%). The user then asked for the empty-chunk
 detection alone to come back: dropped, counted as holes, flagged on the
 badge. No source switching, automatic or manual. Instructions gotcha #31.
+
+## Source picker back, in the stats drop-down (2026-10-14, late)
+
+With ~25-30% of the admin HD chunks empty on every channel (buffering, jumps,
+audio out of step in Jellyfin's player at each hole), and the same empty
+URLs confirmed empty through a second VPN exit (Amsterdam) as through New
+York (not our IP: the bucket serves nothing for them), the user asked for the
+source picker back, inside the stream's stats drop-down rather than as a
+separate button, deployed regardless of who was watching. Same behaviour as
+before (check first, then switch; sticks for the game). Also: console tables
+keep their scroll position across polls. Instructions gotchas #32 and #33.

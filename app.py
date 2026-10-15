@@ -1983,6 +1983,11 @@ def update_team_index(matches: list[dict], streams_per_match: list[list[dict]]):
              total, added)
 
 
+def _source_label(s):
+    """'admin1-HD' for one of a match's streams."""
+    return "%s%s-%s" % (s["source"], s["stream_no"], "HD" if s["hd"] else "SD")
+
+
 def _team_candidates(team: str, slot: str):
     """Candidate streams for ?team=..., best first.
 
@@ -2012,9 +2017,7 @@ def _team_candidates(team: str, slot: str):
             "'%s' is listed for %s but has no streams available\n"
             % (slug, entry.get("match_title", "?")), status=503)
 
-    def label(s):
-        return "%s%s-%s" % (s["source"], s["stream_no"],
-                            "HD" if s["hd"] else "SD")
+    label = _source_label
 
     if slot:
         try:
@@ -2883,6 +2886,19 @@ def stream_proxy():
     # Sources already known to carry no audio go to the back rather than being
     # dropped: still usable as a last resort, but no longer worth a full chunk
     # download and a browser extraction ahead of a source that has sound.
+    # A source picked in the console goes first for the rest of the game
+    # (gotcha #32); if it was just checked, its payload is used as is.
+    pin = None
+    if team_arg and not slot_arg and not request.args.get("url"):
+        pin_slug = _slugify(team_arg)
+        pin = _source_pin(pin_slug, _team_match_id(pin_slug))
+        if pin and any(c["embed_url"] == pin["embed_url"] for c in candidates):
+            candidates.sort(key=lambda c: c["embed_url"] != pin["embed_url"])
+            log.info("Console pick for %s: trying %s first", pin_slug, pin["label"])
+        elif pin:
+            _drop_source_pin(pin_slug, "no longer listed for this match")
+            pin = None
+
     if REQUIRE_AUDIO:
         candidates.sort(key=lambda c: _known_silent(c["embed_url"]))
 
@@ -2907,7 +2923,13 @@ def stream_proxy():
         log.info("Resolving stream for: %s (attempt %d/%d, %s)",
                  cand_url, n, tried, cand["label"])
 
-        ok, payload, detail = _validate_candidate(cand_url, cand["label"])
+        prepared = (_take_prepared_source(pin_slug, cand_url)
+                    if pin and cand_url == pin["embed_url"] else None)
+        if prepared is not None:
+            ok, payload, detail = True, prepared, "%s:ok" % cand["label"]
+            log.info("Using the source the console just checked: %s", cand["label"])
+        else:
+            ok, payload, detail = _validate_candidate(cand_url, cand["label"])
         if not ok:
             attempts.append(detail)
             if detail.endswith(":no-audio") and silent_fallback is None:
@@ -2935,6 +2957,9 @@ def stream_proxy():
         source_label = cand_label
         log.warning("No source with audio for this match - falling back to "
                     "silent %s (%s)", cand_label, cand_url)
+
+    if pin:
+        _source_switch_landed(pin_slug, pin, source_label if probe_segments is not None else None)
 
     if probe_segments is None:
         detail = ", ".join(attempts) or "none tried"
@@ -3332,6 +3357,8 @@ def stream_proxy():
             # Empty placeholders the source sent instead of chunks, dropped
             # (gotcha #31). Each is a hole of that chunk's length.
             "chunks_empty":      0,
+            # Which of the match's streams this is, e.g. "admin1-HD".
+            "source_label":      source_label,
             "hold_key":          hold_key,
             # Set when this stream is feeding a composite rather than a
             # viewer, as "<slot>/<role>". Sent as a header rather than a
@@ -3426,6 +3453,264 @@ def _stop_active_stream(stream_id: str) -> str:
     return "ok"
 
 
+# ─── Manual source choice (console) ──────────────────────────────────────────
+# Gotcha #32. No automatic switching: the operator picks a source in the
+# stream's stats drop-down, it is checked while the current one keeps
+# playing, and only a source whose chunks are real video replaces it. The
+# session then ends *without* the disconnect hold, so the player's reconnect
+# (Dispatcharr retries at once) finds the checked source ready and skips the
+# cascade. The pick sticks for the rest of that match: every reconnect on the
+# channel tries it first. In memory only: a restart forgets picks.
+
+SOURCE_PREPARED_TTL = 60.0   # a checked source waits this long for the reconnect
+SOURCE_CHECK_CHUNKS = 3      # chunks that must be real video, the first included
+SOURCE_JOB_KEEP_S = 120.0    # how long a finished check stays on the console
+
+_source_pins = {}   # slug -> {embed_url, label, match_id, set_at, prepared, prepared_at}
+_source_jobs = {}   # slug -> {state, label, detail, at}
+_source_lock = threading.Lock()
+
+_CHECK_FAILURES = (
+    ("no-extract", "no stream link"),
+    ("no-segments", "its playlist is empty"),
+    ("no-audio", "no audio track"),
+)
+
+
+def _team_match_id(slug):
+    with _team_lock:
+        return (_team_map.get(slug) or {}).get("match_id")
+
+
+def _match_sources(slug):
+    """(match_id, [{embed_url, label, hd}]) for what this channel is showing."""
+    with _team_lock:
+        entry = _team_map.get(slug)
+        entry = dict(entry) if entry else None
+    if not entry:
+        return None, []
+    return entry.get("match_id"), [
+        {"embed_url": s["embed_url"], "label": _source_label(s), "hd": bool(s.get("hd"))}
+        for s in entry.get("streams") or []]
+
+
+def _source_pin(slug, match_id):
+    """The console's pick for this channel, if it is still the same match."""
+    with _source_lock:
+        pin = _source_pins.get(slug)
+        if pin and pin["match_id"] != match_id:
+            _source_pins.pop(slug, None)
+            log.info("Console pick for %s dropped: the match has changed", slug)
+            pin = None
+        return dict(pin) if pin else None
+
+
+def _drop_source_pin(slug, why):
+    with _source_lock:
+        pin = _source_pins.pop(slug, None)
+    if pin:
+        log.info("Console pick for %s (%s) dropped: %s", slug, pin["label"], why)
+
+
+def _take_prepared_source(slug, embed_url):
+    """The payload the console's check produced, once, if still fresh."""
+    with _source_lock:
+        pin = _source_pins.get(slug)
+        if not pin or pin["embed_url"] != embed_url or not pin.get("prepared"):
+            return None
+        payload, pin["prepared"] = pin["prepared"], None
+        if time.time() - pin["prepared_at"] > SOURCE_PREPARED_TTL:
+            return None
+        return payload
+
+
+def _set_source_job(slug, state, label, detail=""):
+    with _source_lock:
+        _source_jobs[slug] = {"state": state, "label": label, "detail": detail,
+                              "at": time.time()}
+
+
+def _source_switch_landed(slug, pin, playing_label):
+    """A stream started while a pick was set: close out a pending switch."""
+    with _source_lock:
+        job = _source_jobs.get(slug)
+        pending = job is not None and job["state"] == "switching"
+    if not pending:
+        return
+    if playing_label == pin["label"]:
+        _set_source_job(slug, "done", pin["label"], "Now playing %s" % pin["label"])
+    elif playing_label:
+        _set_source_job(slug, "failed", pin["label"],
+                        "%s failed when the stream restarted; playing %s instead"
+                        % (pin["label"], playing_label))
+    else:
+        _set_source_job(slug, "failed", pin["label"],
+                        "%s failed when the stream restarted, and so did every "
+                        "other source" % pin["label"])
+
+
+def _check_source(embed_url, label):
+    """The startup check, plus proof that the newest chunks are real video.
+
+    Returns (payload, detail): payload as _validate_candidate's, with every
+    chunk it downloaded primed so the switch does not fetch them twice; or
+    (None, why it failed) in words for the console.
+    """
+    ok, payload, detail = _validate_candidate(embed_url, label)
+    if not ok:
+        reason = detail.split(":", 1)[-1]
+        for key, text in _CHECK_FAILURES:
+            if reason == key:
+                return None, text
+        if reason.startswith("probe-"):
+            return None, "its playlist answered HTTP %s" % reason[6:]
+        if reason.startswith("segment-"):
+            return None, "its first chunk failed (HTTP %s)" % reason[8:]
+        return None, reason
+    d, h, c, segs, primed = payload
+    primed = dict(primed)
+    tested, empty = 0, 0
+    for body in primed.values():
+        tested += 1
+        empty += 1 if _is_empty_chunk(body) else 0
+    for u in [u for u in segs[::-1] if u not in primed][:max(0, SOURCE_CHECK_CHUNKS - tested)]:
+        try:
+            r = cf_requests.get(u, headers=_headers_for_url(u, h),
+                                cookies=_cookies_for_url(u, c),
+                                timeout=SEGMENT_PROBE_TIMEOUT, impersonate="chrome",
+                                curl_options=_upstream_curl_options())
+            body = r.content if r.status_code == 200 else b""
+        except Exception:
+            body = b""
+        tested += 1
+        if not body or _is_empty_chunk(body):
+            empty += 1
+        else:
+            primed[u] = body
+    if empty:
+        return None, "%d of %d test chunks were empty or missing" % (empty, tested)
+    return (d, h, c, segs, primed), "%d test chunks were real video" % tested
+
+
+def _run_source_switch(stream_id, slug, match_id, src):
+    label = src["label"]
+    log.info("Console source switch for %s: checking %s", slug, label)
+    payload, detail = _check_source(src["embed_url"], label)
+    if payload is None:
+        _set_source_job(slug, "failed", label, "%s did not pass: %s" % (label, detail))
+        log.warning("Console source switch for %s: %s did not pass (%s); "
+                    "the current stream is untouched", slug, label, detail)
+        return
+    now = time.time()
+    with _source_lock:
+        _source_pins[slug] = {"embed_url": src["embed_url"], "label": label,
+                              "match_id": match_id, "set_at": now,
+                              "prepared": payload, "prepared_at": now}
+    _set_source_job(slug, "switching", label,
+                    "%s passed (%s); restarting the stream on it" % (label, detail))
+    with _active_streams_lock:
+        rec = _active_streams.get(stream_id)
+        ev = rec.get("stop") if rec else None
+        health = rec.get("health") if rec else None
+    if ev is not None:
+        # No disconnect hold: the reconnect must be let straight back in.
+        (health or streamhealth.NULL).end("source_switch", label)
+        ev.set()
+    log.info("Console source switch for %s: %s passed (%s); stream %s ended so "
+             "the player reconnects onto it", slug, label, detail, stream_id)
+
+
+def _switch_source(stream_id, embed_url):
+    """Console: check one of this stream's match sources, then move to it.
+
+    Returns (status, label): 'ok', 'invalid', 'missing', 'not_team',
+    'unknown_source' or 'busy'. The check runs on its own thread.
+    """
+    if not _STREAM_ID_RE.match(stream_id or ""):
+        return "invalid", None
+    with _active_streams_lock:
+        rec = _active_streams.get(stream_id)
+        hold_key = (rec or {}).get("hold_key") or ""
+        playing = (rec or {}).get("embed_url")
+        mv = (rec or {}).get("multiview")
+    if rec is None:
+        return "missing", None
+    if mv or not hold_key.startswith("team:"):
+        return "not_team", None
+    slug = hold_key[len("team:"):]
+    match_id, sources = _match_sources(slug)
+    src = next((x for x in sources if x["embed_url"] == embed_url), None)
+    if src is None:
+        return "unknown_source", None
+    with _source_lock:
+        job = _source_jobs.get(slug)
+        if (job and job["state"] in ("checking", "switching")
+                and time.time() - job["at"] < SOURCE_PREPARED_TTL + 30):
+            return "busy", None
+    if embed_url == playing:
+        with _source_lock:
+            _source_pins[slug] = {"embed_url": embed_url, "label": src["label"],
+                                  "match_id": match_id, "set_at": time.time(),
+                                  "prepared": None, "prepared_at": 0}
+        _set_source_job(slug, "done", src["label"],
+                        "%s is already playing; it stays for the rest of this game"
+                        % src["label"])
+        return "ok", src["label"]
+    _set_source_job(slug, "checking", src["label"])
+    threading.Thread(target=_run_source_switch, args=(stream_id, slug, match_id, src),
+                     daemon=True, name="source-switch").start()
+    return "ok", src["label"]
+
+
+def _clear_source_choice(stream_id):
+    """Console: forget this channel's pick; the normal order applies from
+    the next start. The current stream is left alone."""
+    if not _STREAM_ID_RE.match(stream_id or ""):
+        return "invalid"
+    with _active_streams_lock:
+        rec = _active_streams.get(stream_id)
+        hold_key = (rec or {}).get("hold_key") or ""
+    if rec is None:
+        return "missing"
+    if not hold_key.startswith("team:"):
+        return "not_team"
+    slug = hold_key[len("team:"):]
+    _drop_source_pin(slug, "cleared from the console")
+    _set_source_job(slug, "done", "", "Back to the normal order from the next start")
+    return "ok"
+
+
+def _stream_source_view(rec):
+    """The picker's data for one active stream, or None if it has no choice.
+    Not `_source_view`: that name is the multi-view panel's (one side of a
+    slot); reusing it broke that panel once (2026-10-14)."""
+    hold_key = rec.get("hold_key") or ""
+    if rec.get("multiview") or not hold_key.startswith("team:"):
+        return None
+    slug = hold_key[len("team:"):]
+    match_id, sources = _match_sources(slug)
+    pin = _source_pin(slug, match_id)
+    now = time.time()
+    with _source_lock:
+        job = dict(_source_jobs.get(slug) or {}) or None
+    if job and job["state"] in ("done", "failed") and now - job["at"] > SOURCE_JOB_KEEP_S:
+        job = None
+    if job and job["state"] == "switching" and now - job["at"] > SOURCE_PREPARED_TTL:
+        job = dict(job, state="waiting",
+                   detail="No reconnect yet; %s will be used when the channel next "
+                          "starts" % job["label"])
+    if job:
+        job["age_s"] = round(now - job.pop("at"), 1)
+    return {
+        "playing": rec.get("source_label"),
+        "pinned": pin["label"] if pin else None,
+        "options": [dict(x, playing=x["embed_url"] == rec.get("embed_url"),
+                         pinned=bool(pin and x["embed_url"] == pin["embed_url"]))
+                    for x in sources],
+        "job": job,
+    }
+
+
 @app.route("/stream/status")
 def stream_status():
     if auth.enabled() and not auth.logged_in():
@@ -3450,6 +3735,11 @@ def stream_status():
             "prefix_stripped":  s.get("prefix_stripped", 0),
             "prefix_bytes":     s.get("prefix_bytes", 0),
             "chunks_empty":     s.get("chunks_empty", 0),
+            # The channel this stream plays ("team:<slug>" or "url:<embed>"),
+            # so the console can follow it across a source switch.
+            "channel":          s.get("hold_key"),
+            # The match's sources for the console's picker (gotcha #32).
+            "source":           _stream_source_view(s),
             "bytes_sent":       s["bytes_sent"],
             "mb_sent":          round(s["bytes_sent"] / 1_048_576, 2),
             "mbit_per_s":       round(s["bytes_sent"] * 8 / 1e6 / elapsed, 2)
@@ -4045,6 +4335,8 @@ dashboard.register_dashboard(
     config_values=lambda: globals(),
     apply_settings=lambda s, o: _settings.apply_live(globals(), s, o),
     stop_stream=_stop_active_stream,
+    switch_source=_switch_source,
+    clear_source=_clear_source_choice,
     stream_history=_stream_history,
     refresh_extract=_refresh_extract_entry,
     clear_extract=_clear_extract_entry,

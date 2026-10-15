@@ -739,6 +739,150 @@ def unit_tests(app):
     check("the stand-in swallows every hook", n.delivered("x", 1) is None and n.snapshot() is None)
 
 
+# ─── Manual source choice ─────────────────────────────────────────────────────
+
+def source_choice_tests(app, client, port):
+    """The console picker against four fake sources for one match: A works,
+    B works, C sends only empty placeholders, D cannot be extracted."""
+    base = "http://127.0.0.1:%d/" % port
+    for key, fail in (("srcA", None), ("srcB", None),
+                      ("srcC", {n: "empty" for n in range(400)})):
+        SCENARIOS[key] = Scenario(key, take=10 ** 6, seg_fail=fail)
+        SCENARIOS[key].reset()
+    E = {k: "http://fake-embed.test/source-%s" % k for k in "ABCD"}
+    urls = {E["A"]: base + "srcA/master.m3u8", E["B"]: base + "srcB/master.m3u8",
+            E["C"]: base + "srcC/master.m3u8", E["D"]: None}
+    app.extract_m3u8_via_browser = (
+        lambda e, *a, **k: {"url": urls[e], "headers": {}, "cookies": {},
+                            "browser_m3u8_status": 200} if urls.get(e) else None)
+    with app._team_lock:
+        app._team_roster["srcteam"] = {"name": "Src Team", "kind": "team", "sport": "test"}
+        app._team_map["srcteam"] = {
+            "team": "Src Team", "away": "Test", "category": "Live", "sport": "test",
+            "poster": "", "starts": int(time.time() * 1000), "kind": "team", "side": "home",
+            "match_id": "m1", "match_title": "Src vs Test",
+            "streams": [{"embed_url": E["A"], "source": "admin", "stream_no": 1, "hd": True},
+                        {"embed_url": E["B"], "source": "golf", "stream_no": 1, "hd": True},
+                        {"embed_url": E["C"], "source": "hotel", "stream_no": 1, "hd": True},
+                        {"embed_url": E["D"], "source": "admin", "stream_no": 2, "hd": False}]}
+
+    def reader():
+        out = {"first": None, "done": threading.Event(), "stop": threading.Event(),
+               "t0": time.time()}
+
+        def run():
+            resp = client.get("/stream?team=srcteam", buffered=False)
+            out["status"] = resp.status_code
+            try:
+                for item in resp.response:
+                    if item != app.TS_NULL_PACKET and out["first"] is None:
+                        out["first"] = time.time() - out["t0"]
+                    if out["stop"].is_set():
+                        break
+            finally:
+                resp.close()
+                out["done"].set()
+        threading.Thread(target=run, daemon=True).start()
+        return out
+
+    def active(timeout=20.0, label=None):
+        end = time.time() + timeout
+        while time.time() < end:
+            with app._active_streams_lock:
+                for r in app._active_streams.values():
+                    if r.get("hold_key") == "team:srcteam" and (
+                            label is None or r.get("source_label") == label):
+                        return r["stream_id"], r.get("source_label")
+            time.sleep(0.1)
+        return None, None
+
+    def job(states, timeout=40.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            j = app._source_jobs.get("srcteam")
+            if j and j["state"] in states:
+                return dict(j)
+            time.sleep(0.1)
+        return dict(app._source_jobs.get("srcteam") or {})
+
+    r1 = reader()
+    sid, label = active()
+    check("a channel starts on the first source", label == "admin1-HD", label)
+    st = client.get("/stream/status").get_json()
+    view = next((x.get("source") for x in st["streams"] if x["stream_id"] == sid), None) or {}
+    check("/stream/status lists the match's four sources, the playing one marked",
+          len(view.get("options") or []) == 4
+          and [o["label"] for o in view["options"] if o["playing"]] == ["admin1-HD"], view)
+
+    check("a dead source is accepted for checking", app._switch_source(sid, E["D"])[0] == "ok")
+    j = job(("failed", "switching", "done"))
+    check("a dead source fails its check, in words", j.get("state") == "failed"
+          and "no stream link" in j.get("detail", ""), j)
+    check("and the stream is untouched", active(1)[0] == sid and not r1["done"].is_set())
+
+    app._switch_source(sid, E["C"])
+    j = job(("failed", "switching", "done"))
+    check("a source sending empty placeholders fails its check",
+          j.get("state") == "failed" and "empty" in j.get("detail", ""), j)
+    check("and the stream is still untouched", active(1)[0] == sid and not r1["done"].is_set())
+
+    check("an unknown source is refused", app._switch_source(sid, "http://elsewhere/x")[0]
+          == "unknown_source")
+    r = client.post("/api/streams/%s/source" % sid, json={})
+    check("the API wants an embed_url", r.status_code == 400, r.status_code)
+
+    check("a good source is accepted", app._switch_source(sid, E["B"])[0] == "ok")
+    check("a second switch while one runs is refused",
+          app._switch_source(sid, E["A"])[0] == "busy")
+    j = job(("switching", "failed", "done"))
+    check("the good source passes its check", j.get("state") in ("switching", "done"), j)
+    r1["done"].wait(10)
+    check("the old stream ended", r1["done"].is_set())
+    check("without a disconnect hold, so the reconnect is let in",
+          not app._disconnect_held("team:srcteam"))
+    r2 = reader()                                   # what Dispatcharr does next
+    sid2, label = active(label="golf1-HD")
+    deadline = time.time() + 5
+    while r2["first"] is None and time.time() < deadline:
+        time.sleep(0.05)
+    check("the reconnect plays the picked source", label == "golf1-HD", label)
+    check("from the checked payload: first video within 1s",
+          r2["first"] is not None and r2["first"] < 1.0, r2["first"])
+    check("the switch reports done", job(("done",), 5).get("detail") == "Now playing golf1-HD",
+          app._source_jobs.get("srcteam"))
+
+    r2["stop"].set(); r2["done"].wait(10)
+    r3 = reader()
+    sid3, label = active()
+    check("the pick sticks across a later reconnect", label == "golf1-HD", label)
+    check("picking what is already playing just keeps it",
+          app._switch_source(sid3, E["B"])[0] == "ok"
+          and "already playing" in job(("done",), 2).get("detail", ""))
+    check("back to the normal order", app._clear_source_choice(sid3) == "ok"
+          and app._source_pins.get("srcteam") is None)
+    r3["stop"].set(); r3["done"].wait(10)
+    r4 = reader()
+    sid4, label = active()
+    check("the next start uses the normal order again", label == "admin1-HD", label)
+    r4["stop"].set(); r4["done"].wait(10)
+
+    app._source_pins["srcteam"] = {"embed_url": E["B"], "label": "golf1-HD",
+                                   "match_id": "m1", "set_at": time.time(),
+                                   "prepared": None, "prepared_at": 0}
+    with app._team_lock:
+        app._team_map["srcteam"]["match_id"] = "m2"
+    check("a new match drops the pick", app._source_pin("srcteam", "m2") is None)
+    with app._active_streams_lock:
+        app._active_streams["abcdef01"] = {"stream_id": "abcdef01", "hold_key": "url:x",
+                                           "embed_url": "x", "multiview": None}
+    try:
+        check("a ?url= stream has no source choice",
+              app._switch_source("abcdef01", E["A"])[0] == "not_team")
+    finally:
+        with app._active_streams_lock:
+            app._active_streams.pop("abcdef01", None)
+
+
 # ─── Rigs ─────────────────────────────────────────────────────────────────────
 
 HOOKS = ("download_begin", "download_attempt", "download_bytes", "download_end",
@@ -1014,6 +1158,9 @@ def main():
         check("every one of them was IPv4 only",
               all(o == {CurlOpt.IPRESOLVE: 1} for _u, o in seen),
               [x for x in seen if x[1] != {CurlOpt.IPRESOLVE: 1}][:3])
+
+        section("manual source choice")
+        source_choice_tests(app, client, port)
 
         section("status endpoint")
         r = client.get("/api/streams/history?limit=5")

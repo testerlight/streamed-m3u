@@ -147,6 +147,7 @@ END_REASONS = {
     "idle_timeout":      "Idle limit: no new video",
     "playlist_failures": "Playlist failed repeatedly",
     "fatal":             "Source link dead",
+    "source_switch":     "Switched source from the console",
 }
 
 # What the loop was doing -> what a freeze during it is blamed on. "sending"

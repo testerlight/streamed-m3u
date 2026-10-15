@@ -454,6 +454,8 @@ showing, and the old file is kept as `lineup.json.pre-allowlist`.
 | `/prewarm` | Pre-warm state per favourite |
 | `/stream/status` | Active streams with throughput and health |
 | `GET /api/streams/history` | Finished streams, newest first, with their health and totals |
+| `POST /api/streams/<id>/source` | Check one of the stream's match sources (`{"embed_url": ...}`) and, if its chunks are real video, restart the stream on it for the rest of the game (session and CSRF). Answers 202; progress is in `/stream/status`. |
+| `POST /api/streams/<id>/source/auto` | Forget the channel's source pick; the normal order applies from its next start (session and CSRF) |
 | `/api/overview`, `/api/config`, `/api/cache`, `/api/events` | Console data |
 | `PUT /api/settings` | Change settings (session and CSRF token required) |
 | `/playlist.m3u` | Legacy per-match playlist, kept as a fallback |
@@ -500,6 +502,12 @@ then carries on. Those placeholders are dropped rather than passed to the
 player, counted as missing video, and flagged on the stream's Health badge
 ("Source sending empty chunks: 8 of the last 20"). Nothing can fill the gap;
 if it keeps happening, another source for the game is the only way round it.
+
+**Picking a source.** Click a stream's Health badge: its stats end with the
+game's sources. **Switch** checks the one you pick while the current one keeps
+playing; only if its chunks are real video does the stream restart on it, with
+a pause of a few seconds. It then stays that channel's source until the game
+ends, or until **Back to the normal order**. Nothing switches by itself.
 
 ## Limitations
 
