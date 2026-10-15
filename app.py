@@ -3849,8 +3849,10 @@ def _clear_source_choice(stream_id):
     return "ok"
 
 
-def _source_view(rec):
-    """The picker's data for one active stream, or None if it has no choice."""
+def _stream_source_view(rec):
+    """The picker's data for one active stream, or None if it has no choice.
+    Not `_source_view`: that name is the multi-view panel's (one side of a
+    slot), and reusing it broke that panel."""
     hold_key = rec.get("hold_key") or ""
     if rec.get("multiview") or not hold_key.startswith("team:"):
         return None
@@ -3903,7 +3905,7 @@ def stream_status():
             "prefix_bytes":     s.get("prefix_bytes", 0),
             "chunks_empty":     s.get("chunks_empty", 0),
             # The match's sources for the console's picker (gotcha #32).
-            "source":           _source_view(s),
+            "source":           _stream_source_view(s),
             "bytes_sent":       s["bytes_sent"],
             "mb_sent":          round(s["bytes_sent"] / 1_048_576, 2),
             "mbit_per_s":       round(s["bytes_sent"] * 8 / 1e6 / elapsed, 2)
