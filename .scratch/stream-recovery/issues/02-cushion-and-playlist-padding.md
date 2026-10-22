@@ -1,7 +1,7 @@
 # 30s cushion and padding during playlist waits
 
 Status: ready-for-agent
-Blocked by: 01
+Blocked by: none (01 resolved and watched on real games 2026-10-22)
 
 Spec: ../spec.md. Gotcha #20 (keepalive), #30 (IPv4).
 
