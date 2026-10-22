@@ -1097,6 +1097,80 @@ Verified through the real route and Jellyfin's ffmpeg input line
   real providers may differ; the first real game with a long hole is the test
   (look for the `Restamped` line and an audio-in-step report).
 
+**35. The start is capped at `BEHIND_LIVE_S` behind live (and the window is the
+real cap), and the playlist request is padded.** Stream recovery ticket 02
+(`.scratch/stream-recovery/issues/02-cushion-and-playlist-padding.md`).
+
+*The start.* The probe's playlist is the whole window, oldest first, and
+`stream_ts` has always sent all of it before polling: **the proxy already
+started at the oldest chunk the source offers** (the 12-15s `behind_live_max_s`
+in every history line is that start). So `BEHIND_LIVE_S` (30; 0 = off) is a
+*cap*, not a floor: `_cushion_cut` drops the oldest chunks of the start until
+at most that many seconds remain, never the newest, never when an EXTINF is
+unknown. The cut chunks are marked seen (else the next poll, which still lists
+them, sends them out of order) and are not holes (`_missed` is not called:
+nothing was missing, it started later). Everything after the start is
+unchanged and stays sequential: chunks still listed after a stall go oldest
+first, chunks that left the window are skipped as before, nothing jumps to the
+live edge. The achieved cushion is therefore `min(setting, window)`, and the
+window on the sources seen is **about 12-20s** (3-6 chunks of 3-6s, derived
+from `behind_live_max_s` plus one chunk over the last 40 history lines;
+`window_s` now records it directly). **With a 30s setting nothing changes on
+those sources**; it only bites on a source with a window over 30s, where it
+reduces today's burst and today's cushion (measured: a 60s window and 30s of
+silence from the source: old image smallest cushion 29.8s, new 0.0s, no
+freeze in either, but nothing to spare). Getting a real 30s on a 17s
+window needs the proxy to hold the start and buffer chunks as they publish
+(first picture ~13s later, and the chunks held in memory): not built, the
+user's call. A history projection (last 40 streams, every listed freeze
+against a window-limited cushion, 13s more of it) takes 1,766s of frozen time
+to 159s.
+
+- **Recorded.** `start_window` and `start_done` (guarded hooks) add
+  `window_s` (median of the playlist windows seen), `cushion_wanted_s`,
+  `start_cushion_s` (what the first burst put in hand, measured when it is
+  sent) and `start_trimmed_chunks` to `/stream/status` and the history line, a
+  timeline event, one log line (`Starting 20s behind live: the playlist only
+  offers 20s, which is the limit (setting 30s)`) and a "Started" row in the
+  stats drop-down. `window_s` is recorded even with the setting at 0. While
+  the first burst is being sent the tracker keeps it out of the behind-live
+  figures (it is the point of the setting, not lag), so `behind_live_*` now
+  means lag after the start; the cushion starts at the burst's length and
+  cannot go negative.
+- **Costs.** Never a larger burst than before (the old start was the whole
+  window). If the cut removes the chunk the probe downloaded, the new first
+  chunk is a fresh download: one chunk later to first picture (~0.5s at the
+  85 Mbit/s median link, ~13s at the 4 Mbit/s of gotcha #16). A 30s burst of
+  8-10 Mbit/s video is 30-38 MB, ~3.5s at the median link, read by Dispatcharr
+  and then at real time by Jellyfin's `-re`, so the cushion sits in
+  Dispatcharr's buffer; how much of it a client that joins late is given
+  (`initial_behind_chunks`) is Dispatcharr's, not measured here.
+- **Fails closed.** The cut and the hooks are in separate `try` blocks; an
+  exception in the cut sends the whole window, as before. Interactions
+  checked in `tools/check_cushion.py`: dedup with re-signed URLs, the WebP
+  prefix strip, empty placeholders in the burst, a 10s hole inside the burst
+  (still one restamp, none from the start), a slow reader, restamp and
+  tracker hooks raising.
+
+*The padding.* `_generate` used to send nothing while `get_segments` ran, and
+that request can hang for most of its 15s timeout (the three 15-19s freezes
+of 2026-10-13). `PLAYLIST_KEEPALIVE` (on) runs it on a worker thread like
+`_fetch_with_keepalive` and yields a null packet per
+`STREAM_KEEPALIVE_INTERVAL` while it runs. Null packets only (no video, no
+cushion, not in `bytes_sent`, `last_data_at` untouched, so the 45s idle
+timeout still fires on time), never mid-chunk. Off, or with the interval at
+0, it is the plain call: no thread, same timing. An exception in the request
+is re-raised in the loop, which answers it with `loop_error` and `_idle(2)` as
+before. **Padding does not shorten a freeze**: it keeps Dispatcharr from
+seeing silence (a 13s hang: longest silence on the wire 13.0s, 1.0s with
+padding). A playlist that answers 500 six times in a row (~12s) still ends the
+stream (`consecutive_failures`), padded or not: that is ticket 03/04 material.
+
+Verified in `streamed-m3u:verify-cushion` (nothing live): `check_health.py`
+192 checks and `--compare` against the running image byte-identical with
+matching timing, also with both settings off; `check_cushion.py` (units,
+tracker, route, and the time-driven player-side scenarios).
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when

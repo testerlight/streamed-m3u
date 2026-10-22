@@ -233,6 +233,15 @@ SCHEMA = [
     _s("HOLE_RESTAMP_MIN_S", "HOLE_RESTAMP_MIN_S", "Playback", "live", "float",
        "Shortest missing span that is restamped. ffmpeg's own jump threshold is 10s; "
        "shorter holes stay byte passthrough.", min=1, max=60),
+    _s("BEHIND_LIVE_S", "BEHIND_LIVE_S", "Playback", "live", "float",
+       "Play about this many seconds behind live: a stream starts at the oldest chunk the "
+       "source's playlist still offers, up to this far back, and stays in order after a "
+       "stall. The playlist window (about 12-20s on the sources seen) caps it. 0: no limit, "
+       "the whole window, as before.", min=0, max=300),
+    _s("PLAYLIST_KEEPALIVE", "PLAYLIST_KEEPALIVE", "Playback", "live", "bool",
+       "Send null-packet padding while a playlist request is running, as is already done "
+       "during chunk downloads, so Dispatcharr does not see silence. Makes no video. Off: "
+       "nothing is sent during the request."),
     _s("STREAM_IDLE_TIMEOUT", "STREAM_IDLE_TIMEOUT", "Playback", "live", "int",
        "Seconds without a new segment before a stream is treated as dead.", min=5, max=600),
     _s("STREAM_KEEPALIVE_INTERVAL", "STREAM_KEEPALIVE_INTERVAL", "Playback", "live", "float",

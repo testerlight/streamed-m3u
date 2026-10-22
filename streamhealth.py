@@ -534,6 +534,16 @@ class StreamHealth:
         self.restamps = 0
         self.restamp_s = 0.0
         self.restamp_list = []
+        # The start behind live (app.py BEHIND_LIVE_S, gotcha #35): the
+        # source's playlist window, what was asked for, what the first burst
+        # actually put in front of the player, and how many chunks were left
+        # out to stay within the setting.
+        self._windows = deque(maxlen=PLAYLIST_BASELINE_WINDOW)
+        self._start_window_s = None
+        self.cushion_wanted_s = None
+        self.start_cushion_s = None
+        self.start_trimmed = 0
+        self._start_burst = False
 
         self.end_reason = None
         self.end_detail = None
@@ -966,7 +976,9 @@ class StreamHealth:
                     if key in keys:
                         behind = sum(d or 0 for _k, _s, d
                                      in self._latest[keys.index(key) + 1:])
-            if behind is not None:
+            # The first burst of a start behind live is the point of the
+            # setting, not lag: keep it out of the behind-live figures.
+            if behind is not None and not self._start_burst:
                 self.behind_now = behind
                 self._behind.append(behind)
 
@@ -1054,6 +1066,9 @@ class StreamHealth:
                 self._last_ms = ms
             if info.get("latest"):
                 self._latest = info["latest"]
+                span = sum(d or 0 for _k, _s, d in info["latest"])
+                if span > 0:
+                    self._windows.append(span)
             if info.get("endlist") and not self.endlist:
                 self.endlist = True
                 self._event("endlist", "Source says the broadcast has ended", now)
@@ -1144,6 +1159,43 @@ class StreamHealth:
                 self._event("empty", text, now)
         if text:
             (log.warning if level == "warning" else log.info)("%s: %s", self._who(), text)
+
+    # ── hooks: the start behind live (generator thread) ──────────────────────
+
+    @_guarded
+    def start_window(self, window_s, wanted_s, start_s, trimmed):
+        """The stream is about to start `start_s` behind live: the playlist
+        offered `window_s`, the setting wanted up to `wanted_s`, and `trimmed`
+        of the oldest chunks were left out to stay within it. Records only."""
+        with self._lock:
+            now = self._now()
+            window_s, wanted_s, start_s = float(window_s), float(wanted_s), float(start_s)
+            trimmed = int(trimmed)
+            self._start_window_s = window_s
+            self.cushion_wanted_s = wanted_s
+            self.start_trimmed = trimmed
+            self._start_burst = True
+            if trimmed:
+                msg = ("Starting %.0fs behind live: the playlist offers %.0fs, so the "
+                       "oldest %d chunk(s) were left out to stay within the %.0fs setting"
+                       % (start_s, window_s, trimmed, wanted_s))
+            elif window_s < wanted_s - 0.5:
+                msg = ("Starting %.0fs behind live: the playlist only offers %.0fs, "
+                       "which is the limit (setting %.0fs)" % (start_s, window_s, wanted_s))
+            else:
+                msg = ("Starting %.0fs behind live (playlist window %.0fs, setting %.0fs)"
+                       % (start_s, window_s, wanted_s))
+            self._event("cushion", msg, now)
+        log.info("%s: %s", self._who(), msg)
+
+    @_guarded
+    def start_done(self):
+        """The first burst has been sent: what the player now has in hand."""
+        with self._lock:
+            self._start_burst = False
+            cushion, _frozen = self._cushion_now(self._now())
+            if cushion is not None:
+                self.start_cushion_s = cushion
 
     # ── hooks: restamping (generator thread) ─────────────────────────────────
 
@@ -1363,6 +1415,11 @@ class StreamHealth:
             "empty_s": _r(self.empty_s),
             "restamps": self.restamps,
             "restamp_s": _r(self.restamp_s),
+            "window_s": _r(_median(self._windows) if self._windows
+                           else self._start_window_s),
+            "cushion_wanted_s": _r(self.cushion_wanted_s),
+            "start_cushion_s": _r(self.start_cushion_s),
+            "start_trimmed_chunks": self.start_trimmed,
             "empty_recent": {"empty": sum(1 for x in self._empty_recent if x),
                              "of": len(self._empty_recent)},
             "reconnect": None if r is None else {

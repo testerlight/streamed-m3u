@@ -513,6 +513,19 @@
     return parts.join("; ");
   }
 
+  /* The start behind live: what the first burst put in hand, against the
+     source's playlist window and the setting (BEHIND_LIVE_S). */
+  function startText(h) {
+    if (h.window_s === null || h.window_s === undefined) { return "n/a"; }
+    var t = secs(h.window_s) + " playlist window";
+    if (h.start_cushion_s !== null && h.start_cushion_s !== undefined) {
+      t = secs(h.start_cushion_s) + " ahead at the start (" + t +
+        ", setting " + secs(h.cushion_wanted_s) +
+        (h.start_trimmed_chunks ? "; " + plural(h.start_trimmed_chunks, "chunk") + " left out" : "") + ")";
+    }
+    return t;
+  }
+
   function healthFacts(h) {
     var rc = h.reconnect;
     var facts = [
@@ -523,6 +536,7 @@
       ["Quality taken", variantText(h)],
       ["Cushion", secs(h.cushion_s)],
       ["Behind live", secs(h.behind_live_s)],
+      ["Started", startText(h)],
       ["Freezes", h.freezes ? plural(h.freezes, "freeze") + ", " + secs(h.frozen_s) +
         " total (" + causeList(h.by_cause) + ")" : "none"],
       ["Jumps", plural(h.skipped || 0, "chunk") + " skipped, " +

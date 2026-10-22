@@ -445,6 +445,20 @@ UPSTREAM_IPV4 = os.getenv("UPSTREAM_IPV4", "1") == "1"
 # passthrough. Off: every chunk is sent exactly as it came.
 HOLE_RESTAMP = os.getenv("HOLE_RESTAMP", "1") == "1"
 HOLE_RESTAMP_MIN_S = float(os.getenv("HOLE_RESTAMP_MIN_S", "8"))
+# Play about this many seconds behind the live edge (stream recovery ticket 02,
+# gotcha #35). A stream starts at the oldest chunk the source's playlist still
+# offers, but no more than this far back, and then stays sequential: whatever a
+# stall leaves in the playlist is sent oldest first, never skipped to the live
+# edge. The source's playlist window (about 12-20s on the sources seen so far)
+# is the real limit, so the cushion is min(this, window); stream health
+# records both. 0: no limit, the whole window, exactly as before.
+BEHIND_LIVE_S = float(os.getenv("BEHIND_LIVE_S", "30"))
+# Pad with null packets while a playlist request is running, as chunk
+# downloads already are (gotcha #20). The request can hang for most of its 15s
+# timeout and the proxy sent nothing meanwhile, so Dispatcharr saw a stalled
+# stream. Padding is null packets only: it makes no video and no cushion.
+# Off: nothing is sent during the request, as before.
+PLAYLIST_KEEPALIVE = os.getenv("PLAYLIST_KEEPALIVE", "1") == "1"
 # Some sources publish a video elementary stream and no audio one at all -
 # observed on `admin`, which carries a raw MLB.TV feed. Playback looks fine and
 # is silent, and _rank_streams puts `admin` above `delta` (both HD, `admin`
@@ -813,6 +827,30 @@ def _upstream_curl_options():
     """Per-request curl options for stream sources (see UPSTREAM_IPV4).
     Read at call time, so the setting applies live."""
     return {CurlOpt.IPRESOLVE: 1} if UPSTREAM_IPV4 else None   # 1 = CURL_IPRESOLVE_V4
+
+
+def _cushion_cut(durations, cap_s):
+    """How many of the oldest chunks of a start to leave out so that the video
+    sent in the first burst is at most cap_s seconds (BEHIND_LIVE_S).
+
+    `durations` are the EXTINFs of the playlist's chunks, oldest first. The
+    newest chunk is always kept. Returns 0 (send everything, as before) when
+    the cap is off or any duration is unknown: a start is never guessed.
+    """
+    try:
+        if not cap_s or cap_s <= 0 or not durations:
+            return 0
+        if any(d is None or d <= 0 for d in durations):
+            return 0
+        kept, n = 0.0, 0
+        for d in reversed(durations):
+            if n and kept + d > cap_s + 1e-6:
+                break
+            kept += d
+            n += 1
+        return len(durations) - n
+    except Exception:
+        return 0
 
 
 def get_segments(m3u8_url, headers, cookies, _depth=0, info=None):
@@ -3203,13 +3241,76 @@ def stream_proxy():
                     yield TS_NULL_PACKET
                 return result.get("body")
 
+            def _playlist_with_keepalive(pl):
+                """get_segments, yielding keepalives while the request runs.
+
+                The request can hang for most of its 15s timeout (measured
+                2026-10-13: three 15-19s freezes, each one) and the loop sent
+                nothing meanwhile, which Dispatcharr reads as a stalled
+                stream (gotcha #20). Same pattern as _fetch_with_keepalive:
+                the request runs on a worker thread, this pads the wait, and
+                the result is the generator's return value (use `yield from`).
+                Null packets only, so no video and no cushion. Off, or with
+                keepalives disabled, it is the plain call: no thread, no
+                change in timing. An exception in the request is raised here,
+                where the loop handles it as it always did.
+                """
+                if not PLAYLIST_KEEPALIVE or STREAM_KEEPALIVE_INTERVAL <= 0:
+                    return get_segments(m3u8_url, headers, cookies, info=pl)
+                result = {}
+
+                def _run():
+                    try:
+                        result["r"] = get_segments(m3u8_url, headers, cookies, info=pl)
+                    except BaseException as exc:      # re-raised in the loop
+                        result["exc"] = exc
+
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
+                while True:
+                    t.join(STREAM_KEEPALIVE_INTERVAL)
+                    if not t.is_alive():
+                        break
+                    if stop.is_set():
+                        return None, 0
+                    _bump("keepalives_sent")
+                    yield TS_NULL_PACKET
+                if "exc" in result:
+                    raise result["exc"]
+                return result["r"]
+
             consecutive_failures = 0
             last_data_at = time.time()  # tracks when we last yielded actual data
             delivered = 0               # segments that actually reached the player
 
+            # Start no further back than BEHIND_LIVE_S (gotcha #35). The probe's
+            # playlist is the whole window, oldest first; chunks cut from the
+            # front are marked seen so the next poll does not bring them back
+            # out of order. Any failure here sends the whole window, as before.
+            start_segments = initial_segments
+            behind_start = False
+            durs, drop = None, 0
+            try:
+                if BEHIND_LIVE_S > 0 and initial_segments:
+                    durs = [streamhealth.chunk_meta(u)[1] for u in initial_segments]
+                    drop = _cushion_cut(durs, BEHIND_LIVE_S)
+                    start_segments = initial_segments[drop:]
+                    for u in initial_segments[:drop]:
+                        add_seen(u)
+                        if primed:
+                            primed.pop(u, None)
+            except Exception:
+                start_segments, durs = initial_segments, None
+            try:
+                if durs and all(durs):
+                    H.start_window(sum(durs), BEHIND_LIVE_S, sum(durs[drop:]), drop)
+                    behind_start = True
+            except Exception:
+                pass
+
             # Yield segments already fetched during the probe - no wasted
             # round-trip and the stream starts immediately.
-            for seg_url in initial_segments:
+            for seg_url in start_segments:
                 add_seen(seg_url)
                 # Already fetched during the segment probe - reuse it so the
                 # validation costs no extra round-trip.
@@ -3262,6 +3363,11 @@ def stream_proxy():
                     yield chunk
                 H.delivered(seg_url, len(body))
 
+            if behind_start:
+                try:
+                    H.start_done()
+                except Exception:
+                    pass
             if initial_segments:
                 last_data_at = time.time()
             # Count what actually reached the player, not what was attempted -
@@ -3285,9 +3391,10 @@ def stream_proxy():
                 try:
                     H.playlist_begin()
                     pl = {}
-                    segments, status = get_segments(m3u8_url, headers, cookies,
-                                                    info=pl)
+                    segments, status = yield from _playlist_with_keepalive(pl)
                     if not segments:
+                        if status == 0 and stop.is_set():
+                            return              # stopped while the request ran
                         H.playlist_failed(status, empty=segments is not None)
                         consecutive_failures += 1
                         if status in FATAL_STATUS_CODES:
