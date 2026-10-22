@@ -1,18 +1,20 @@
-# Mark a timestamp break at each hole
+# Close the timestamp jump after long holes (restamp)
 
 Status: ready-for-agent
 Blocked by: none
 
-Spec: ../spec.md. Gotcha #31 (empty chunks dropped), #29 (health hooks), #16/#20.
+Spec: ../spec.md. Gotcha #31 (empty chunks dropped), #29 (health hooks), #16/#20/#36. Measurement is in the `## Answer` below (the discontinuity flag was tried and does not work; user chose restamping on 2026-10-22).
 
-When a chunk is dropped as a hole (403, empty, left the window), set the TS discontinuity indicator on the first packets of the next delivered chunk so the player resyncs audio and video. Passthrough otherwise untouched.
+When the span of video missing before a delivered chunk exceeds `HOLE_RESTAMP_MIN_S` (default 8s, ffmpeg's jump threshold is 10s), shift every PTS, DTS and PCR in that chunk and all later ones back by the missing span, so the timeline stays continuous. The span comes from EXTINF of the dropped/skipped chunks (or the PTS gap if EXTINF is missing), never from a guessed chunk length. Shorter holes stay byte-passthrough.
 
 ## Acceptance
 
-- First reproduce: build a TS stream with a missing chunk, run it through ffmpeg as Jellyfin does, and measure the A/V offset after the hole. Record the result in this ticket. If the flag does not fix it, stop and report; do not widen scope.
-- Off switch setting; off = byte-identical output.
-- Hook exception-guarded; unit test with a rigged raise.
-- Holes still counted by the tracker as today.
+- Reuse the logic proven in `tools/check_hole_av.py` (`RESTAMP=1`); re-run it on the final implementation: offset after 12s and 18s holes within 0.1s in every mode, including `-re -readrate_catchup 100 -fflags +igndts -f mpegts` (the real Jellyfin line, from its transcode log).
+- Only PES-start and PCR packets are rewritten; everything else is untouched. Handle wrap-around of the 33-bit clocks.
+- Off switch setting; off = byte-identical output. With no hole over the threshold, output is byte-identical even when on.
+- Hook exception-guarded; on any error send the chunk unmodified. Unit test with a rigged raise.
+- Holes still counted by the tracker as today; record each restamp (span, chunk) in stream health and the log.
+- Test with messy failures (slow, partial, then fine), not only clean drops.
 - instructions.md gotcha added, settings table regenerated.
 
 ## Answer

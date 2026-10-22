@@ -15,7 +15,7 @@ Smooth playback and audio always in step, as long as the provider delivers the b
 - Play about 30s behind live (setting). Start from the oldest chunk in the playlist window, stay sequential, never jump forward after a stall. The window may cap the cushion; log the real window per source.
 - Applies to all channels. Every piece has its own live off switch (setting, no rebuild).
 - Ship order, each piece deployed alone and watched on real games before the next: 01 -> 02 -> 03 -> 04. Deploy whether or not anyone is watching, with a rollback tag first.
-- Hole: keep byte passthrough but flag a timestamp discontinuity so the player resyncs (not ffmpeg in the path).
+- Hole: the discontinuity flag was tried first and does not work (ticket 01 `## Answer`: ffmpeg reacts to the timestamp jump, not the flag; holes of 12s+ put audio out of step in Jellyfin's mode, single 6s holes do not). Decided 2026-10-22: after a missing span over ~8s, restamp PTS/DTS/PCR of the following chunks back by that span; shorter holes stay byte-passthrough. Not ffmpeg in the path.
 - Pad with keepalive null packets while a playlist request hangs (previously declined, now agreed).
 - 403: re-read the playlist and retry on the fresh link before declaring a hole.
 - Automatic source switch, trigger: source silent 20s+, or 3+ freezes in 2 min, or 3+ holes in the last 20 chunks. Candidate pre-checked with the existing `_check_source` while the current plays; max one switch per 2 min; never straight back; stay put if nothing passes; logged; manual picker kept (ADR 0001).
@@ -29,6 +29,6 @@ Smooth playback and audio always in step, as long as the provider delivers the b
 
 ## Unverified assumptions (ticket 01 must settle the first)
 
-- A TS discontinuity flag at a hole keeps Jellyfin's A/V in step. The audio offset was never measured (the 2026-10-22 capture failed: no cached link, extraction timed out).
+- Restamping keeps Jellyfin's A/V in step on real sources. Measured only on a synthetic source (ticket 01); needs a real capture. The long skips (chunks that left the window during a playlist hang) are the suspected real trigger, not the single 403s.
 - The 403s are dead signed links (inferred from the retry failing 0.1s later).
 - NFL Network has only 2 candidate sources; auto-switch may rarely help there.
