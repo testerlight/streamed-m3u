@@ -1,6 +1,6 @@
 # Close the timestamp jump after long holes (restamp)
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 Spec: ../spec.md. Gotcha #31 (empty chunks dropped), #29 (health hooks), #16/#20/#36. Measurement is in the `## Answer` below (the discontinuity flag was tried and does not work; user chose restamping on 2026-10-22).
@@ -33,3 +33,7 @@ Measured 2026-10-22 with `tools/check_hole_av.py` (inside a scratch image's ffmp
 - **What does fix it**: closing the jump on our side. Shifting every PTS, DTS and PCR in the chunks after a hole back by the hole's length (`RESTAMP=1` in the tool) leaves a continuous timeline: after 18s of holes the offset is 0.03-0.04s in every mode (the -1.45 in hls + `-copyts` is the same start-up artifact as the control). That is a rewrite of the bytes at PES-start and PCR packets (a few percent of packets), not byte passthrough, so it departs from the "flag, keep passthrough" decision and needs the user's call.
 
 Stopped here per the ticket: the flag was not implemented in `app.py`. Caveats: synthetic content and a guessed Jellyfin command line (real sources' chunk boundaries, B-frames and audio alignment may differ); the 2026-10-22 NFL Network holes were mostly single 403 chunks, which this says are harmless, so the real offset episodes need consecutive holes over 10s or a different trigger. Next step: a capture of the real stream (or Jellyfin's actual ffmpeg line from its transcode log) through the same tool.
+
+## Resolved
+
+Implemented in 1f9a6c6 (restamp.py, gotcha #34, settings HOLE_RESTAMP default on, HOLE_RESTAMP_MIN_S 8). Verified in scratch image streamed-m3u:verify-restamp: tools/check_restamp.py ALL PASS (re-run independently), check_health.py 192 checks and byte-identical comparison, check_console.py 169 checks. Not deployed. Real-source behaviour unverified: watch for the "Restamped from chunk N" log line on the first long hole.
