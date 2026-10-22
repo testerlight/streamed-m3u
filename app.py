@@ -61,6 +61,7 @@ from flask import Flask, Response, jsonify, request, has_request_context
 import auth
 import dashboard
 import streamhealth
+import restamp
 import dockerctl
 import composite
 import lineup
@@ -434,6 +435,16 @@ SEGMENT_MAX_MB = int(os.getenv("SEGMENT_MAX_MB", "64"))
 # IPv6 default route, which is Docker's bridge, not the VPN tunnel. Set to 0
 # to restore the library default without a rebuild.
 UPSTREAM_IPV4 = os.getenv("UPSTREAM_IPV4", "1") == "1"
+# After chunks go missing (dropped, empty, or gone from the playlist before
+# they were fetched) the next chunk's timestamps jump forward by the missing
+# span. Past ffmpeg's 10s jump threshold, Jellyfin's transcode keeps the jump
+# and the audio stays that far out of step with the picture until re-tuning
+# (measured 2026-10-22, ticket 01). With this on, a missing span over
+# HOLE_RESTAMP_MIN_S moves the PTS/DTS/PCR of the next chunk and every later one
+# back by that span (restamp.py, gotcha #34). Shorter holes stay byte
+# passthrough. Off: every chunk is sent exactly as it came.
+HOLE_RESTAMP = os.getenv("HOLE_RESTAMP", "1") == "1"
+HOLE_RESTAMP_MIN_S = float(os.getenv("HOLE_RESTAMP_MIN_S", "8"))
 # Some sources publish a video elementary stream and no audio one at all -
 # observed on `admin`, which carries a raw MLB.TV feed. Playback looks fine and
 # is silent, and _rank_streams puts `admin` above `delta` (both HD, `admin`
@@ -2994,6 +3005,35 @@ def stream_proxy():
             _bump("chunks_empty")
             H.empty_chunk(seg_url)
 
+        # Restamping (restamp.py, gotcha #34). Both helpers are guarded: a
+        # failure here sends the chunk as it came and nothing else changes.
+        R = restamp.Restamper()
+
+        def _missed(seg_url):
+            """A chunk is not going to be sent: the next one follows a hole."""
+            try:
+                if HOLE_RESTAMP:
+                    seq, dur = streamhealth.chunk_meta(seg_url)
+                    R.missing(seq, dur)
+            except Exception:
+                pass
+
+        def _restamped(seg_url, body):
+            """The chunk to send in place of body (the same object, unless a
+            hole over HOLE_RESTAMP_MIN_S came before it)."""
+            try:
+                if not HOLE_RESTAMP:
+                    R.reset()
+                    return body
+                seq, dur = streamhealth.chunk_meta(seg_url)
+                out = R.chunk(body, seq, dur, HOLE_RESTAMP_MIN_S)
+                ev = R.event
+                if ev:
+                    H.restamped(seg_url, ev["span_s"], ev["from"], ev["missing"])
+                return out
+            except Exception:
+                return body
+
         def fetch_segment(seg_url):
             """Download one chunk whole, or return None.
 
@@ -3177,10 +3217,12 @@ def stream_proxy():
                     raw = primed.pop(seg_url)
                     if _is_empty_chunk(raw):
                         _empty(seg_url)
+                        _missed(seg_url)
                         continue
                     body, cut = _strip_ts_prefix(raw)
                     if cut:
                         _note_prefix(cut)
+                    body = _restamped(seg_url, body)
                     delivered += 1
                     H.sending()
                     for off in range(0, len(body), 8192):
@@ -3201,10 +3243,12 @@ def stream_proxy():
                 else:
                     H.download_end(seg_url, body)
                 if body is None:
+                    _missed(seg_url)
                     continue
                 body, cut = _strip_ts_prefix(body)
                 if cut:
                     _note_prefix(cut)
+                body = _restamped(seg_url, body)
                 delivered += 1
                 H.sending()
                 for off in range(0, len(body), 8192):
@@ -3283,10 +3327,12 @@ def stream_proxy():
                         # edge moves away from us.
                         add_seen(seg_url)
                         if body is None:
+                            _missed(seg_url)
                             continue
                         body, cut = _strip_ts_prefix(body)
                         if cut:
                             _note_prefix(cut)
+                        body = _restamped(seg_url, body)
                         loop_delivered += 1
                         H.sending()
                         for off in range(0, len(body), 8192):

@@ -226,6 +226,13 @@ SCHEMA = [
     _s("UPSTREAM_IPV4", "UPSTREAM_IPV4", "Playback", "live", "bool",
        "Reach stream sources over IPv4 only. Behind the VPN, an IPv6 lookup costs "
        "about 2s per request and the IPv6 route bypasses the tunnel."),
+    _s("HOLE_RESTAMP", "HOLE_RESTAMP", "Playback", "live", "bool",
+       "After chunks go missing, move the timestamps of the next chunk and every later "
+       "one back by the missing span, so Jellyfin's audio stays in step with the picture. "
+       "Off: chunks are sent exactly as they came."),
+    _s("HOLE_RESTAMP_MIN_S", "HOLE_RESTAMP_MIN_S", "Playback", "live", "float",
+       "Shortest missing span that is restamped. ffmpeg's own jump threshold is 10s; "
+       "shorter holes stay byte passthrough.", min=1, max=60),
     _s("STREAM_IDLE_TIMEOUT", "STREAM_IDLE_TIMEOUT", "Playback", "live", "int",
        "Seconds without a new segment before a stream is treated as dead.", min=5, max=600),
     _s("STREAM_KEEPALIVE_INTERVAL", "STREAM_KEEPALIVE_INTERVAL", "Playback", "live", "float",

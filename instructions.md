@@ -72,8 +72,10 @@ fingerprint → re-served as a raw TS byte stream.
 | `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
 | `streamhealth.py` | Watch-only stream health: speed, cushion, freezes and causes, jumps, end reasons, early warnings scored against the freezes that followed, and the `/data/stream_history.jsonl` writer. Changes nothing a stream sends. Gotcha #29. |
+| `restamp.py` | Closes the timestamp jump a long hole leaves: moves PTS/DTS/PCR of the chunks after it back by the missing span, so Jellyfin's audio stays in step. Pure, fail-safe, live off switch `HOLE_RESTAMP`. Gotcha #34. |
 | `tools/reorder_channels.py` | Channel numbering. `--dump-config` prints the built-in order as editable JSON. |
 | `tools/channel_order.example.json` | Generated: exactly `reorder_channels.py --dump-config`. Regenerate it, do not edit it; `check_reorder.py` fails if it drifts. |
+| `tools/check_restamp.py`, `tools/check_hole_av.py` | Restamping: unit tests on hand-built TS, then the real `/stream` route against a scripted origin serving real ffmpeg-made chunks that fail messily (403, half-sent, slow, gone from the playlist), then the beep-minus-flash offset through several ffmpeg transcodes including Jellyfin's input line. `check_hole_av.py` is the measuring tool. About 8 minutes (the `jelly_*` modes run in real time). #34. |
 | `tools/check_pacing.py` | Does a composite play at real speed when its inputs arrive in production-shaped bursts? Frame-numbered picture, read back per output frame. `MODE=smooth`/`filler`, `SECONDARY=none`. About a minute; run it after any change to the feeders or the ffmpeg argv. #34-#38. |
 | `tools/check_reorder.py` | Offline proof of the numbering. Pure planner, synthetic channel list, no Dispatcharr. §12b. |
 | `tools/soak_multiview.py` | Run on the **host**. Plays a Multi-Player channel through Dispatcharr's proxy (as Jellyfin does), optionally with an ordinary channel alongside and every control stepped, and reports gaps, Dispatcharr's unhealthy/switch counts, encoder exits, CPU and GPU. No Dispatcharr login. |
@@ -1039,6 +1041,61 @@ its index among that panel's scrollers) on each scroll event, and a
 MutationObserver restores it when a re-render replaces it, before the
 browser paints. No render function knows about it; a new scrollable
 container must be added to `SCROLLERS` or it will jump again.
+
+**34. After a hole over 8s the timestamps are moved back, so Jellyfin's audio
+stays in step.** Chunks that never arrive (dropped after a failed download,
+empty placeholders #31, or gone from the playlist before they were fetched)
+leave the next chunk's PTS, DTS and PCR jumping forward by the missing span.
+Measured 2026-10-22 (`tools/check_hole_av.py`, `.scratch/stream-recovery/
+issues/01-hole-discontinuity.md`): one missing 6s chunk puts nothing out of
+step, but 12s and 18s do, in the transcodes that keep input timestamps
+(`-copyts`, `igndts`, which is Jellyfin's mode): audio ends up exactly the
+hole's length ahead of the picture, until the input is reopened. A TS
+`discontinuity_indicator` on every stream changed nothing, because ffmpeg
+reacts to the size of the jump and does not read the flag. So `restamp.py`
+closes the jump itself: when the span missing before a delivered chunk is over
+`HOLE_RESTAMP_MIN_S` (8s; ffmpeg's threshold is 10s), that chunk and every
+later one of the stream has its PTS, DTS and PCR moved back by the span.
+Verified through the real route and Jellyfin's ffmpeg input line
+(`-re -readrate_catchup 100 -fflags +igndts -f mpegts`): offset after 12s and
+24s of holes 0.02-0.08s, against -12 and -24s with it off.
+`tools/check_restamp.py` is the harness.
+
+- **The span is never a guessed chunk length.** Dropped and empty chunks add
+  their EXTINF (`streamhealth.chunk_meta`, the playlist record the tracker
+  keeps). Chunks that left the playlist unseen (the long skips after a
+  playlist hang) have no EXTINF, so the gap between the previous chunk's last
+  PTS and this one's first is the span. When both exist they must agree
+  within max(1s, 20%), otherwise the chunk is left alone: a source that
+  restarted its clock has a playlist hole and no timestamp hole. A gap over
+  120s, or a hole before anything was sent, is not restamped either.
+- **Only PES-start and PCR packets are rewritten**, the 33-bit clocks wrap,
+  and nothing is touched when the shift is zero (same object back), so with no
+  hole over the threshold, or `HOLE_RESTAMP=0`, the bytes are identical to
+  before. Holes under the threshold stay passthrough, and later chunks keep
+  whatever shift earlier long holes set. Switching it off mid-stream forgets
+  the shift (the timeline jumps back once); it is a live setting, but a
+  stream that had been shifted should be re-tuned.
+- **It fails to the old behaviour.** `Restamper.chunk` and the two
+  guarded helpers in `stream_ts` (`_missed`, `_restamped`) swallow any
+  exception: the chunk goes out as it came, and after a failure the stream
+  sends everything unmodified (one jump, not two). A chunk that is not 188-
+  aligned transport stream is skipped without counting as a failure.
+  `check_restamp.py` rigs `shift_chunk` to raise and checks the video equals
+  the off output.
+- **It costs a pass over each chunk once a shift is in force** (under 0.1 s
+  for 6 MB in pure Python, on the stream's own thread, before the chunk is
+  sent). With no shift only the head and tail of a chunk are read.
+- **Recorded, not hidden.** Holes are counted by the tracker exactly as before
+  (`downloads_failed`, `skipped`, `empty_chunks`). Each restamp adds a
+  timeline event and log line (`Restamped from chunk N: timestamps moved back
+  Xs ...`) and `restamps`, `restamp_s` and `restamp_list` (span, chunks, where
+  the span came from) to `/stream/status` and the history line.
+- **Not proven on a real source.** The measurement and the harness use a
+  synthetic source (6s chunks, H.264 + AAC) and Jellyfin's input line from its
+  transcode log. B-frame depth, audio alignment and chunk boundaries of the
+  real providers may differ; the first real game with a long hole is the test
+  (look for the `Restamped` line and an audio-in-step report).
 
 ## 8. Endpoint reference
 

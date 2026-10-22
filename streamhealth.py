@@ -300,6 +300,18 @@ def note_playlist(url, text, resolve, info=None):
         _warn_once("parse", "Playlist parse failed (tracking only)")
 
 
+def chunk_meta(url):
+    """(media sequence, EXTINF or target duration) of a chunk this process has
+    seen listed in a playlist; (None, None) if never. Never raises. Used by
+    app.py's restamping, so it reads the same record the tracker does."""
+    try:
+        with _meta_lock:
+            m = _meta.get(_key(url))
+        return (m[0], m[1]) if m else (None, None)
+    except Exception:
+        return None, None
+
+
 _warned = set()
 
 
@@ -518,6 +530,10 @@ class StreamHealth:
         self._empty_recent = deque(maxlen=EMPTY_WINDOW)  # True = empty, per chunk
         self._empty_run = False
         self._empty_logged = None     # [last logged at, count since]
+        # Timestamp jumps closed by restamping (restamp.py, app.py gotcha #34).
+        self.restamps = 0
+        self.restamp_s = 0.0
+        self.restamp_list = []
 
         self.end_reason = None
         self.end_detail = None
@@ -1129,6 +1145,28 @@ class StreamHealth:
         if text:
             (log.warning if level == "warning" else log.info)("%s: %s", self._who(), text)
 
+    # ── hooks: restamping (generator thread) ─────────────────────────────────
+
+    @_guarded
+    def restamped(self, url, span_s, how, missing):
+        """The chunk about to be sent had its timestamps moved back by span_s,
+        closing the jump a hole of `missing` chunk(s) left. Records only: the
+        hole itself was counted as a drop, a skip or an empty chunk."""
+        with self._lock:
+            now = self._now()
+            seq = chunk_meta(url)[0]
+            self.restamps += 1
+            self.restamp_s += span_s
+            if len(self.restamp_list) < FREEZE_LIST_MAX:
+                self.restamp_list.append({"at_s": round(now - self.started, 1),
+                                          "span_s": round(span_s, 1), "chunks": missing,
+                                          "from": how, "seq": seq})
+            text = ("Restamped from chunk %s: timestamps moved back %.1fs to close "
+                    "a hole of %d chunk(s) (span from the %s)"
+                    % (seq if seq is not None else "?", span_s, missing, how))
+            self._event("restamp", text, now)
+        log.info("%s: %s", self._who(), text)
+
     # ── the watcher (its own thread) ─────────────────────────────────────────
 
     @_guarded
@@ -1323,6 +1361,8 @@ class StreamHealth:
             "download_quiet_max_s": _r(self.download_quiet_max),
             "empty_chunks": self.empty_chunks,
             "empty_s": _r(self.empty_s),
+            "restamps": self.restamps,
+            "restamp_s": _r(self.restamp_s),
             "empty_recent": {"empty": sum(1 for x in self._empty_recent if x),
                              "of": len(self._empty_recent)},
             "reconnect": None if r is None else {
@@ -1384,6 +1424,7 @@ class StreamHealth:
             "behind_live_median_s": _r(_median(self._behind)),
             "behind_live_max_s": _r(max(self._behind) if self._behind else None),
             "freeze_list": list(self.freezes),
+            "restamp_list": list(self.restamp_list),
             "warning_list": [{"kind": w["kind"], "at_s": _r(w["raised"] - self.started),
                               "s": _r((w["cleared"] or now) - w["raised"]),
                               "hit": w["hit"], "lead_s": _r(w["lead"])}
@@ -1423,6 +1464,9 @@ def _summary_line(rec):
     if rec.get("empty_chunks"):
         parts.append("%d empty chunk(s), %.0fs of video missing"
                      % (rec["empty_chunks"], rec.get("empty_s") or 0))
+    if rec.get("restamps"):
+        parts.append("%d restamp(s) closing %.0fs of timestamp jump"
+                     % (rec["restamps"], rec.get("restamp_s") or 0))
     for n, label in ((rec.get("skipped"), "chunk(s) skipped"),
                      (jumps, "jump(s) back"),
                      (rec.get("downloads_failed"), "chunk(s) dropped"),

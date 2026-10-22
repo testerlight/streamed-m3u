@@ -390,6 +390,8 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `SEGMENT_RETRIES` | `1` | live | Extra attempts for a failed chunk. Small on purpose: retries drag the live edge. |
 | `SEGMENT_MAX_MB` | `64` | live | Sanity cap on a buffered chunk, since chunks are held in RAM before forwarding. |
 | `UPSTREAM_IPV4` | `on` | live | Reach stream sources over IPv4 only. Behind the VPN, an IPv6 lookup costs about 2s per request and the IPv6 route bypasses the tunnel. |
+| `HOLE_RESTAMP` | `on` | live | After chunks go missing, move the timestamps of the next chunk and every later one back by the missing span, so Jellyfin's audio stays in step with the picture. Off: chunks are sent exactly as they came. |
+| `HOLE_RESTAMP_MIN_S` | `8.0` | live | Shortest missing span that is restamped. ffmpeg's own jump threshold is 10s; shorter holes stay byte passthrough. |
 | `STREAM_IDLE_TIMEOUT` | `45` | live | Seconds without a new segment before a stream is treated as dead. |
 | `STREAM_KEEPALIVE_INTERVAL` | `1.0` | live | Seconds between null packets sent while waiting on a slow chunk, so the client does not give up. |
 | `STREAM_SEEN_MAX` | `300` | live | Segment URLs remembered per stream, bounding memory on long sessions. |

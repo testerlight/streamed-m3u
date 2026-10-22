@@ -16,8 +16,14 @@ Run inside a scratch-tag image (it has ffmpeg), never against a live source:
 
 HOLES is a comma list of chunk numbers to drop ("none" for a control run).
 MARK=1 runs each transcode a second time with the flag. RESTAMP=1 instead
-shifts every later chunk's PTS/DTS/PCR back by the hole's length, so the
-timeline has no jump at all. A real capture can
+shifts every later chunk's PTS/DTS/PCR back by the hole's length (with the
+image's own restamp.shift_chunk, the code the proxy runs), so the timeline
+has no jump at all. The `jelly_*` modes use the input side of the line from
+Jellyfin's transcode log (`-analyzeduration 3000000 -probesize 1G -re
+-readrate_catchup 100 -fflags +igndts -f mpegts`); they run in real time,
+so each takes as long as the source, and they need Jellyfin's ffmpeg (the
+Debian one lacks -readrate_catchup): set JELLY=1 there, otherwise they are
+skipped. A real capture can
 stand in for the synthetic one: put its chunks in /w/src/seg000.ts,
 seg001.ts, ... (flashes and beeps are then not known, so the offsets mean
 nothing; only the synthetic source can be measured).
@@ -69,42 +75,13 @@ def mark(b, scan=2000):
     return bytes(out) + bytes(b)
 
 
-M33 = (1 << 33) - 1
+sys.path.insert(0, "/app")
+import restamp  # noqa: E402  (the module the proxy runs)
 
-def enc_ts(prefix, v):
-    v &= M33
-    return bytes([(prefix << 4) | (((v >> 30) & 7) << 1) | 1, (v >> 22) & 0xFF,
-                  (((v >> 15) & 0x7F) << 1) | 1, (v >> 7) & 0xFF, ((v & 0x7F) << 1) | 1])
-
-def dec_ts(b):
-    return ((b[0] >> 1) & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | (b[4] >> 1)
 
 def shift(b, delta):
-    """Move every PTS, DTS and PCR in a chunk by delta (90 kHz ticks)."""
-    b = bytearray(b)
-    for i in range(0, len(b) - 187, 188):
-        if b[i] != 0x47: continue
-        afc = (b[i+3] >> 4) & 3
-        off = i + 4
-        if afc & 2:
-            alen = b[i+4]
-            if alen >= 7 and b[i+5] & 0x10:      # PCR present
-                base = (b[i+6] << 25) | (b[i+7] << 17) | (b[i+8] << 9) | (b[i+9] << 1) | (b[i+10] >> 7)
-                base = (base + delta) & M33
-                b[i+6] = (base >> 25) & 0xFF; b[i+7] = (base >> 17) & 0xFF
-                b[i+8] = (base >> 9) & 0xFF;  b[i+9] = (base >> 1) & 0xFF
-                b[i+10] = ((base & 1) << 7) | (b[i+10] & 0x7F)
-            off = i + 5 + alen
-        if afc & 1 and b[i+1] & 0x40 and b[off:off+3] == b"\x00\x00\x01":
-            flags = b[off+7] >> 6
-            if flags & 2:
-                p = off + 9
-                pts = dec_ts(b[p:p+5]) + delta
-                b[p:p+5] = enc_ts(3 if flags == 3 else 2, pts)
-                if flags == 3:
-                    d = dec_ts(b[p+5:p+10]) + delta
-                    b[p+5:p+10] = enc_ts(1, d)
-    return bytes(b)
+    return restamp.shift_chunk(b, delta)
+
 
 def make_source():
     d = os.path.join(W, "src")
@@ -161,6 +138,12 @@ def events(path, kind):
     return ev
 
 
+def offsets(path):
+    """Beep-minus-flash (s) for every flash/beep pair in a media file."""
+    v, a = events(path, "v"), events(path, "a")
+    return [round(a[k] - v[k], 2) for k in range(min(len(v), len(a)))], len(v), len(a)
+
+
 def analyse(label, path):
     v, a = events(path, "v"), events(path, "a")
     exp = [t for t in range(0, TOTAL, 2) if t // CHUNK not in HOLES]
@@ -178,6 +161,9 @@ HLS = ["-f", "hls", "-hls_time", "6", "-hls_segment_type", "mpegts", "-hls_list_
        "-hls_playlist_type", "event"]
 CP = ["-copyts", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "2048"]
 GP = ["-fflags", "+genpts", "-i", "{in}"]
+# Jellyfin's input line (from its transcode log); output side simplified.
+JIN = ["-analyzeduration", "3000000", "-probesize", "1G", "-re", "-readrate_catchup", "100",
+       "-fflags", "+igndts", "-f", "mpegts", "-i", "{in}"]
 MODES = {
     "plain":      ["-i", "{in}"] + JELLY + ["-f", "mpegts", "{out}.ts"],
     "copyts":     GP + JELLY + CP + ["-f", "mpegts", "{out}.ts"],
@@ -185,6 +171,8 @@ MODES = {
     "hls_copyts": GP + JELLY + CP + ["-fps_mode", "cfr"] + HLS + ["{out}.m3u8"],
     "hls_igndts": ["-fflags", "+genpts+igndts", "-i", "{in}"] + JELLY + CP + HLS + ["{out}.m3u8"],
     "hls_async":  GP + JELLY + ["-af", "aresample=async=1:first_pts=0"] + HLS + ["{out}.m3u8"],
+    "jelly_ts":   JIN + JELLY + ["-f", "mpegts", "{out}.ts"],
+    "jelly_hls":  JIN + JELLY + CP + HLS + ["{out}.m3u8"],
 }
 
 if __name__ == "__main__":
@@ -194,6 +182,8 @@ if __name__ == "__main__":
         p = W + "/in_%s.ts" % tag.replace(" ", "")
         build(p, flag)
         for m, args in MODES.items():
+            if m.startswith("jelly") and not os.environ.get("JELLY"):
+                continue       # needs Jellyfin's ffmpeg (-readrate_catchup) and real time
             out = W + "/out_%s_%s" % (tag.replace(" ", ""), m)
             run(["ffmpeg", "-y"] + [x.replace("{in}", p).replace("{out}", out) for x in args])
             analyse("%s / %s" % (tag, m), out + (".m3u8" if "hls" in m else ".ts"))
