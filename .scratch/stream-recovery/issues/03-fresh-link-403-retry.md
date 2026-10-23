@@ -34,3 +34,7 @@ So: expect `same_url` to dominate and `url_differed` to be a small minority at b
 Verified in `streamed-m3u:verify-403` (scratch tag, nothing live touched): `check_freshlink.py` 85 checks (403 then fresh URL works; identical URL, no retry; re-read 500, hung, slow; three in a row with and without restamp; first chunk of a start; fresh URL 404 or empty; switch off; hooks and helpers rigged to raise; no padding; idle limit after a recovery); switch off byte-identical to the running image with matching timing (median 0.03s) and `clean` with the switch on likewise; `check_health.py` 192 and `--compare` identical; `check_console.py`, `check_multiview.py` (MULTIVIEW_ENABLE=1), `check_restamp.py` (53), `check_cushion.py` (68), `check_health_render.py` pass.
 
 Deploy checklist (user's call): rollback tag first; after the first game read `fresh_link` in the stats drop-down / `stream_history.jsonl` (`url_differed`, `succeeded`, `fresh_link_list`) and record the live answer here.
+
+## Built and deployed 2026-10-23
+
+Commit 326bc4c, FRESH_LINK_RETRY (default on), gotcha #36, tools/check_freshlink.py (85 checks, re-run independently), health/console/multi-view/restamp/cushion passing, byte-identical to the live image with the switch off. Outcome counters (attempted / url_differed / succeeded / same_url ...) in stream health will settle whether a re-read ever yields a working link; if url_differed stays ~0 the next idea is a delayed re-read.
