@@ -1,7 +1,7 @@
 # Retry a 403'd chunk on a fresh link
 
 Status: ready-for-agent
-Blocked by: 02
+Blocked by: none (01 and 02 deployed and watched 2026-10-22)
 
 Spec: ../spec.md.
 
