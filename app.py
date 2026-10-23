@@ -459,6 +459,16 @@ BEHIND_LIVE_S = float(os.getenv("BEHIND_LIVE_S", "30"))
 # stream. Padding is null packets only: it makes no video and no cushion.
 # Off: nothing is sent during the request, as before.
 PLAYLIST_KEEPALIVE = os.getenv("PLAYLIST_KEEPALIVE", "1") == "1"
+# A chunk whose last attempt was refused with HTTP 403 gets one more try on a
+# fresh link, if there is one (stream recovery ticket 03, gotcha #36): the
+# playlist is read again on a new connection, the chunk is found in it by media
+# sequence, and it is fetched once more only if the playlist now lists a
+# different URL for it (a retry on the same URL is pointless). The extra work is
+# capped at one SEGMENT_TIMEOUT per minute per stream and is padded like any
+# download. Whether a re-read ever lists a new URL is unknown; stream health
+# counts attempts, new URLs and recoveries. Off: the two attempts of
+# SEGMENT_RETRIES, then the hole, as before.
+FRESH_LINK_RETRY = os.getenv("FRESH_LINK_RETRY", "1") == "1"
 # Some sources publish a video elementary stream and no audio one at all -
 # observed on `admin`, which carries a raw MLB.TV feed. Playback looks fine and
 # is silent, and _rank_streams puts `admin` above `delta` (both HD, `admin`
@@ -853,7 +863,59 @@ def _cushion_cut(durations, cap_s):
         return 0
 
 
-def get_segments(m3u8_url, headers, cookies, _depth=0, info=None):
+def _fresh_link_url(segments, seqs, seq, failed_url):
+    """Find the chunk that just failed in a re-read playlist (gotcha #36).
+
+    `segments` are the re-read playlist's chunk URLs, `seqs` their media
+    sequence numbers (same order), `seq` the failed chunk's, `failed_url` the
+    URL that failed. Returns (how, url): ("same", url) when the playlist still
+    lists exactly the URL that failed, ("differs", url) when it lists another
+    for the same chunk, ("not_listed", None) when the chunk is gone. The chunk
+    is found by media sequence; when the sequence is unknown (or the lists do
+    not line up) by its object path, since a re-signed link keeps the path.
+    Never raises, never guesses.
+    """
+    try:
+        segments = list(segments)
+        idx = None
+        if seq is not None and seqs is not None and len(seqs) == len(segments):
+            for i, s in enumerate(seqs):
+                if s == seq:
+                    idx = i
+                    break
+        else:
+            want = urlsplit(failed_url).path
+            for i, u in enumerate(segments):
+                if urlsplit(u).path == want:
+                    idx = i
+                    break
+        if idx is None:
+            return "not_listed", None
+        url = segments[idx]
+        return ("same" if url == failed_url else "differs"), url
+    except Exception:
+        return "not_listed", None
+
+
+def _link_changes(old, new):
+    """What differs between two URLs of one chunk, as names only (never a
+    value: signatures stay out of logs and history). [] if identical."""
+    try:
+        a, b = urlsplit(old), urlsplit(new)
+        out = []
+        if (a.scheme, a.netloc) != (b.scheme, b.netloc):
+            out.append("host")
+        if a.path != b.path:
+            out.append("path")
+        qa, qb = dict(parse_qsl(a.query, keep_blank_values=True)), \
+            dict(parse_qsl(b.query, keep_blank_values=True))
+        out += sorted(k for k in set(qa) | set(qb) if qa.get(k) != qb.get(k))
+        return out
+    except Exception:
+        return []
+
+
+def get_segments(m3u8_url, headers, cookies, _depth=0, info=None, deadline=None):
     """
     Fetch m3u8 manifest and return (segments, status_code).
     Handles master playlists (variant streams) and media playlists that
@@ -863,14 +925,24 @@ def get_segments(m3u8_url, headers, cookies, _depth=0, info=None):
     `info`, when given, is filled with what the playlist's tags say (variants,
     sequence numbers, durations) for stream health tracking. That parse is a
     separate pass that cannot raise, so it never changes the return value.
+
+    `deadline` (a time.time() value), when given, caps every request at the
+    time left, so the whole read, master and variant together, ends by then
+    (503 if there is none left). The fresh-link retry uses it; without it the
+    timeout is the fixed 15s it always was.
     """
     if _depth > 3:
         return None, 0  # Guard against infinite recursion
+    timeout = 15
+    if deadline is not None:
+        timeout = min(15, deadline - time.time())
+        if timeout < 0.5:
+            return None, 503
     try:
         r = cf_requests.get(m3u8_url,
                             headers=_headers_for_url(m3u8_url, headers),
                             cookies=_cookies_for_url(m3u8_url, cookies),
-                            timeout=15, impersonate="chrome",
+                            timeout=timeout, impersonate="chrome",
                             curl_options=_upstream_curl_options())
     except Exception as exc:
         # Treat connection-level errors (DNS failure, refused, TLS) as
@@ -899,7 +971,7 @@ def get_segments(m3u8_url, headers, cookies, _depth=0, info=None):
 
     if sub_playlists and not segments:
         return get_segments(sub_playlists[0], headers, cookies, _depth + 1,
-                            info=info)
+                            info=info, deadline=deadline)
 
     return segments, 200
 
@@ -3035,8 +3107,14 @@ def stream_proxy():
                     _active_streams[stream_id][field] = \
                         _active_streams[stream_id].get(field, 0) + n
 
-        # Set by fetch_segment: the last chunk was an empty placeholder.
-        fetch_note = {"empty": False}
+        # Set by fetch_segment: the last chunk was an empty placeholder; the
+        # URL a fresh-link retry found for it (alias), so the dedup treats
+        # that URL as the same chunk; whether that retry ran (fresh) and when
+        # the extra work began.
+        fetch_note = {"empty": False, "alias": None, "fresh": False, "began": None}
+        # (end time, seconds) of the extra work fresh-link retries did in the
+        # last minute: the cap on it (FRESH_LINK_RETRY).
+        fl_spent = deque()
 
         def _empty(seg_url):
             """An empty placeholder instead of a chunk: drop it, record it."""
@@ -3072,7 +3150,66 @@ def stream_proxy():
             except Exception:
                 return body
 
+        def _fresh_link(seg_url):
+            """After a 403 (gotcha #36): re-read the playlist on a new
+            connection and look for another URL for the same chunk. Returns
+            (url, seconds left) for the one extra try, or None (no new URL,
+            re-read failed, no time). Guarded: any error is None, which is
+            today's behaviour (the hole).
+
+            Bounded: the extra work of a stream (re-reads and retries) is at
+            most one SEGMENT_TIMEOUT per minute, and the re-read gets at most
+            half of what is left, so a hanging playlist cannot eat the budget
+            of the retry or hold the stream past it."""
+            try:
+                now = time.time()
+                while fl_spent and now - fl_spent[0][0] > 60:
+                    fl_spent.popleft()
+                left = SEGMENT_TIMEOUT - sum(s for _t, s in fl_spent)
+                if left < 2:
+                    H.fresh_link("reread", "skipped")
+                    return None
+                fetch_note["began"] = now
+                seq = streamhealth.chunk_meta(seg_url)[0]
+                pl = {}
+                segs, status = get_segments(m3u8_url, headers, cookies, info=pl,
+                                            deadline=now + min(15, left / 2.0))
+                secs = time.time() - now
+                if not segs:
+                    H.fresh_link("reread", "failed", seq=seq, secs=secs)
+                    return None
+                seqs = [s for _k, s, _d in pl.get("latest") or []]
+                how, url = _fresh_link_url(segs, seqs, seq, seg_url)
+                if how != "differs":
+                    H.fresh_link("reread", how, seq=seq, secs=secs)
+                    return None
+                fetch_note["alias"] = url
+                H.fresh_link("reread", "differs", seq=seq, secs=secs,
+                             changed=_link_changes(seg_url, url))
+                return url, max(1.0, now + left - time.time())
+            except Exception:
+                return None
+
         def fetch_segment(seg_url):
+            """_fetch_tries, and the books for a fresh-link retry (one place,
+            whichever way the tries end)."""
+            fetch_note["empty"] = False
+            fetch_note["alias"] = None
+            fetch_note["fresh"] = False
+            fetch_note["began"] = None
+            body = _fetch_tries(seg_url)
+            try:
+                if fetch_note["began"] is not None:
+                    now = time.time()
+                    fl_spent.append((now, now - fetch_note["began"]))
+                    if fetch_note["fresh"] and not stop.is_set():
+                        H.fresh_link("retry", "ok" if body is not None else
+                                     "empty" if fetch_note["empty"] else "failed")
+            except Exception:
+                pass
+            return body
+
+        def _fetch_tries(seg_url):
             """Download one chunk whole, or return None.
 
             Buffered rather than streamed straight through on purpose. The old
@@ -3090,24 +3227,38 @@ def stream_proxy():
             the same every time, and not logged as a drop, because the caller
             records it as what it is.
             """
-            fetch_note["empty"] = False
-            for attempt in range(1, SEGMENT_RETRIES + 2):
+            # One iteration past the configured attempts is the fresh-link
+            # try (gotcha #36): taken only with the switch on, when the last
+            # attempt was a 403 and the playlist now lists another URL for the
+            # chunk. Otherwise that iteration just ends the loop, so with the
+            # switch off these are exactly the SEGMENT_RETRIES + 1 attempts.
+            url, t_out, of, status = seg_url, SEGMENT_TIMEOUT, SEGMENT_RETRIES + 1, None
+            for attempt in range(1, SEGMENT_RETRIES + 3):
+                if attempt == SEGMENT_RETRIES + 2 and not (FRESH_LINK_RETRY and status == 403):
+                    break
                 if stop.is_set():
                     return None
+                if attempt == SEGMENT_RETRIES + 2:
+                    fresh = _fresh_link(seg_url)
+                    if fresh is None or stop.is_set():
+                        break
+                    (url, t_out), of = fresh, attempt
+                    fetch_note["fresh"] = True
+                status = None
                 H.download_attempt(attempt)
                 try:
                     seg = cf_requests.get(
-                        seg_url,
-                        headers=_headers_for_url(seg_url, headers),
-                        cookies=_cookies_for_url(seg_url, cookies),
-                        timeout=SEGMENT_TIMEOUT, stream=True,
+                        url,
+                        headers=_headers_for_url(url, headers),
+                        cookies=_cookies_for_url(url, cookies),
+                        timeout=t_out, stream=True,
                         impersonate="chrome",
                         curl_options=_upstream_curl_options(),
                     )
                     if seg.status_code != 200:
+                        status = seg.status_code
                         log.warning("Segment HTTP %d (attempt %d/%d): %s",
-                                    seg.status_code, attempt,
-                                    SEGMENT_RETRIES + 1, seg_url)
+                                    seg.status_code, attempt, of, url)
                         continue
 
                     expected = seg.headers.get("Content-Length")
@@ -3116,7 +3267,7 @@ def stream_proxy():
                     if expected and expected > SEGMENT_MAX_MB * 1024 * 1024:
                         log.warning("Segment oversized (%d bytes > %dMB cap), "
                                     "skipping: %s",
-                                    expected, SEGMENT_MAX_MB, seg_url)
+                                    expected, SEGMENT_MAX_MB, url)
                         return None
 
                     buf = bytearray()
@@ -3130,7 +3281,7 @@ def stream_proxy():
                             if len(buf) > cap:
                                 log.warning("Segment exceeded %dMB while "
                                             "downloading, abandoning: %s",
-                                            SEGMENT_MAX_MB, seg_url)
+                                            SEGMENT_MAX_MB, url)
                                 return None
 
                     # A short read is the exact failure mode that used to be
@@ -3138,31 +3289,30 @@ def stream_proxy():
                     if expected is not None and len(buf) != expected:
                         log.warning("Segment incomplete %d/%d bytes "
                                     "(attempt %d/%d): %s",
-                                    len(buf), expected, attempt,
-                                    SEGMENT_RETRIES + 1, seg_url)
+                                    len(buf), expected, attempt, of, url)
                         continue
                     if not buf:
                         log.warning("Segment empty (attempt %d/%d): %s",
-                                    attempt, SEGMENT_RETRIES + 1, seg_url)
+                                    attempt, of, url)
                         continue
                     if _is_empty_chunk(buf):
                         fetch_note["empty"] = True
                         return None
 
                     if attempt > 1:
-                        log.info("Segment recovered on attempt %d: %s",
-                                 attempt, seg_url)
+                        log.info("Segment recovered on attempt %d%s: %s",
+                                 attempt, " (fresh link)" if url != seg_url else "",
+                                 url)
                         _bump("segments_retried")
                     return bytes(buf)
 
                 except Exception as exc:
                     log.warning("Segment fetch failed (attempt %d/%d, "
                                 "timeout=%ds): %s - %s",
-                                attempt, SEGMENT_RETRIES + 1, SEGMENT_TIMEOUT,
-                                seg_url, exc)
+                                attempt, of, t_out, url, exc)
 
             log.warning("Segment dropped after %d attempt(s), leaving a gap: %s",
-                        SEGMENT_RETRIES + 1, seg_url)
+                        of, seg_url)
             _bump("segments_failed")
             return None
 
@@ -3177,6 +3327,18 @@ def stream_proxy():
                     seen_set.discard(seen_deque.popleft())
                 seen_deque.append(key)
                 seen_set.add(key)
+
+            def _note_alias():
+                """A fresh-link retry (gotcha #36) found the chunk under a
+                new URL. The playlist lists that one from now on, and the
+                dedup keys on the URL, so without this it would be fetched
+                again as a new chunk, late and out of order."""
+                try:
+                    alias = fetch_note.get("alias")
+                    if alias and _segment_key(alias) not in seen_set:
+                        add_seen(alias)
+                except Exception:
+                    pass
 
             def _idle(seconds):
                 """Wait without going silent on the wire.
@@ -3339,6 +3501,7 @@ def stream_proxy():
                     continue
                 H.download_begin(seg_url)
                 body = yield from _fetch_with_keepalive(seg_url)
+                _note_alias()
                 if body is None and fetch_note["empty"]:
                     _empty(seg_url)
                 else:
@@ -3433,6 +3596,7 @@ def stream_proxy():
                         # dropped must not be retried forever while the live
                         # edge moves away from us.
                         add_seen(seg_url)
+                        _note_alias()
                         if body is None:
                             _missed(seg_url)
                             continue

@@ -563,6 +563,13 @@
         esc(rc.previous_id) + " ended (" + (END_TEXT[rc.previous_reason] || rc.previous_reason) +
         "); replayed " + plural(rc.replayed_chunks || 0, "chunk")]);
     }
+    var fl = h.fresh_link;
+    if (fl && fl.attempted) {
+      facts.push(["Fresh links (403)", plural(fl.attempted, "refused chunk") + " re-read; " +
+        num(fl.url_differed || 0) + " with a new link, " + num(fl.succeeded || 0) + " recovered, " +
+        num(fl.same_url || 0) + " same link" +
+        (fl.reread_failed ? ", " + num(fl.reread_failed) + " re-read failed" : "")]);
+    }
     if (h.endlist) { facts.push(["Source", "says the broadcast has ended"]); }
     return '<dl class="health-facts">' + facts.map(function (f) {
       return "<dt>" + esc(f[0]) + "</dt><dd>" + esc(f[1]) + "</dd>";

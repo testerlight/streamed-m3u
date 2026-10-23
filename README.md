@@ -394,6 +394,7 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `HOLE_RESTAMP_MIN_S` | `8.0` | live | Shortest missing span that is restamped. ffmpeg's own jump threshold is 10s; shorter holes stay byte passthrough. |
 | `BEHIND_LIVE_S` | `30.0` | live | Play about this many seconds behind live: a stream starts at the oldest chunk the source's playlist still offers, up to this far back, and stays in order after a stall. The playlist window (about 12-20s on the sources seen) caps it. 0: no limit, the whole window, as before. |
 | `PLAYLIST_KEEPALIVE` | `on` | live | Send null-packet padding while a playlist request is running, as is already done during chunk downloads, so Dispatcharr does not see silence. Makes no video. Off: nothing is sent during the request. |
+| `FRESH_LINK_RETRY` | `on` | live | When a chunk's last attempt is refused with HTTP 403, read the playlist again and try the chunk once more, but only if the playlist now lists a different link. Costs one playlist request per refused chunk and at most one segment timeout of extra work a minute per stream. Off: the two attempts, then the hole, as before. |
 | `STREAM_IDLE_TIMEOUT` | `45` | live | Seconds without a new segment before a stream is treated as dead. |
 | `STREAM_KEEPALIVE_INTERVAL` | `1.0` | live | Seconds between null packets sent while waiting on a slow chunk, so the client does not give up. |
 | `STREAM_SEEN_MAX` | `300` | live | Segment URLs remembered per stream, bounding memory on long sessions. |

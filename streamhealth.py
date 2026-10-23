@@ -534,6 +534,15 @@ class StreamHealth:
         self.restamps = 0
         self.restamp_s = 0.0
         self.restamp_list = []
+        # Fresh-link retries after a 403 (app.py FRESH_LINK_RETRY, gotcha #36):
+        # the playlist is re-read and the chunk retried once if its URL
+        # changed. attempted = a re-read was made; url_differed = it listed
+        # another URL for the chunk; succeeded = the retry on it delivered.
+        self.fresh = {"attempted": 0, "url_differed": 0, "succeeded": 0,
+                      "same_url": 0, "not_listed": 0, "reread_failed": 0,
+                      "retry_failed": 0, "skipped": 0}
+        self.fresh_list = []
+        self._fresh_logged = None     # [last logged at, count since]
         # The start behind live (app.py BEHIND_LIVE_S, gotcha #35): the
         # source's playlist window, what was asked for, what the first burst
         # actually put in front of the player, and how many chunks were left
@@ -1197,6 +1206,78 @@ class StreamHealth:
             if cushion is not None:
                 self.start_cushion_s = cushion
 
+    # ── hooks: fresh-link retry after a 403 (download worker thread) ─────────
+
+    @_guarded
+    def fresh_link(self, stage, how, seq=None, secs=None, changed=None):
+        """One step of the fresh-link retry for a chunk that answered 403.
+
+        stage "reread": the playlist was read again and `how` is "same" (it
+        lists the URL that failed, so no retry), "differs" (another URL for the
+        chunk: one retry follows), "not_listed" (the chunk left the playlist),
+        "failed" (the re-read itself failed or timed out) or "skipped" (the
+        time budget for extra work was used up; not an attempt). stage "retry":
+        the one extra try on the new URL, `how` "ok", "failed" or "empty".
+        Records only: the chunk is a hole or not exactly as before.
+        """
+        with self._lock:
+            now = self._now()
+            f = self.fresh
+            if stage == "reread":
+                if how == "skipped":
+                    f["skipped"] += 1
+                    return
+                f["attempted"] += 1
+                key = {"same": "same_url", "differs": "url_differed",
+                       "not_listed": "not_listed", "failed": "reread_failed"}.get(how)
+                if key:
+                    f[key] += 1
+                if len(self.fresh_list) < FREEZE_LIST_MAX:
+                    self.fresh_list.append({
+                        "at_s": round(now - self.started, 1), "seq": seq, "how": how,
+                        "reread_s": None if secs is None else round(float(secs), 2),
+                        "changed": list(changed) if changed else None, "result": None})
+                if how == "differs":
+                    text = ("Chunk %s: 403, and the playlist now lists another link for it "
+                            "(%s differ): retrying once" % (seq, ", ".join(changed or ["?"])))
+                    self._event("freshlink", text, now)
+                    log.info("%s: %s", self._who(), text)
+                    return
+                # The expected, repeated outcomes: first one, then a summary.
+                seen = self._fresh_logged
+                text = None
+                if seen is None:
+                    self._fresh_logged = [now, 0]
+                    text = ("Chunk %s: 403, re-read the playlist (%.1fs): %s; no retry"
+                            % (seq, secs or 0.0,
+                               {"same": "it lists the same link",
+                                "not_listed": "the chunk is no longer listed",
+                                "failed": "the re-read failed"}.get(how, str(how))))
+                elif now - seen[0] >= EMPTY_LOG_EVERY_S:
+                    text = ("%d more 403 re-read(s) in the last %.0fs, none retried (%d "
+                            "attempted, %d with a new link, %d recovered)"
+                            % (seen[1] + 1, now - seen[0], f["attempted"],
+                               f["url_differed"], f["succeeded"]))
+                    self._fresh_logged = [now, 0]
+                else:
+                    seen[1] += 1
+                if text:
+                    self._event("freshlink", text, now)
+                    log.info("%s: %s", self._who(), text)
+                return
+            if stage == "retry":
+                last = self.fresh_list[-1] if self.fresh_list else None
+                if last is not None and last.get("how") == "differs":
+                    last["result"] = how
+                if how == "ok":
+                    f["succeeded"] += 1
+                    text = "Chunk recovered on the new link (the 403 was a stale link)"
+                else:
+                    f["retry_failed"] += 1
+                    text = "The new link did not work either (%s): chunk dropped" % how
+                self._event("freshlink", text, now)
+                log.info("%s: %s", self._who(), text)
+
     # ── hooks: restamping (generator thread) ─────────────────────────────────
 
     @_guarded
@@ -1415,6 +1496,7 @@ class StreamHealth:
             "empty_s": _r(self.empty_s),
             "restamps": self.restamps,
             "restamp_s": _r(self.restamp_s),
+            "fresh_link": dict(self.fresh),
             "window_s": _r(_median(self._windows) if self._windows
                            else self._start_window_s),
             "cushion_wanted_s": _r(self.cushion_wanted_s),
@@ -1482,6 +1564,7 @@ class StreamHealth:
             "behind_live_max_s": _r(max(self._behind) if self._behind else None),
             "freeze_list": list(self.freezes),
             "restamp_list": list(self.restamp_list),
+            "fresh_link_list": list(self.fresh_list),
             "warning_list": [{"kind": w["kind"], "at_s": _r(w["raised"] - self.started),
                               "s": _r((w["cleared"] or now) - w["raised"]),
                               "hit": w["hit"], "lead_s": _r(w["lead"])}

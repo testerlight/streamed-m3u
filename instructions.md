@@ -76,6 +76,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/reorder_channels.py` | Channel numbering. `--dump-config` prints the built-in order as editable JSON. |
 | `tools/channel_order.example.json` | Generated: exactly `reorder_channels.py --dump-config`. Regenerate it, do not edit it; `check_reorder.py` fails if it drifts. |
 | `tools/check_restamp.py`, `tools/check_hole_av.py` | Restamping: unit tests on hand-built TS, then the real `/stream` route against a scripted origin serving real ffmpeg-made chunks that fail messily (403, half-sent, slow, gone from the playlist), then the beep-minus-flash offset through several ffmpeg transcodes including Jellyfin's input line. `check_hole_av.py` is the measuring tool. About 8 minutes (the `jelly_*` modes run in real time). #34. |
+| `tools/check_cushion.py`, `tools/check_freshlink.py` | Stream recovery tickets 02 and 03, each in the pattern of `check_restamp.py`: units, tracker, then the real `/stream` route against a scripted origin (`check_freshlink.py`: links that re-sign, 403, 404, hang), and `--identity`/`--compare` for byte-identical-with-the-switch-off against the running image. #35, #36. |
 | `tools/check_pacing.py` | Does a composite play at real speed when its inputs arrive in production-shaped bursts? Frame-numbered picture, read back per output frame. `MODE=smooth`/`filler`, `SECONDARY=none`. About a minute; run it after any change to the feeders or the ffmpeg argv. #34-#38. |
 | `tools/check_reorder.py` | Offline proof of the numbering. Pure planner, synthetic channel list, no Dispatcharr. §12b. |
 | `tools/soak_multiview.py` | Run on the **host**. Plays a Multi-Player channel through Dispatcharr's proxy (as Jellyfin does), optionally with an ordinary channel alongside and every control stepped, and reports gaps, Dispatcharr's unhealthy/switch counts, encoder exits, CPU and GPU. No Dispatcharr login. |
@@ -1170,6 +1171,100 @@ Verified in `streamed-m3u:verify-cushion` (nothing live): `check_health.py`
 192 checks and `--compare` against the running image byte-identical with
 matching timing, also with both settings off; `check_cushion.py` (units,
 tracker, route, and the time-driven player-side scenarios).
+
+**36. A chunk refused with 403 gets one more try on a fresh link, if the
+playlist offers one.** Stream recovery ticket 03
+(`.scratch/stream-recovery/issues/03-fresh-link-403-retry.md`). Since
+2026-10-22 the `admin` HD sources serve many chunks from signed TikTok CDN
+image URLs (`p19-common-sign.tiktokcdn.com/<bucket>/<id>~tplv-tiktokx-origin.
+image?...x-expires=...&x-signature=...`) that answer 403 on both attempts
+0.1s apart: 530 chunks in 6h (1,060 warnings, no other status), about 11% of
+the chunks of the long streams, three buckets alike. `x-expires` was hours in
+the future, so these are not expired links; why the CDN refuses them is
+unknown. The ticket's question is whether a re-read playlist ever lists a
+*different* URL for the same chunk. It cannot be settled offline (the
+`## Answer` in the ticket has what the logs do and do not say), so the code
+works under either answer and counts the answer.
+
+`FRESH_LINK_RETRY` (on; live). In `fetch_segment`'s loop, if the last attempt
+was a 403 and the switch is on, `_fresh_link` re-reads the playlist
+(`get_segments`, a fresh connection as every request here is), finds the chunk
+by **media sequence** (`_fresh_link_url`; by object path when the sequence is
+unknown), and only if the listed URL differs from the one that failed does the
+loop make one more attempt on it. Same URL, chunk gone from the playlist, or
+a failed re-read: no retry, the hole is declared exactly as before. Off, or
+any exception anywhere in the new code: the `SEGMENT_RETRIES + 1` attempts and
+the hole, byte for byte and tick for tick (the extra loop iteration just
+ends). Load-bearing:
+
+- **Bounded.** The extra work (re-reads and retries together) is capped at one
+  `SEGMENT_TIMEOUT` per stream per rolling minute (`fl_spent`). The re-read
+  gets at most half of what is left (and at most 15s: `get_segments(...,
+  deadline=)` shortens every request it makes, master and variant, to the time
+  left), the retry gets the rest. Once the minute's budget is down to 2s,
+  attempts are skipped and counted as such. So a hanging playlist costs a
+  chunk's hole at most 15s once, not 15s per refused chunk, and the stream's
+  45s idle limit is not in play (it is checked per loop turn, and one
+  chunk's worth of extra work is under 30s).
+- **Padded.** It all happens inside `fetch_segment`, which already runs on the
+  worker thread that `_fetch_with_keepalive` pads, so null packets flow
+  throughout (longest silence on the wire in the tests: under 1.5s with a
+  4s hung re-read). With `STREAM_KEEPALIVE_INTERVAL=0` it is inline, unpadded,
+  as chunk downloads are.
+- **Dedup.** The URLs carry `x-signature`, which `_segment_key` does not
+  strip, so a new link is a new key. The recovered chunk's new URL is marked
+  seen (`fetch_note["alias"]`, `_note_alias`) or the next poll, which lists
+  it, would fetch it again as a new chunk, late and out of order. This is
+  also what happens **today** whenever the playlist re-lists a dropped chunk
+  under a new URL: the log's `Sent an older chunk: sequence N after M`
+  events (5 in the 4.3h Devils stream, each within 60s of a drop) are very
+  likely that, a late, out-of-order delivery. With the switch on and a
+  re-read that finds the new URL at once, the chunk comes back in order.
+- **Holes.** A recovered chunk is no hole: `_missed` is not called, nothing
+  to restamp, `delivered` credits it normally (`download_end` already labels a
+  chunk that needed more than one attempt as a stalled download). A failed
+  one is as before: `downloads_failed`, `_missed`, the restamp rules of #34.
+  An empty placeholder on the new link is counted as an empty chunk (#31). A
+  403 on the first chunk of a start is the same path (a start is the
+  oldest-first burst, #35; nothing sent yet means no restamp).
+- **Only a 403 earns it**, and only when it was the *last* attempt's answer:
+  a 404, 500, timeout or short read, or a 403 followed by one of those, is
+  not a stale link and gets nothing new.
+
+*Recorded* (stream health, `StreamHealth.fresh_link`; `fresh_link` in
+`/stream/status` and the history line, `fresh_link_list` (first 50 attempts:
+sequence, outcome, re-read seconds, the *names* of the URL parts that
+changed, never a signature, and how the retry ended), a "Fresh links (403)"
+row in the stats drop-down): `attempted` (a re-read was made), `url_differed`,
+`succeeded`, plus `same_url`, `not_listed`, `reread_failed`, `retry_failed`,
+`skipped`. A new link is logged and put on the timeline every time; the
+expected "same link" outcome is logged for the first and then one summary
+line a minute. **Read these after the first real game**:
+`url_differed` near 0 means re-signing is not how this CDN works and the
+setting buys nothing (and costs a playlist request per refused chunk, about
+0.3s at the IPv4 figures of #30); `url_differed` high with `succeeded` low
+means the new links are refused too; both high is the fix. The re-read is
+immediate, so it cannot see a link the source re-signs *later*; if the log
+shows `url_differed` low but `Sent an older chunk` events continue, a delayed
+re-read is the next thing to try (ticket 04's territory, not built).
+
+Verified in `streamed-m3u:verify-403` (nothing live): `tools/check_freshlink.py`
+(85 checks: the matcher, the tracker, and the real route against a scripted
+origin that re-signs, 403s, 404s, empties, 500s and hangs; the messy cases are
+403 then fresh URL works, 403 and identical URL, re-read 500 or hung or slow,
+three in a row with and without restamps, the very first chunk, a dead or
+empty new link, hooks and helpers rigged to raise, no padding, the idle
+limit after a recovery); the switch off against the running image is
+byte-identical with matching timing (`--identity messy`, also `clean` with it
+on); `check_health.py` (192 checks) and its `--compare` against the running
+image (byte-identical, timing within 0.02s), `check_console.py`,
+`check_multiview.py`, `check_restamp.py` (53; step 1 only, the Jellyfin-ffmpeg
+steps were not re-run: restamping is untouched), `check_cushion.py` (68) all
+pass. `check_restamp.py` now pins `FRESH_LINK_RETRY` off for its messy route
+run: its origin is poll-driven and refuses chunks with 403, and a re-read
+uses up a poll; with the switch on that run's windows no longer line up
+(nothing is wrong, the harness assumed no extra playlist requests). A
+poll-driven harness that 403s chunks needs the same pin.
 
 ## 8. Endpoint reference
 

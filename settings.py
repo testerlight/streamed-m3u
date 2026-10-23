@@ -242,6 +242,11 @@ SCHEMA = [
        "Send null-packet padding while a playlist request is running, as is already done "
        "during chunk downloads, so Dispatcharr does not see silence. Makes no video. Off: "
        "nothing is sent during the request."),
+    _s("FRESH_LINK_RETRY", "FRESH_LINK_RETRY", "Playback", "live", "bool",
+       "When a chunk's last attempt is refused with HTTP 403, read the playlist again and "
+       "try the chunk once more, but only if the playlist now lists a different link. Costs "
+       "one playlist request per refused chunk and at most one segment timeout of extra "
+       "work a minute per stream. Off: the two attempts, then the hole, as before."),
     _s("STREAM_IDLE_TIMEOUT", "STREAM_IDLE_TIMEOUT", "Playback", "live", "int",
        "Seconds without a new segment before a stream is treated as dead.", min=5, max=600),
     _s("STREAM_KEEPALIVE_INTERVAL", "STREAM_KEEPALIVE_INTERVAL", "Playback", "live", "float",

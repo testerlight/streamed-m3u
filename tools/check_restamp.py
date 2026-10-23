@@ -480,6 +480,10 @@ def route_tests():
     want = sum(len(chunks[n]) for n in delivered)
 
     def run(label, **flags):
+        # Its origin is poll-driven and these chunks are refused with 403; a
+        # fresh-link re-read (ticket 03) would use up a poll, so restamping
+        # is tested on its own. check_freshlink.py covers the two together.
+        app.FRESH_LINK_RETRY = False
         for k, v in flags.items():
             setattr(app, k, v)
         try:

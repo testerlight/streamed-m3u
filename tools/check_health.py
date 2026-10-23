@@ -888,7 +888,7 @@ def source_choice_tests(app, client, port):
 HOOKS = ("download_begin", "download_attempt", "download_bytes", "download_end",
          "sending", "delivered", "playlist_begin", "playlist_failed",
          "playlist_ok", "loop_error", "end", "finish", "snapshot", "tick",
-         "empty_chunk", "restamped", "start_window", "start_done")
+         "empty_chunk", "restamped", "start_window", "start_done", "fresh_link")
 
 
 def rig_hooks_raise(sh):
