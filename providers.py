@@ -7,7 +7,8 @@ never needs to know which service a game came from:
     list_games()          -> [game, ...]      what is on (and coming)
     list_sources(game)    -> [source, ...]    ways to watch one game
 
-streamed.pk is the first Provider and keeps the exact shapes it always had.
+streamed.pk is the first Provider and keeps the exact shapes it always had;
+ppv.st maps its one list response onto those same shapes.
 Each game and source is stamped with `_provider` (the Provider's name) so a
 later step can route a game back to the Provider that listed it.
 
@@ -22,6 +23,7 @@ module imports nothing from app.py.
 """
 
 import logging
+import re
 import threading
 
 import requests
@@ -173,3 +175,105 @@ class StreamedPk:
                 s["quality"] = self.HD_QUALITY if s.get("hd") else self.SD_QUALITY
             found.extend(streams)
         return found
+
+
+# ppv.st's sport names, as the app's sport ids (streamed.pk's, which the
+# major-league gate reads: "hockey", not "ice-hockey").
+_PPV_SPORT_IDS = {"ice-hockey": "hockey"}
+
+_PPV_AT = re.compile(r"\s+at\s+", re.I)
+_PPV_VS = re.compile(r"\s+(?:vs\.?|v)\s+", re.I)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+
+
+def _ppv_teams(title: str) -> dict:
+    """{"home": {"name"}, "away": {"name"}} from a ppv.st title, or {}.
+
+    "Away at Home" is the American shape; "X vs. Y" names the home side
+    first, as streamed.pk's titles did. Anything else (a feed, a show) names
+    no teams.
+    """
+    for pat, home_first in ((_PPV_AT, False), (_PPV_VS, True)):
+        parts = pat.split(title or "", maxsplit=1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            first, second = parts[0].strip(), parts[1].strip()
+            home, away = (first, second) if home_first else (second, first)
+            return {"home": {"name": home}, "away": {"name": away}}
+    return {}
+
+
+class Ppv:
+    """ppv.st: one call lists every game, with its embed link and substreams.
+
+    Embed hosts come out of the response (`iframe`), never from here. A game's
+    substreams are extra Sources for the same game. ppv.st says nothing about
+    picture quality, so its Sources carry no `quality`. Sources are built from
+    the list call alone: `list_sources` makes no request.
+    """
+
+    name = "ppv"
+    code = "PPV"
+
+    def __init__(self, bases: list[str], timeout: float, headers: dict):
+        self.mirrors = Mirrors(bases)
+        self.timeout = timeout
+        self.headers = headers
+
+    def list_games(self) -> list[dict]:
+        self.mirrors.prefer_first()
+        payload = self.mirrors.get_json("/api/streams", self.timeout, self.headers)
+        categories = payload.get("streams") if isinstance(payload, dict) else None
+        games: list[dict] = []
+        seen: set = set()
+        for cat in (categories or []):
+            if not isinstance(cat, dict):
+                continue
+            label = str(cat.get("category") or "Sports")
+            sport = _PPV_SPORT_IDS.get(_slug(label), _slug(label))
+            for g in (cat.get("streams") or []):
+                game = self._game(g, sport, label)
+                if game and game["id"] not in seen:
+                    seen.add(game["id"])
+                    games.append(game)
+        log.info("ppv: collected %d games", len(games))
+        return games
+
+    def _game(self, g, sport: str, label: str):
+        if not isinstance(g, dict) or not g.get("id") or not g.get("name"):
+            return None
+        title = str(g["name"]).strip()
+        always = bool(g.get("always_live"))
+        links = [g] + [s for s in (g.get("substreams") or []) if isinstance(s, dict)]
+        game = {
+            "id": "ppv-%s" % g["id"],
+            "title": title,
+            "category": sport,
+            "poster": g.get("poster") or "",
+            "teams": {} if always else _ppv_teams(title),
+            "always_live": always,
+            "_category": label,
+            "_provider": self.name,
+            "_links": [(str(s["iframe"]).strip(), str(s.get("source_tag") or ""))
+                       for s in links if str(s.get("iframe") or "").strip()],
+        }
+        # A feed has no start; ppv.st gives it 0 or a small offset.
+        if g.get("starts_at") and not always:
+            game["date"] = int(g["starts_at"]) * 1000
+        return game
+
+    def list_sources(self, game: dict) -> list[dict]:
+        return [{
+            "id": "%s-%d" % (game["id"], n),
+            "streamNo": n,
+            "language": "",
+            "embedUrl": url,
+            "source": _slug(tag) or self.name,
+            "_match_title": game.get("title", "Unknown Match"),
+            "_match_id": game.get("id", ""),
+            "_match_category": game.get("_category", "Sports"),
+            "_match_poster": game.get("poster", ""),
+            "_provider": self.name,
+        } for n, (url, tag) in enumerate(game.get("_links") or [], 1)]

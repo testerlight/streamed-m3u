@@ -32,7 +32,8 @@ os.environ["EXTRACT_CACHE_FILE"] = os.path.join(DATA, "extract_cache.json")
 os.environ["SETTINGS_FILE"] = os.path.join(DATA, "settings.json")
 os.environ["STREAMED_BASE_URL"] = "https://streamed.example"
 os.environ.pop("PUBLIC_BASE_URL", None)
-os.environ.pop("PROVIDERS", None)
+# streamed.pk is off by default now; this harness is about it, so name it.
+os.environ["PROVIDERS"] = "streamed"
 
 sys.path.insert(0, "/app")
 import app  # noqa: E402
@@ -182,7 +183,7 @@ if baseline is not None:
     check("playlist identical to the pre-Provider image", got["playlist"] == baseline["playlist"])
     check("team playlist identical to the pre-Provider image", got["teams"] == baseline["teams"])
 check("only the configured host was contacted", set(net.hosts) == {PRIMARY}, sorted(set(net.hosts)))
-check("streamed is enabled by default", list(getattr(app, "PROVIDERS", [])) == ["streamed"],
+check("streamed is enabled when PROVIDERS names it", list(getattr(app, "PROVIDERS", [])) == ["streamed"],
       getattr(app, "PROVIDERS", None))
 
 # 2. The setting decides which Providers are used.

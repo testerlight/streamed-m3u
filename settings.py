@@ -103,9 +103,16 @@ SCHEMA = [
        "Extra web addresses for the catalog, tried in order if the main one is down. "
        "Only addresses listed here (and the main one) are ever contacted.",
        allow_empty=True),
+    _s("PPV_BASE_URL", "PPV_BASE_URL", "Upstream", "live", "url",
+       "ppv.st API the service lists games from. Change this when it moves domain."),
+    _s("PPV_MIRRORS", "PPV_MIRRORS", "Upstream", "live", "list",
+       "Extra web addresses for the ppv.st API, tried in order if the main one is down. "
+       "Only addresses listed here (and the main one) are ever contacted.",
+       allow_empty=True),
     _s("PROVIDERS", "PROVIDERS", "Upstream", "live", "list",
        "Which services supply games and streams, in preference order. "
-       "Known names: streamed. Unknown names are ignored.",
+       "Known names: ppv, streamed (closed in October 2026). Unknown names are ignored, "
+       "so streamfree can be listed ahead of the build that supports it.",
        allow_empty=True),
     _s("REQUEST_TIMEOUT", "REQUEST_TIMEOUT", "Upstream", "live", "int",
        "Seconds before an upstream API call is abandoned.", min=1, max=120),

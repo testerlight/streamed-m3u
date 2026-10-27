@@ -68,7 +68,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `app.py` | The service: scrape, playlist, guide, resolution, proxy. |
 | `settings.py` | The settings schema, the `/data/settings.json` overlay, atomic writes. §3. |
 | `auth.py` | Optional console login and CSRF. §4. |
-| `providers.py` | The Provider layer (provider-swap ticket 01): `Mirrors` (ordered, configured base URLs; the last one that answered is tried first, and each refresh starts again from the first) and `StreamedPk`, which lists games and Sources in the app's existing shapes and stamps `_provider`. `app.py` picks the Providers named in `PROVIDERS`; a name it does not know is ignored. Only configured addresses are ever contacted. Checked by `tools/check_providers.py` (`--baseline` in the old image, `--compare` in the new). |
+| `providers.py` | The Provider layer (provider-swap tickets 01, 03): `Ppv` (ppv.st, #38), `Mirrors` (ordered, configured base URLs; the last one that answered is tried first, and each refresh starts again from the first) and `StreamedPk`, which lists games and Sources in the app's existing shapes and stamps `_provider`. `app.py` picks the Providers named in `PROVIDERS`; a name it does not know is ignored. Only configured addresses are ever contacted. Checked by `tools/check_providers.py` (`--baseline` in the old image, `--compare` in the new). |
 | `dashboard.py`, `templates/`, `static/` | The console. |
 | `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
@@ -1302,6 +1302,46 @@ Provider. A Source whose Provider gives no height ranks as `QUALITY_UNKNOWN`
 
 Checked by `tools/check_ranking.py` (15), with scripted Providers: order, the
 silent tie-break, labels, HD, and the SPS reader on 720p, 480p and cropped 1080p.
+
+**38. ppv.st: one list call, Sources built from it, feeds by flag.** Provider
+swap ticket 03 (`.scratch/provider-swap/issues/03-ppv-provider.md`),
+`providers.Ppv`, name `ppv`, code `PPV`, `PPV_BASE_URL` / `PPV_MIRRORS`
+(default `https://api.ppv.st`). Recorded real response:
+`tools/fixtures/ppv_streams.json`. Load-bearing:
+
+- **`/api/streams` is the whole catalogue** (about 200 entries, grouped by
+  sport) and the only request per refresh. `list_sources` makes none: each
+  game keeps its embed links (`_links`: the entry's own `iframe`, then each
+  substream's) and they become Sources `[PPV1]`, `[PPV2]`... of one game.
+  Embed hosts come out of `iframe`; nothing in the code names one. ppv.st
+  gives no quality, so `quality` is absent (unknown, #37).
+- **Titles are "Away at Home" or "X vs. Y".** `_ppv_teams` reads "at" as
+  away-first, "vs"/"v" as home-first (as streamed.pk's were). Only the home
+  side is guaranteed a Channel; the away side resolves only for the major-league
+  aliases (`MAJOR_LEAGUE_TEAMS`, `EXTRA_ALIAS_TEAMS`). A team that plays twice
+  in the list gets its nearer game. `tools/check_ppv.py` prints every NFL/NBA/
+  NHL/MLB team that has no Channel playing one of its games, so the alias
+  list can be extended.
+- **Sport ids are streamed.pk's**, because `MAJOR_LEAGUE_SPORTS` reads them:
+  "Ice Hockey" is mapped to `hockey`; the rest are the slugged category name.
+- **`always_live` is the Provider's flag.** A feed has no `teams` and no
+  `date` (ppv.st gives it `starts_at` 0 or a small offset). It becomes a
+  feed Channel only if its title is a configured feed (`FEED_CHANNELS`):
+  "NFL Network" is, with slug `nfl-network` (on the bundled allowlist;
+  the live `lineup.json` is a separate step). An always-live entry with no
+  feed Channel (cartoons, racing, "Willow" against the configured "Willow
+  Cricket") is dropped in `update_team_index`; before, it would have taken a
+  shared Live Event slot.
+- **A game appears as soon as ppv.st lists it**, days ahead, with its embed
+  link. Nothing is prewarmed for it until it is the current game.
+- **Posters** are absolute URLs on `static.ppvservices.st` and go through
+  `/logo` (which accepts any `http` URL) and its cache.
+- The playlist header reads `# Providers: ppv` (the enabled names).
+- WebP-wrapped chunks from signed TikTok links need nothing new: #17 and
+  the fresh-link retry (#35-#36) already cover them. Not yet watched on a real
+  game on this branch.
+
+Checked by `tools/check_ppv.py` (27), offline, against the recorded response.
 
 ## 8. Endpoint reference
 
