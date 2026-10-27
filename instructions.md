@@ -86,6 +86,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, a hanging playlist request, reconnecting) through the real `/stream` route, checking each raises the early warning it should. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
 | `tools/check_health_render.py`, `tools/check_health_live.py` | The health UI driven in Chromium against scripted streams; and one real stream pulled through a scratch image inside gluetun's namespace (binds no port, own `/data`), reporting health and TS alignment. #29. |
 | `tools/check_merge.py` | Cross-Provider merging (provider-swap 05): one game from two Providers, too-far-apart and unsure pairs kept separate, feeds merged by name or alias. Same style as `check_ppv.py`. #40. |
+| `tools/check_pick.py` | Picking and pinning a Source across Providers (provider-swap 06): a pick of the other Provider's Source is honoured, survives reconnects and the merged game's primary listing changing, falls back when it fails; the cascade reaches every Provider. #41. Same style as `check_merge.py`. |
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
 | `tools/check_multiview.py` | Multi-view checks with the feature **on**. A separate script because the slot map is derived once at import, so enabled and disabled cannot share a process. §12. |
 | `tools/live_multiview_ui.py` | The console's multi-player section driven against a **real** encoder and real fixtures. Needs the network and the render node; costs two extractions and a minute of encoding. A gate check, not a routine one. §5b. |
@@ -1406,6 +1407,26 @@ Load-bearing:
 Checked by `tools/check_merge.py` (19), offline: the recorded ppv.st response
 plus a scripted streamed.pk (closed, so nothing to record; its start times are
 taken from the ppv.st recording).
+
+**41. A pick outlives its game id; the cascade must reach every Provider.**
+Provider swap ticket 06 (`.scratch/provider-swap/issues/06-cross-provider-switching.md`,
+scoped to the manual picker and pin; automatic switching is stream-recovery 04
+and is not built). The picker and pins were already Provider-blind (they key on
+the embed URL), but two things broke across Providers:
+
+- **The pin was tied to the game id** (`_source_pin`), and a merged game's id
+  is its first listing's, so it changes when the preferred Provider starts or
+  stops listing the game. The pick was dropped mid-game. It is now kept while
+  its embed URL is still among the game's Sources (another game never lists
+  the same embed) and re-keyed to the new id. A pick whose Source is gone is
+  still dropped.
+- **The cascade tries `CASCADE_MAX_ATTEMPTS` (4) Sources**, best first, so one
+  Provider with four or more dead Sources hid a live Source of the other.
+  `_reach_every_provider` reorders so the attempt window holds each Provider's
+  best Source; the evicted ones are the lowest ranked of a Provider that has
+  others. `/stream` only; pre-warm is unchanged.
+
+Checked by `tools/check_pick.py` (offline, same fixtures as #40).
 
 ## 8. Endpoint reference
 

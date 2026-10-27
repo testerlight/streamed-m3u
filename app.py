@@ -2513,6 +2513,25 @@ def _source_label(s):
     return _label_of(code, s.get("n", s.get("stream_no", 1)), _src_quality(s))
 
 
+def _reach_every_provider(cands: list, limit: int) -> list:
+    """Reorder so the first `limit` candidates include each Provider's best
+    Source. A Provider with more dead Sources than the cascade has attempts
+    would otherwise hide a working one from another Provider; the evicted
+    candidates are the lowest-ranked of a Provider that already has others."""
+    head, rest = list(cands[:limit]), list(cands[limit:])
+    for cand in list(rest):
+        prov = cand.get("provider")
+        if not prov or any(c.get("provider") == prov for c in head):
+            continue
+        for i in range(len(head) - 1, 0, -1):
+            if sum(1 for c in head if c.get("provider") == head[i].get("provider")) > 1:
+                rest.remove(cand)
+                rest.insert(0, head[i])
+                head[i] = cand
+                break
+    return head + rest
+
+
 def _team_candidates(team: str, slot: str):
     """Candidate streams for ?team=..., best first.
 
@@ -2560,7 +2579,8 @@ def _team_candidates(team: str, slot: str):
                  slug, idx + 1, label(s), entry.get("match_title", "?"))
         return [{"embed_url": s["embed_url"], "label": label(s)}], None
 
-    cands = [{"embed_url": s["embed_url"], "label": label(s)} for s in streams]
+    cands = [{"embed_url": s["embed_url"], "label": label(s),
+              "provider": s.get("provider", "")} for s in streams]
 
     # If the pre-warm loop validated one of these, try it first: it is both
     # cached and known-good, so the click lands warm instead of cascading.
@@ -3436,6 +3456,7 @@ def stream_proxy():
 
     if REQUIRE_AUDIO:
         candidates.sort(key=lambda c: _known_silent(c["embed_url"]))
+    candidates = _reach_every_provider(candidates, CASCADE_MAX_ATTEMPTS)
 
     started  = time.time()
     deadline = started + CASCADE_BUDGET
@@ -4227,13 +4248,23 @@ def _match_sources(slug):
 
 
 def _source_pin(slug, match_id):
-    """The console's pick for this channel, if it is still the same match."""
+    """The console's pick for this channel, if it is still the same match.
+
+    A merged game's id is its first listing's, so it changes when a Provider
+    starts or stops listing the game. The pick still holds while its Source
+    is among the game's Sources: another game never lists the same embed.
+    """
+    with _team_lock:
+        listed = {s["embed_url"] for s in (_team_map.get(slug) or {}).get("streams") or []}
     with _source_lock:
         pin = _source_pins.get(slug)
         if pin and pin["match_id"] != match_id:
-            _source_pins.pop(slug, None)
-            log.info("Console pick for %s dropped: the match has changed", slug)
-            pin = None
+            if pin["embed_url"] in listed:
+                pin["match_id"] = match_id
+            else:
+                _source_pins.pop(slug, None)
+                log.info("Console pick for %s dropped: the match has changed", slug)
+                pin = None
         return dict(pin) if pin else None
 
 

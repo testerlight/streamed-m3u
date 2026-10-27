@@ -871,7 +871,13 @@ def source_choice_tests(app, client, port):
                                    "prepared": None, "prepared_at": 0}
     with app._team_lock:
         app._team_map["srcteam"]["match_id"] = "m2"
-    check("a new match drops the pick", app._source_pin("srcteam", "m2") is None)
+    check("a changed game id with the picked Source still listed keeps the pick "
+          "(a merged game's id moves when a Provider joins or leaves)",
+          app._source_pin("srcteam", "m2") is not None)
+    with app._team_lock:
+        for s in app._team_map["srcteam"]["streams"]:
+            s["embed_url"] += "/next-game"
+    check("a new match drops the pick", app._source_pin("srcteam", "m3") is None)
     with app._active_streams_lock:
         app._active_streams["abcdef01"] = {"stream_id": "abcdef01", "hold_key": "url:x",
                                            "embed_url": "x", "multiview": None}
