@@ -8,8 +8,12 @@ A proxy that turns a live-sports provider's changing sources into one stable cha
 A permanent per-team (or per-feed) entry the viewer tunes to, such as NFL Network. It outlives any single game or source.
 _Avoid_: Station, feed (a feed is a kind of channel with no team)
 
+**Provider**:
+An outside service that lists games and offers sources for them (streamed.pk, ppv.st, streamfree). Several providers can be enabled at once, and a channel's sources may come from more than one.
+_Avoid_: Site, API, backend
+
 **Source**:
-One provider-side origin of a channel's video for a given game (for example `admin1-HD`). A channel has several candidate sources, ranked, and one is active at a time.
+One provider-side origin of a channel's video for a given game (for example `admin1-HD`). A channel has several candidate sources, ranked, and one is active at a time. Every source belongs to exactly one provider.
 _Avoid_: Stream (that is the session), server, link
 
 **Stream**:
