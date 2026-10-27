@@ -85,6 +85,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/check_console.py`, `tools/check_render.py` | Verification harnesses. Bind-mounted into a scratch image, never shipped. |
 | `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, a hanging playlist request, reconnecting) through the real `/stream` route, checking each raises the early warning it should. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
 | `tools/check_health_render.py`, `tools/check_health_live.py` | The health UI driven in Chromium against scripted streams; and one real stream pulled through a scratch image inside gluetun's namespace (binds no port, own `/data`), reporting health and TS alignment. #29. |
+| `tools/check_merge.py` | Cross-Provider merging (provider-swap 05): one game from two Providers, too-far-apart and unsure pairs kept separate, feeds merged by name or alias. Same style as `check_ppv.py`. #40. |
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
 | `tools/check_multiview.py` | Multi-view checks with the feature **on**. A separate script because the slot map is derived once at import, so enabled and disabled cannot share a process. §12. |
 | `tools/live_multiview_ui.py` | The console's multi-player section driven against a **real** encoder and real fixtures. Needs the network and the render node; costs two extractions and a minute of encoding. A gate check, not a routine one. §5b. |
@@ -1374,6 +1375,37 @@ Provider swap ticket 04 (`.scratch/provider-swap/issues/04-provider-failure-resi
 Checked by `tools/check_resilience.py` (46), offline, against the recorded
 ppv.st response and a scripted streamed.pk; the clock is moved forward to pass
 the limit.
+
+**40. A game two Providers list is merged only when certain; unsure stays apart.**
+Provider swap ticket 05 (`.scratch/provider-swap/issues/05-cross-provider-merging.md`),
+`app._merge_games`, called from `build_m3u` just before `update_team_index`.
+Load-bearing:
+
+- **A team game merges** only when both listings name two teams (same
+  `_slugify` the team index uses), the pair of teams is the same (either side
+  first: ppv.st's "Away at Home" and streamed.pk's "Home vs Away" differ), both
+  have a start, the starts are within `MERGE_WINDOW_MS` (3 h), and the sport
+  ids do not disagree. A listing with one team or none ("Bruins v Hurricanes"),
+  or no start, is never merged. A wrong merge puts the wrong video on a
+  Channel; a missed one only shows two games. Every doubt keeps them apart.
+- **Two listings from one Provider never merge** (a doubleheader is two games), and a listing that fits two of the other Provider's games merges with neither.
+- **Spelling differences fail safe**: matching is `_slugify` of the team names, so "LA Clippers" and "Los Angeles Clippers" stay two games until an alias bridges them. A start that is not a number also keeps a game apart (the merge guards it; the older team-index scoring does not, which is out of scope here).
+- **Playlist guide ids** (`tvg-id`) of a merged-in Source keep that listing's own match id, so they do not change if the preferred Provider drops the game.
+- **Always-live feeds** (no teams) merge by `_feed_of`, the lookup that picks a
+  feed Channel, so aliases work ("NFL vs RedZone" joins "NFL RedZone"). A start
+  time is not compared.
+- **The first listing wins** (Providers are fetched in `PROVIDERS` order): its
+  title, start, poster and match id are the merged game's. The other
+  Provider's Sources are re-stamped with them, so the playlist shows one title.
+- **Sources are pooled in listed order**, not sorted, so each keeps its number
+  within its own Provider (`PPV1`, `ST1-720p`; #37). Ranking stays where it
+  was (`_entry_streams`): quality, audio, Provider order.
+- A failure in the merge is logged and the games are kept separate; it never
+  stops the refresh.
+
+Checked by `tools/check_merge.py` (19), offline: the recorded ppv.st response
+plus a scripted streamed.pk (closed, so nothing to record; its start times are
+taken from the ppv.st recording).
 
 ## 8. Endpoint reference
 

@@ -1790,6 +1790,117 @@ def _merge_streams(stream_lists) -> list:
     return merged
 
 
+# ─── Cross-Provider game merging ──────────────────────────────────────────────
+#
+# The same game listed by two Providers is one game on one Channel, with every
+# Provider's Sources in a single list. A pair is merged only when it is
+# certain: both sides name two teams (by the same slug the team index uses),
+# the teams are the same pair, and the starts are within MERGE_WINDOW_MS. A
+# title that names no team, or only one, is never guessed at. A wrong merge
+# would put the wrong video on a Channel, so every doubt keeps games apart.
+# Always-live feeds have no teams or start: they merge by feed name or alias
+# (the same lookup the team index uses to pick a feed Channel).
+
+MERGE_WINDOW_MS = 3 * 3600 * 1000
+
+
+def _merge_key(match: dict):
+    """What identifies a game across Providers, or None if it can't be told."""
+    teams = match.get("teams") or {}
+    home = _slugify(((teams.get("home") or {}).get("name")) or "")
+    away = _slugify(((teams.get("away") or {}).get("name")) or "")
+    if home or away:
+        if home and away and home != away and match.get("date"):
+            return ("teams", frozenset((home, away)))
+        return None
+    slug, _ = _feed_of(match.get("title", ""))
+    return ("feed", slug) if slug else None
+
+
+def _merges_with(primary: dict, match: dict, key) -> bool:
+    if key[0] == "feed":
+        return True
+    sports = (primary.get("category") or "", match.get("category") or "")
+    if sports[0] and sports[1] and sports[0] != sports[1]:
+        return False
+    try:
+        return abs(int(primary["date"]) - int(match["date"])) <= MERGE_WINDOW_MS
+    except (TypeError, ValueError):
+        return False        # a start we cannot read is a doubt
+
+
+def _merge_games(matches: list[dict], streams_per_match: list[list[dict]]):
+    """(matches, streams_per_match) with one entry per real-world game.
+
+    Listings come in Provider preference order, so the first listing of a game
+    is the one whose title, start and poster the game keeps. Two listings from
+    the same Provider are never merged (a doubleheader is two games). The
+    Sources are pooled in listed order, so each keeps its number within its
+    own Provider; ranking happens where it always has, per Channel.
+    """
+    keys = [_merge_key(m) for m in matches]
+    # A listing that fits two listings of one other Provider (that Provider's
+    # doubleheader) is a doubt whichever is listed first: none of them merge.
+    ambiguous: set = set()
+    listed: dict = {}
+    for i, key in enumerate(keys):
+        if key:
+            listed.setdefault(key, []).append(i)
+    for key, idxs in listed.items():
+        for i in idxs:
+            fit: dict = {}
+            for j in idxs:
+                if (_src_provider(matches[j]) != _src_provider(matches[i])
+                        and _merges_with(matches[i], matches[j], key)):
+                    fit.setdefault(_src_provider(matches[j]), []).append(j)
+            for js in fit.values():
+                if len(js) > 1:
+                    ambiguous.add(i)
+                    ambiguous.update(js)
+
+    groups: list[dict] = []
+    by_key: dict = {}
+    for i, match in enumerate(matches):
+        key = None if i in ambiguous else keys[i]
+        prov = _src_provider(match)
+        fits = [g for g in (by_key.get(key, []) if key else [])
+                if prov not in g["providers"]
+                and _merges_with(matches[g["idx"][0]], match, key)]
+        # Fitting two games (another Provider's doubleheader) is a doubt too:
+        # joining the first listed could put the wrong video on a Channel.
+        target = fits[0] if len(fits) == 1 else None
+        if target is None:
+            target = {"idx": [], "providers": set()}
+            groups.append(target)
+            if key:
+                by_key.setdefault(key, []).append(target)
+        target["idx"].append(i)
+        target["providers"].add(prov)
+
+    out_matches, out_streams, merged = [], [], 0
+    for g in groups:
+        primary = matches[g["idx"][0]]
+        pooled = []
+        for n, i in enumerate(g["idx"]):
+            for s in (streams_per_match[i] or []):
+                if n:
+                    s = dict(s)
+                    # Keeps its own playlist guide id, so that id does not
+                    # change if the preferred Provider stops listing the game.
+                    s.setdefault("_guide_match_id", s.get("_match_id", ""))
+                    s["_match_title"] = primary.get("title", s.get("_match_title", ""))
+                    s["_match_id"] = primary.get("id", s.get("_match_id", ""))
+                    s["_match_category"] = primary.get("_category", s.get("_match_category", "Sports"))
+                    s["_match_poster"] = primary.get("poster", "") or s.get("_match_poster", "")
+                pooled.append(s)
+        merged += len(g["idx"]) - 1
+        out_matches.append(primary)
+        out_streams.append(pooled)
+    if merged:
+        log.info("Merged %d listing(s) of games that more than one Provider lists", merged)
+    return out_matches, out_streams
+
+
 def _feed_of(title: str):
     """(slug, display) if this title is a configured always-on feed.
 
@@ -2480,6 +2591,12 @@ def build_m3u(matches: list[dict]) -> tuple[str, int]:
     with ThreadPoolExecutor(max_workers=BUILD_WORKERS) as pool:
         streams_per_match = list(pool.map(fetch_streams_for_match, matches))
 
+    # A game listed by more than one Provider is one game from here on.
+    try:
+        matches, streams_per_match = _merge_games(matches, streams_per_match)
+    except Exception:
+        log.exception("Merging games across Providers failed (kept separate)")
+
     # Refresh the team index from the same data. Playlist output below is
     # unaffected by this call.
     try:
@@ -2507,7 +2624,7 @@ def build_m3u(matches: list[dict]) -> tuple[str, int]:
             label    = _label_of(_code_of(_src_provider(stream), codes), number,
                                  _src_quality(stream))
             ch_name  = format_channel_name(title, label)
-            tvg_id   = f"streamed.{match_id}.{source}.{stream_no}"
+            tvg_id   = f"streamed.{stream.get('_guide_match_id') or match_id}.{source}.{stream_no}"
 
             proxy_url = f"{_BASE_PLACEHOLDER}/stream?url={quote(embed_url, safe='')}"
 

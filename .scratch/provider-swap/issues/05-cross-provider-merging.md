@@ -4,12 +4,12 @@
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** implemented on provider-swap (awaiting review)
 
-- [ ] Two fixture games with the same teams and starts within 3 hours merge into one game with Sources from both Providers.
-- [ ] Two games with the same teams but starts further apart stay separate.
-- [ ] A title that cannot be resolved to teams on one side stays separate rather than guessing.
-- [ ] Always-live feeds listed by two Providers merge by name or alias.
-- [ ] The merged Source list is ranked as in ticket 02, and each label shows its own Provider.
-- [ ] Checked through the test seam with recorded fixtures from two Providers.
-- [ ] Existing checks still pass on a scratch-tagged image.
+- [x] Two fixture games with the same teams and starts within 3 hours merge into one game with Sources from both Providers.
+- [x] Two games with the same teams but starts further apart stay separate.
+- [x] A title that cannot be resolved to teams on one side stays separate rather than guessing.
+- [x] Always-live feeds listed by two Providers merge by name or alias.
+- [x] The merged Source list is ranked as in ticket 02, and each label shows its own Provider.
+- [x] Checked through the test seam with recorded fixtures from two Providers.
+- [x] Existing checks still pass on a scratch-tagged image.
