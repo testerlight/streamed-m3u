@@ -114,6 +114,10 @@ SCHEMA = [
        "Known names: ppv, streamed (closed in October 2026). Unknown names are ignored, "
        "so streamfree can be listed ahead of the build that supports it.",
        allow_empty=True),
+    _s("PROVIDER_STALE_HOURS", "PROVIDER_STALE_HOURS", "Upstream", "live", "float",
+       "Hours a service whose game list fails is still served from its last good list. "
+       "Past this its games drop out of the playlist; Channels are never removed because "
+       "of a failed fetch.", min=0, max=168),
     _s("REQUEST_TIMEOUT", "REQUEST_TIMEOUT", "Upstream", "live", "int",
        "Seconds before an upstream API call is abandoned.", min=1, max=120),
     _s("BUILD_WORKERS", "BUILD_WORKERS", "Upstream", "live", "int",

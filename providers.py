@@ -31,6 +31,11 @@ import requests
 log = logging.getLogger("providers")
 
 
+class ProviderError(Exception):
+    """A Provider's list call failed: no answer, 403, "Violation", or a body
+    that is not a game list. Distinct from an empty list, which is an answer."""
+
+
 def clean_bases(*groups) -> list[str]:
     """Configured base URLs in order, de-duplicated, http(s) only.
 
@@ -61,25 +66,39 @@ class Mirrors:
         self.bases = list(bases)
         self._good = 0
         self._lock = threading.Lock()
+        # Why the latest request found no usable answer ("" after a good one).
+        self.last_error = ""
 
     def prefer_first(self):
         with self._lock:
             self._good = 0
 
     def get_json(self, path: str, timeout: float, headers: dict):
-        """JSON from the first base that answers, or None if none does."""
+        """JSON from the first base that answers, or None if none does.
+
+        `last_error` says why, for a caller that must tell a failure from an
+        empty answer.
+        """
         with self._lock:
             start = self._good
         order = [start] + [i for i in range(len(self.bases)) if i != start]
+        self.last_error = "" if self.bases else "no address configured"
         for i in order:
             url = f"{self.bases[i]}{path}"
             try:
                 r = requests.get(url, timeout=timeout, headers=headers)
                 r.raise_for_status()
-                payload = r.json()
+                try:
+                    payload = r.json()
+                except ValueError:
+                    # A block page or "Violation" answers 200 with text.
+                    snippet = " ".join(str(getattr(r, "text", "") or "").split())[:80]
+                    raise ValueError("answer is not JSON: %r" % snippet) from None
             except requests.HTTPError as exc:
                 log.warning("API error [%s]: %s", url, exc)
-                if getattr(exc.response, "status_code", 0) in (404, 410):
+                code = getattr(exc.response, "status_code", 0)
+                self.last_error = "HTTP %s from %s" % (code or "error", self.bases[i])
+                if code in (404, 410):
                     # "No such thing" is an answer, not an outage: another
                     # mirror would say the same, and one missing path must
                     # not make the app move over to it.
@@ -87,11 +106,13 @@ class Mirrors:
                 continue
             except Exception as exc:
                 log.warning("API error [%s]: %s", url, exc)
+                self.last_error = "%s: %s" % (self.bases[i], exc)
                 continue
             if i != start:
                 with self._lock:
                     self._good = i
                 log.info("Using %s from now on", self.bases[i])
+            self.last_error = ""
             return payload
         return None
 
@@ -117,7 +138,11 @@ class StreamedPk:
 
     def list_games(self) -> list[dict]:
         self.mirrors.prefer_first()
-        sports = self._get("/api/sports") or []
+        sports = self._get("/api/sports")
+        live = self._get("/api/matches/live")
+        if sports is None and live is None:
+            raise ProviderError(self.mirrors.last_error or "no answer")
+        sports = sports or []
         log.info("Fetched %d sport categories", len(sports))
 
         seen: set[str] = set()
@@ -133,7 +158,7 @@ class StreamedPk:
                 m["_provider"] = self.name
                 games.append(m)
 
-        for m in (self._get("/api/matches/live") or []):
+        for m in (live or []):
             _add(m, "Live")
 
         for sport in sports:
@@ -226,6 +251,14 @@ class Ppv:
         self.mirrors.prefer_first()
         payload = self.mirrors.get_json("/api/streams", self.timeout, self.headers)
         categories = payload.get("streams") if isinstance(payload, dict) else None
+        if not isinstance(categories, list):
+            # No answer, or one that is not a game list (a refusal such as
+            # {"error": "Violation"}). Not the same as an empty list.
+            why = self.mirrors.last_error
+            if not why and isinstance(payload, dict):
+                why = "unexpected answer: %s" % (
+                    payload.get("error") or payload.get("message") or sorted(payload)[:4])
+            raise ProviderError(why or "unexpected answer")
         games: list[dict] = []
         seen: set = set()
         for cat in (categories or []):

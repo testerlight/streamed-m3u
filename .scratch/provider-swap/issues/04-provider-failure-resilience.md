@@ -4,12 +4,12 @@
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** implemented on provider-swap (awaiting review)
 
-- [ ] When a Provider's list call fails, the served playlist still contains its last good games, checked through the test seam.
-- [ ] After the retention limit passes, the stale list stops being served, and Channels are still not removed or rebuilt because of the failure.
-- [ ] A 403 or Violation answer is treated as a failure, logged, and does not crash the refresh.
-- [ ] One Provider failing does not affect games from the other Provider.
-- [ ] The dashboard shows which Provider is failing and when it last succeeded.
-- [ ] The retention limit is a setting.
-- [ ] Existing checks still pass on a scratch-tagged image.
+- [x] When a Provider's list call fails, the served playlist still contains its last good games, checked through the test seam.
+- [x] After the retention limit passes, the stale list stops being served, and Channels are still not removed or rebuilt because of the failure.
+- [x] A 403 or Violation answer is treated as a failure, logged, and does not crash the refresh.
+- [x] One Provider failing does not affect games from the other Provider.
+- [x] The dashboard shows which Provider is failing and when it last succeeded.
+- [x] The retention limit is a setting.
+- [x] Existing checks still pass on a scratch-tagged image.

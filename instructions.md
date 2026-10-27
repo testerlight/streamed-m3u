@@ -1343,6 +1343,38 @@ swap ticket 03 (`.scratch/provider-swap/issues/03-ppv-provider.md`),
 
 Checked by `tools/check_ppv.py` (27), offline, against the recorded response.
 
+**39. A failed Provider list call keeps the last good list; empty is not failure.**
+Provider swap ticket 04 (`.scratch/provider-swap/issues/04-provider-failure-resilience.md`),
+`app._fetch_provider_games`, `PROVIDER_STALE_HOURS` (default 6). Load-bearing:
+
+- **`list_games()` raises `providers.ProviderError` on failure** and returns
+  `[]` only for a real empty answer. Failure means: no mirror answered, 403,
+  a 200 whose body is not JSON (a "Violation" page), or JSON that is not a game
+  list (`{"error": "Violation"}`; ppv.st's body must hold a `streams` list).
+  `Mirrors.last_error` carries the reason. streamed.pk fails only when both
+  `/api/sports` and `/api/matches/live` are dead, because its later per-sport
+  calls already degrade game by game. Without the distinction an outage would
+  look like "ppv.st lists no games" and empty the guide.
+- **`fetch_all_matches` never raises for a Provider.** A good list replaces the
+  held one; a failure serves a deep copy of the held list while it is at most
+  `PROVIDER_STALE_HOURS` since the last *good* call (not since the first
+  failure), then serves nothing. Another Provider is never affected.
+- **Stale ppv.st games are fully playable** (Sources come from the list).
+  Stale streamed.pk games are only known to the guide and their Channel: its
+  Sources need per-game calls, which fail too during an outage.
+- **Channels are not touched**: they come from the roster and `lineup.json`,
+  not from games, so an empty playlist after the limit leaves
+  `/playlist-teams.m3u` as it was. Keep it that way.
+- The state is `app._provider_state`, in memory only: a restart during an
+  outage has no list to fall back on and serves nothing for that Provider.
+- The dashboard shows it in `/api/overview` `providers` (`ok`, `error`,
+  `last_success`, `serving_stale`), as a "Provider failing" banner and a stat
+  per Provider. Each failure is logged at WARNING from `app` and `providers`.
+
+Checked by `tools/check_resilience.py` (46), offline, against the recorded
+ppv.st response and a scripted streamed.pk; the clock is moved forward to pass
+the limit.
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when

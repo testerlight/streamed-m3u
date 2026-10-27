@@ -272,6 +272,29 @@
       " take effect on the next start.</span>";
   }
 
+  /* Seconds since an ISO timestamp, by the server's clock (d.now), or null. */
+  function agoS(iso, now) {
+    var t = iso ? Date.parse(iso) : NaN;
+    return isNaN(t) ? null : Math.max(0, now - t / 1000);
+  }
+
+  /* Which Providers are failing, why, and when each last gave a good list. */
+  function renderProviderBanner(list, now) {
+    var el = $("provider-banner");
+    if (!el) { return; }
+    var bad = (list || []).filter(function (p) { return p.ok === false; });
+    if (!bad.length) { el.hidden = true; el.innerHTML = ""; return; }
+    el.hidden = false;
+    el.innerHTML = "<b>Provider failing</b>" + bad.map(function (p) {
+      var ago = agoS(p.last_success, now);
+      return "<span><span class=\"mono\">" + esc(p.name) + "</span>: " + esc(p.error || "no answer") +
+        ". " + (ago === null ? "Never had a good list."
+                : "Last good list " + dur(ago) + " ago, " +
+                  (p.serving_stale ? "still serving it (" + num(p.games) + " games)"
+                                   : "no longer served") + ".") + "</span>";
+    }).join("");
+  }
+
   function renderOverview(d) {
     var ok = d.status === "ok";
     var dot = $("health-dot");
@@ -299,6 +322,7 @@
         "PUBLIC_BASE_URL if clients reach this service through a proxy or a different host.";
 
     renderRestartBanner(d.restart_pending || []);
+    renderProviderBanner(d.providers, d.now);
 
     var r = d.roster || {};
     var pw = d.prewarm || {};
@@ -324,7 +348,12 @@
              ? "pending" : dur(p.next_refresh_in_s),
            "every " + num(p.refresh_seconds) + "s"),
       stat("uptime", "Uptime", dur(sv.uptime_s), "process " + num(sv.pid))
-    ].join("");
+    ].concat((d.providers || []).map(function (p) {
+      var ago = agoS(p.last_success, d.now);
+      return stat("provider-" + p.name, "Provider " + p.name,
+        p.ok === null ? "waiting" : (p.ok ? "OK" : "Failing"),
+        ago === null ? "no good list yet" : "last good list " + dur(ago) + " ago");
+    })).join("");
 
     $("footer-uptime").textContent = "Up " + dur(sv.uptime_s);
     $("footer-source").textContent = "Upstream " + (d.base_url || "unknown");

@@ -34,6 +34,7 @@ See settings.py.
 
 import os
 import re
+import copy
 import time
 import uuid
 import signal
@@ -87,6 +88,10 @@ STREAMED_MIRRORS  = [t.strip() for t in os.getenv(
 PPV_BASE_URL      = os.getenv("PPV_BASE_URL", "https://api.ppv.st")
 PPV_MIRRORS       = [t.strip() for t in os.getenv(
     "PPV_MIRRORS", "").split(",") if t.strip()]
+# How long a Provider whose list call keeps failing is still served from its
+# last good list. Past this its games drop out of the playlist; Channels never
+# change because of a failed fetch.
+PROVIDER_STALE_HOURS = float(os.getenv("PROVIDER_STALE_HOURS", "6"))
 REFRESH_SECONDS   = int(os.getenv("REFRESH_SECONDS", "480"))
 REQUEST_TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT", "10"))
 # Concurrency for the playlist build. Each match needs one API call per
@@ -1397,11 +1402,83 @@ def _enabled_providers() -> list:
     return found
 
 
+# What each Provider last gave and how its last attempt went, by name:
+# {"games", "last_success", "last_attempt", "error"} (epoch seconds). Read by
+# the dashboard and by tests; written only by `_fetch_provider_games`.
+_provider_state: dict = {}
+
+
+def _within_retention(last_success, now) -> bool:
+    """Is a list fetched at `last_success` still young enough to serve?"""
+    return last_success is not None and now - last_success <= PROVIDER_STALE_HOURS * 3600
+
+
+def _fetch_provider_games(prov) -> list[dict]:
+    """One Provider's games for this refresh.
+
+    A good list replaces the one held. A failed call (no answer, 403,
+    "Violation", not a game list) keeps the last good list and serves it for
+    PROVIDER_STALE_HOURS since it was fetched, then serves nothing. Either way
+    the failure is logged and recorded for the dashboard, and never raises:
+    one Provider failing must not cost the others, or the Channels.
+    """
+    now = time.time()
+    try:
+        games = prov.list_games()
+        error = ""
+    except Exception as exc:                                   # noqa: BLE001
+        games = None
+        error = (str(exc) or type(exc).__name__)[:300]
+    with _provider_lock:
+        st = _provider_state.setdefault(
+            prov.name, {"games": [], "last_success": None,
+                        "last_attempt": None, "error": ""})
+        st["last_attempt"] = now
+        st["error"] = error
+        if games is not None:
+            # Held apart from the list handed on, so nothing the build does
+            # to a game can change what a later failure falls back to.
+            st["games"], st["last_success"] = copy.deepcopy(games), now
+            return games
+        held, since = st["games"], st["last_success"]
+    if _within_retention(since, now):
+        log.warning("Provider %s failed (%s); serving its last good list of %d games, "
+                    "%.1fh old", prov.name, error, len(held), (now - since) / 3600)
+        return copy.deepcopy(held)
+    log.warning("Provider %s failed (%s); %s", prov.name, error,
+                ("its last good list is past the %gh limit and is no longer served"
+                 % PROVIDER_STALE_HOURS) if since is not None
+                else "it has no good list to fall back on")
+    return []
+
+
+def _provider_status() -> list[dict]:
+    """Per enabled Provider: is its latest list call good, and since when."""
+    out, now = [], time.time()
+    for prov in _enabled_providers():
+        with _provider_lock:
+            st = dict(_provider_state.get(prov.name) or {})
+        since, tried = st.get("last_success"), st.get("last_attempt")
+        failing = bool(tried) and bool(st.get("error"))
+        out.append({
+            "name":          prov.name,
+            "code":          prov.code,
+            "ok":            None if not tried else not failing,
+            "error":         st.get("error") or "",
+            "last_success":  datetime.fromtimestamp(since, timezone.utc).isoformat() if since else None,
+            "last_attempt":  datetime.fromtimestamp(tried, timezone.utc).isoformat() if tried else None,
+            "serving_stale": bool(failing and _within_retention(since, now)),
+            "games":         len(st.get("games") or []),
+            "stale_hours":   PROVIDER_STALE_HOURS,
+        })
+    return out
+
+
 def fetch_all_matches() -> list[dict]:
     """Every game from every enabled Provider, stamped with its `_provider`."""
     matches: list[dict] = []
     for prov in _enabled_providers():
-        matches.extend(prov.list_games())
+        matches.extend(_fetch_provider_games(prov))
     return matches
 
 
@@ -4787,6 +4864,7 @@ def _dash_runtime() -> dict:
                          "ttl_s": NO_AUDIO_TTL,
                          "enabled": REQUIRE_AUDIO},
         },
+        "providers": _provider_status(),
         "sources": ALL_SOURCES,
         "base_url": BASE_URL,
         "public_base": {
