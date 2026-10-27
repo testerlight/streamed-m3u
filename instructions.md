@@ -68,6 +68,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `app.py` | The service: scrape, playlist, guide, resolution, proxy. |
 | `settings.py` | The settings schema, the `/data/settings.json` overlay, atomic writes. §3. |
 | `auth.py` | Optional console login and CSRF. §4. |
+| `providers.py` | The Provider layer (provider-swap ticket 01): `Mirrors` (ordered, configured base URLs; the last one that answered is tried first, and each refresh starts again from the first) and `StreamedPk`, which lists games and Sources in the app's existing shapes and stamps `_provider`. `app.py` picks the Providers named in `PROVIDERS`; a name it does not know is ignored. Only configured addresses are ever contacted. Checked by `tools/check_providers.py` (`--baseline` in the old image, `--compare` in the new). |
 | `dashboard.py`, `templates/`, `static/` | The console. |
 | `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |

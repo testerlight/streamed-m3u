@@ -345,6 +345,8 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `LINEUP_FILE` | `/data/lineup.json` | env only | Jellyfin allowlist file. Missing means the bundled default set is installed. |
 | **Upstream** | | | |
 | `STREAMED_BASE_URL` | `https://streamed.pk` | live | Catalog the service scrapes. Change this when the site moves domain. |
+| `STREAMED_MIRRORS` | `(empty)` | live | Extra web addresses for the catalog, tried in order if the main one is down. Only addresses listed here (and the main one) are ever contacted. |
+| `PROVIDERS` | `streamed` | live | Which services supply games and streams, in preference order. Known names: streamed. Unknown names are ignored. |
 | `REQUEST_TIMEOUT` | `10` | live | Seconds before an upstream API call is abandoned. |
 | `BUILD_WORKERS` | `8` | live | Parallel workers for a playlist build. Modest values avoid rate limits. |
 | `REFRESH_SECONDS` | `480` | live | Interval between playlist rebuilds. A change waits out the current interval. |

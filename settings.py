@@ -99,6 +99,14 @@ SCHEMA = [
     # Upstream
     _s("STREAMED_BASE_URL", "BASE_URL", "Upstream", "live", "url",
        "Catalog the service scrapes. Change this when the site moves domain."),
+    _s("STREAMED_MIRRORS", "STREAMED_MIRRORS", "Upstream", "live", "list",
+       "Extra web addresses for the catalog, tried in order if the main one is down. "
+       "Only addresses listed here (and the main one) are ever contacted.",
+       allow_empty=True),
+    _s("PROVIDERS", "PROVIDERS", "Upstream", "live", "list",
+       "Which services supply games and streams, in preference order. "
+       "Known names: streamed. Unknown names are ignored.",
+       allow_empty=True),
     _s("REQUEST_TIMEOUT", "REQUEST_TIMEOUT", "Upstream", "live", "int",
        "Seconds before an upstream API call is abandoned.", min=1, max=120),
     _s("BUILD_WORKERS", "BUILD_WORKERS", "Upstream", "live", "int",

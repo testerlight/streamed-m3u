@@ -4,11 +4,11 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** implemented on provider-swap (awaiting review)
 
-- [ ] With streamed.pk the only enabled Provider, the served playlist and `/stream` output are identical to before, checked against a recorded streamed.pk fixture through the existing test seam.
-- [ ] The enabled-Providers setting controls which Providers are used and their order; streamed.pk can be turned off without a rebuild.
-- [ ] Each Provider's base URL and mirror list are settings; mirrors are tried in order, and a domain that is not configured is never contacted.
-- [ ] Embed hosts come from each Provider's own response, not from a hard-coded value.
-- [ ] The README settings table is regenerated from the settings code.
-- [ ] Existing checks still pass on a scratch-tagged image; the live image tag is not retagged.
+- [x] With streamed.pk the only enabled Provider, the served playlist and `/stream` output are identical to before, checked against a recorded streamed.pk fixture through the existing test seam.
+- [x] The enabled-Providers setting controls which Providers are used and their order; streamed.pk can be turned off without a rebuild.
+- [x] Each Provider's base URL and mirror list are settings; mirrors are tried in order, and a domain that is not configured is never contacted.
+- [x] Embed hosts come from each Provider's own response, not from a hard-coded value.
+- [x] The README settings table is regenerated from the settings code.
+- [x] Existing checks still pass on a scratch-tagged image; the live image tag is not retagged.

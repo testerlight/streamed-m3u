@@ -66,6 +66,7 @@ import dockerctl
 import composite
 import lineup
 import multiview
+import providers
 import settings as _settings
 
 # Compose interpolation and uncommented .env lines hand us VAR="" for unset
@@ -74,6 +75,14 @@ _settings.scrub_empty_env()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 BASE_URL          = os.getenv("STREAMED_BASE_URL", "https://streamed.pk")
+# Which Providers feed the app, in preference order. Only names the app knows
+# are used; "streamed" is streamed.pk. STREAMED_MIRRORS are extra base URLs for
+# streamed.pk, tried in order after STREAMED_BASE_URL. Only addresses written
+# here are ever contacted.
+PROVIDERS         = [t.strip().lower() for t in os.getenv(
+    "PROVIDERS", "streamed").split(",") if t.strip()]
+STREAMED_MIRRORS  = [t.strip() for t in os.getenv(
+    "STREAMED_MIRRORS", "").split(",") if t.strip()]
 REFRESH_SECONDS   = int(os.getenv("REFRESH_SECONDS", "480"))
 REQUEST_TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT", "10"))
 # Concurrency for the playlist build. Each match needs one API call per
@@ -1196,77 +1205,57 @@ def _validate_candidate(embed_url: str, label: str = ""):
     return True, payload, "%s:ok" % tag
 
 
-# ─── API helpers ──────────────────────────────────────────────────────────────
+# ─── Providers ────────────────────────────────────────────────────────────────
 
-def _get(path: str):
-    url = f"{BASE_URL}{path}"
-    try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT, headers=API_HEADERS)
-        r.raise_for_status()
-        return r.json()
-    except Exception as exc:
-        log.warning("API error [%s]: %s", url, exc)
-        return None
+_provider_cache: dict = {}
+_provider_lock = threading.Lock()
+_warned_providers: set = set()
 
 
-# ─── Sports & Matches ─────────────────────────────────────────────────────────
+def _enabled_providers() -> list:
+    """The Providers switched on by PROVIDERS, in order.
 
-def fetch_sports() -> list[dict]:
-    sports = _get("/api/sports") or []
-    log.info("Fetched %d sport categories", len(sports))
-    return sports
-
-
-def fetch_all_matches(sports: list[dict]) -> list[dict]:
-    seen:    set[str]   = set()
-    matches: list[dict] = []
-
-    def _add(m: dict, category: str):
-        mid = m.get("id")
-        if mid and mid not in seen:
-            seen.add(mid)
-            m["_category"] = category
-            matches.append(m)
-
-    for m in (_get("/api/matches/live") or []):
-        _add(m, "Live")
-
-    for sport in sports:
-        sport_id   = sport.get("id", "")
-        sport_name = sport.get("name", sport_id.title())
-        if not sport_id:
+    Instances are kept between calls so a Provider remembers which of its
+    mirrors last answered. A name the app does not know is skipped (and
+    reported once), so one typo cannot take the others down.
+    """
+    found, seen = [], set()
+    for raw in PROVIDERS:
+        name = str(raw).strip().lower()
+        if name in seen:
             continue
-        for m in (_get(f"/api/matches/{sport_id}") or []):
-            _add(m, sport_name)
+        seen.add(name)
+        if name == "streamed":
+            bases = tuple(providers.clean_bases(BASE_URL, STREAMED_MIRRORS))
+            with _provider_lock:
+                held = _provider_cache.get(name)
+                if held is None or held[0] != bases:
+                    held = (bases, providers.StreamedPk(
+                        list(bases), REQUEST_TIMEOUT, API_HEADERS, ALL_SOURCES))
+                    _provider_cache[name] = held
+            prov = held[1]
+            prov.timeout = REQUEST_TIMEOUT
+            found.append(prov)
+        elif name not in _warned_providers:
+            _warned_providers.add(name)
+            log.warning("PROVIDERS names %r, which this build does not have; ignored", name)
+    return found
 
-    log.info("Collected %d unique matches", len(matches))
+
+def fetch_all_matches() -> list[dict]:
+    """Every game from every enabled Provider, stamped with its `_provider`."""
+    matches: list[dict] = []
+    for prov in _enabled_providers():
+        matches.extend(prov.list_games())
     return matches
 
 
 def fetch_streams_for_match(match: dict) -> list[dict]:
-    source_map: dict[str, str] = {}
-    for entry in (match.get("sources") or []):
-        src = entry.get("source", "").lower()
-        sid = entry.get("id", "")
-        if src and sid and src not in source_map:
-            source_map[src] = sid
-
-    all_streams = []
-    for src_name in ALL_SOURCES:
-        src_id = source_map.get(src_name)
-        if not src_id:
-            continue
-        streams = _get(f"/api/stream/{src_name}/{src_id}")
-        if not streams or not isinstance(streams, list):
-            continue
-        for s in streams:
-            s["_match_title"]    = match.get("title", "Unknown Match")
-            s["_match_id"]       = match.get("id", "")
-            s["_match_category"] = match.get("_category", "Sports")
-            s["_match_poster"]   = match.get("poster", "")
-        all_streams.extend(streams)
-
-    return all_streams
+    """The Sources for one game, from the Provider that listed it."""
+    for prov in _enabled_providers():
+        if prov.name == match.get("_provider"):
+            return prov.list_sources(match)
+    return []
 
 
 # ─── M3U builder ──────────────────────────────────────────────────────────────
@@ -2421,19 +2410,22 @@ def _warm_now(slugs):
 
 # ─── Background refresh ───────────────────────────────────────────────────────
 
-def refresh_loop():
+def refresh_once():
     global _cached_m3u, _last_refresh, _last_count
+    matches  = fetch_all_matches()
+    m3u, cnt = build_m3u(matches)
+    with _cache_lock:
+        _cached_m3u   = m3u
+        _last_refresh = datetime.now(timezone.utc)
+        _last_count   = cnt
+    log.info("Playlist ready: %d stream entries across %d matches", cnt, len(matches))
+
+
+def refresh_loop():
     while True:
         log.info("Refreshing playlist …")
         try:
-            sports   = fetch_sports()
-            matches  = fetch_all_matches(sports)
-            m3u, cnt = build_m3u(matches)
-            with _cache_lock:
-                _cached_m3u   = m3u
-                _last_refresh = datetime.now(timezone.utc)
-                _last_count   = cnt
-            log.info("Playlist ready: %d stream entries across %d matches", cnt, len(matches))
+            refresh_once()
         except Exception:
             log.exception("Refresh cycle failed")
         time.sleep(REFRESH_SECONDS)
