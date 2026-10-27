@@ -13,7 +13,7 @@ An outside service that lists games and offers sources for them (streamed.pk, pp
 _Avoid_: Site, API, backend
 
 **Source**:
-One provider-side origin of a channel's video for a given game (for example `admin1-HD`). A channel has several candidate sources, ranked, and one is active at a time. Every source belongs to exactly one provider.
+One provider-side origin of a channel's video for a given game (for example `SF1-1080p`). A channel has several candidate sources, ranked, and one is active at a time. Every source belongs to exactly one provider.
 _Avoid_: Stream (that is the session), server, link
 
 **Stream**:

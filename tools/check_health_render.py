@@ -142,7 +142,7 @@ with sync_playwright() as pw:
     check("open timeline survives a poll", page.locator("tr.health-row").count() == 1)
     picker = page.inner_text("tr.health-row .source-picker")
     check("the stats drop-down holds the source picker, the playing source marked",
-          "admin 1 · HD" in picker and "golf 1 · HD" in picker and "admin 2 · SD" in picker
+          "ADM 1 · 720p" in picker and "GOL 1 · 720p" in picker and "ADM 2 · 540p" in picker
           and "Playing" in picker, picker[:300])
     check("only the other sources offer Switch",
           page.locator("tr.health-row [data-switch-source]").count() == 2)
@@ -154,7 +154,7 @@ with sync_playwright() as pw:
         ".indexOf('did not pass') >= 0", timeout=20000)
     status = page.inner_text("tr.health-row .source-status")
     check("a dead source's check fails in words, the stream untouched",
-          "golf 1 · HD did not pass: no stream link" in status
+          "GOL 1 · 720p did not pass: no stream link" in status
           and page.locator("[data-health]").count() == 1, status)
     page.locator("#streams").screenshot(path="/out/source-picker-dark.png")
     page.wait_for_selector("#history-panel table", timeout=25000)

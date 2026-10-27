@@ -607,8 +607,8 @@
    * replaces it. It then stays the channel's pick for the rest of the match. */
 
   function sourceName(label) {
-    var m = /^([a-z]+)(\d+)-(HD|SD)$/i.exec(label || "");
-    return m ? m[1] + " " + m[2] + " · " + m[3].toUpperCase() : (label || "");
+    var m = /^([A-Z]+)(\d+)(?:-(\d+p))?$/.exec(label || "");
+    return m ? m[1] + " " + m[2] + (m[3] ? " · " + m[3] : "") : (label || "");
   }
 
   function sourceJobText(job) {
@@ -617,7 +617,7 @@
       return "Checking " + sourceName(job.label) + ": loading it and testing its newest " +
         "chunks while this stream keeps playing";
     }
-    return job.detail ? job.detail.replace(/[a-z]+\d+-(HD|SD)/gi, function (l) {
+    return job.detail ? job.detail.replace(/\b[A-Z]{2,6}\d+(?:-\d+p)?\b/g, function (l) {
       return sourceName(l);
     }) : "";
   }
@@ -634,6 +634,8 @@
       src.job.state === "done" ? " ok" : "";
     var items = src.options.map(function (o) {
       var tags = [];
+      if (o.provider) { tags.push('<span class="badge">' + esc(o.provider) + "</span>"); }
+      tags.push('<span class="badge' + (o.hd ? " ok" : "") + '">' + (o.hd ? "HD" : "SD") + "</span>");
       if (o.playing) { tags.push('<span class="badge ok">Playing</span>'); }
       if (o.pinned) { tags.push('<span class="badge">Your pick</span>'); }
       return '<li class="source-option">' +

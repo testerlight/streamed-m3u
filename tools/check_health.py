@@ -807,12 +807,12 @@ def source_choice_tests(app, client, port):
 
     r1 = reader()
     sid, label = active()
-    check("a channel starts on the first source", label == "admin1-HD", label)
+    check("a channel starts on the first source", label == "ADM1-720p", label)
     st = client.get("/stream/status").get_json()
     view = next((x.get("source") for x in st["streams"] if x["stream_id"] == sid), None) or {}
     check("/stream/status lists the match's four sources, the playing one marked",
           len(view.get("options") or []) == 4
-          and [o["label"] for o in view["options"] if o["playing"]] == ["admin1-HD"], view)
+          and [o["label"] for o in view["options"] if o["playing"]] == ["ADM1-720p"], view)
 
     check("a dead source is accepted for checking", app._switch_source(sid, E["D"])[0] == "ok")
     j = job(("failed", "switching", "done"))
@@ -841,20 +841,20 @@ def source_choice_tests(app, client, port):
     check("without a disconnect hold, so the reconnect is let in",
           not app._disconnect_held("team:srcteam"))
     r2 = reader()                                   # what Dispatcharr does next
-    sid2, label = active(label="golf1-HD")
+    sid2, label = active(label="GOL1-720p")
     deadline = time.time() + 5
     while r2["first"] is None and time.time() < deadline:
         time.sleep(0.05)
-    check("the reconnect plays the picked source", label == "golf1-HD", label)
+    check("the reconnect plays the picked source", label == "GOL1-720p", label)
     check("from the checked payload: first video within 1s",
           r2["first"] is not None and r2["first"] < 1.0, r2["first"])
-    check("the switch reports done", job(("done",), 5).get("detail") == "Now playing golf1-HD",
+    check("the switch reports done", job(("done",), 5).get("detail") == "Now playing GOL1-720p",
           app._source_jobs.get("srcteam"))
 
     r2["stop"].set(); r2["done"].wait(10)
     r3 = reader()
     sid3, label = active()
-    check("the pick sticks across a later reconnect", label == "golf1-HD", label)
+    check("the pick sticks across a later reconnect", label == "GOL1-720p", label)
     check("picking what is already playing just keeps it",
           app._switch_source(sid3, E["B"])[0] == "ok"
           and "already playing" in job(("done",), 2).get("detail", ""))
@@ -863,10 +863,10 @@ def source_choice_tests(app, client, port):
     r3["stop"].set(); r3["done"].wait(10)
     r4 = reader()
     sid4, label = active()
-    check("the next start uses the normal order again", label == "admin1-HD", label)
+    check("the next start uses the normal order again", label == "ADM1-720p", label)
     r4["stop"].set(); r4["done"].wait(10)
 
-    app._source_pins["srcteam"] = {"embed_url": E["B"], "label": "golf1-HD",
+    app._source_pins["srcteam"] = {"embed_url": E["B"], "label": "GOL1-720p",
                                    "match_id": "m1", "set_at": time.time(),
                                    "prepared": None, "prepared_at": 0}
     with app._team_lock:

@@ -4,12 +4,12 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** implemented on provider-swap (awaiting review)
 
-- [ ] Given Sources from different Providers and qualities, the default order is quality, then audio, then Provider order, checked through the test seam.
-- [ ] An unlabelled Source ranks just below a labelled 1080p and above lower labelled qualities.
-- [ ] A Source known to have no audio ranks behind one that has audio, as today.
-- [ ] Labels show Provider, number and quality; the old letter labels are no longer produced.
-- [ ] The HD/SD badge follows the 720p-or-above rule, and for unlabelled Sources follows the probe.
-- [ ] The stats drop-down and picker show the Provider for each Source.
-- [ ] Existing checks still pass on a scratch-tagged image.
+- [x] Given Sources from different Providers and qualities, the default order is quality, then audio, then Provider order, checked through the test seam.
+- [x] An unlabelled Source ranks just below a labelled 1080p and above lower labelled qualities.
+- [x] A Source known to have no audio ranks behind one that has audio, as today.
+- [x] Labels show Provider, number and quality; the old letter labels are no longer produced.
+- [x] The HD/SD badge follows the 720p-or-above rule, and for unlabelled Sources follows the probe.
+- [x] The stats drop-down and picker show the Provider for each Source.
+- [x] Existing checks still pass on a scratch-tagged image.

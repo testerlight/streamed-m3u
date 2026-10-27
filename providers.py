@@ -11,6 +11,11 @@ streamed.pk is the first Provider and keeps the exact shapes it always had.
 Each game and source is stamped with `_provider` (the Provider's name) so a
 later step can route a game back to the Provider that listed it.
 
+A Provider also has a short `code` of capital letters for Source labels
+("ST" -> `[ST1-720p]`),
+and a Source may carry `quality`: the picture height in pixels, when the
+Provider says so. A Source without it is of unknown quality.
+
 Every Provider reaches its service through `Mirrors`: an ordered list of
 configured base URLs. Nothing outside that list is ever contacted. This
 module imports nothing from app.py.
@@ -93,6 +98,10 @@ class StreamedPk:
     """streamed.pk: sports, then matches per sport, then streams per source."""
 
     name = "streamed"
+    code = "ST"
+
+    # streamed.pk only says HD or not; these are the heights that stand for it.
+    HD_QUALITY, SD_QUALITY = 720, 540
 
     def __init__(self, bases: list[str], timeout: float, headers: dict,
                  source_names: list[str]):
@@ -161,5 +170,6 @@ class StreamedPk:
                 s["_match_category"] = game.get("_category", "Sports")
                 s["_match_poster"] = game.get("poster", "")
                 s["_provider"] = self.name
+                s["quality"] = self.HD_QUALITY if s.get("hd") else self.SD_QUALITY
             found.extend(streams)
         return found

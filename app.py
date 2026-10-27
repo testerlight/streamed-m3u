@@ -480,8 +480,8 @@ PLAYLIST_KEEPALIVE = os.getenv("PLAYLIST_KEEPALIVE", "1") == "1"
 FRESH_LINK_RETRY = os.getenv("FRESH_LINK_RETRY", "1") == "1"
 # Some sources publish a video elementary stream and no audio one at all -
 # observed on `admin`, which carries a raw MLB.TV feed. Playback looks fine and
-# is silent, and _rank_streams puts `admin` above `delta` (both HD, `admin`
-# earlier in ALL_SOURCES), so channels land on the silent source by default.
+# is silent, and the ranking put `admin` above `delta` (both HD, `admin`
+# earlier in ALL_SOURCES), so channels landed on the silent source by default.
 # With this on, the startup probe rejects a source that carries no audio and the
 # cascade falls through to one that does. Set to 0 to disable without a rebuild.
 REQUIRE_AUDIO = os.getenv("REQUIRE_AUDIO", "1") == "1"
@@ -1098,6 +1098,145 @@ def _has_audio_track(body):
     return False if saw_pmt else None
 
 
+class _Bits:
+    """Reads an H.264 parameter set: fixed-width and Exp-Golomb fields."""
+
+    def __init__(self, data):
+        self.v = int.from_bytes(data, "big")
+        self.n = len(data) * 8
+        self.pos = 0
+
+    def u(self, width):
+        self.pos += width
+        if self.pos > self.n:
+            raise ValueError("ran out of bits")
+        return (self.v >> (self.n - self.pos)) & ((1 << width) - 1)
+
+    def ue(self):
+        zeros = 0
+        while self.u(1) == 0:
+            zeros += 1
+            if zeros > 32:
+                raise ValueError("bad Exp-Golomb code")
+        return (1 << zeros) - 1 + (self.u(zeros) if zeros else 0)
+
+    def se(self):
+        k = self.ue()
+        return (k + 1) // 2 if k % 2 else -(k // 2)
+
+
+# The SPS sits at the start of a chunk, so only this much video is searched.
+VIDEO_SCAN_BYTES = 65536
+_HIGH_PROFILES = {100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135}
+
+
+def _sps_height(rbsp):
+    """Picture height in lines from an H.264 sequence parameter set."""
+    r = _Bits(rbsp)
+    profile = r.u(8)
+    r.u(16)                      # constraint flags, level
+    r.ue()                       # sps id
+    chroma = 1
+    if profile in _HIGH_PROFILES:
+        chroma = r.ue()
+        if chroma == 3:
+            r.u(1)
+        r.ue(); r.ue(); r.u(1)   # bit depths, transform bypass
+        if r.u(1):               # scaling matrices
+            for i in range(8 if chroma != 3 else 12):
+                if r.u(1):
+                    last = nxt = 8
+                    for _ in range(16 if i < 6 else 64):
+                        if nxt:
+                            nxt = (last + r.se()) % 256
+                        last = nxt or last
+    r.ue()                       # log2 max frame num
+    poc = r.ue()
+    if poc == 0:
+        r.ue()
+    elif poc == 1:
+        r.u(1); r.se(); r.se()
+        for _ in range(r.ue()):
+            r.se()
+    r.ue(); r.u(1)               # reference frames, gaps
+    r.ue()                       # width in macroblocks
+    rows = r.ue() + 1
+    frame_only = r.u(1)
+    if not frame_only:
+        r.u(1)
+    r.u(1)                       # direct 8x8
+    height = (2 - frame_only) * rows * 16
+    if r.u(1):                   # cropping
+        r.ue(); r.ue()
+        top, bottom = r.ue(), r.ue()
+        unit = (2 if chroma == 1 else 1) * (2 - frame_only)
+        height -= unit * (top + bottom)
+    return height
+
+
+def _video_height(body):
+    """Picture height of the H.264 video in a TS chunk, or None.
+
+    Reads the sequence parameter set out of the video elementary stream; the
+    PMT says which PID carries it. None means undecidable (no alignment, no
+    PMT, no SPS in this chunk), and callers must treat that as "unknown", not
+    as "small".
+    """
+    off = _ts_sync_offset(body)
+    if off is None:
+        return None
+    pmt_pids, video_pids, es = set(), set(), bytearray()
+    for i in range(off, len(body) - 187, 188):
+        if body[i] != 0x47:
+            continue
+        pid = ((body[i + 1] & 0x1f) << 8) | body[i + 2]
+        afc = (body[i + 3] >> 4) & 3
+        p = i + 4
+        if afc in (2, 3):
+            p += 1 + body[i + 4]
+        if afc not in (1, 3) or p >= i + 188:
+            continue
+        if pid == 0 or pid in pmt_pids:
+            if not body[i + 1] & 0x40:
+                continue                # a section's continuation packet
+            p += 1 + body[p]
+            if p + 12 > i + 188:
+                continue
+            slen = ((body[p + 1] & 0x0f) << 8) | body[p + 2]
+            if pid == 0:
+                for q in range(p + 8, min(p + 5 + slen - 4, i + 188) - 3, 4):
+                    if body[q] or body[q + 1]:      # program 0 is the NIT
+                        pmt_pids.add(((body[q + 2] & 0x1f) << 8) | body[q + 3])
+            else:
+                ilen = ((body[p + 10] & 0x0f) << 8) | body[p + 11]
+                q = p + 12 + ilen
+                end = min(p + 3 + slen - 4, i + 188)
+                while q + 5 <= end:
+                    if body[q] == 0x1b:        # H.264
+                        video_pids.add(((body[q + 1] & 0x1f) << 8) | body[q + 2])
+                    q += 5 + (((body[q + 3] & 0x0f) << 8) | body[q + 4])
+        elif pid in video_pids and len(es) < VIDEO_SCAN_BYTES:
+            es += body[p:i + 188]
+
+    at = 0
+    while True:
+        at = es.find(b"\x00\x00\x01", at)
+        if at < 0 or at + 3 >= len(es):
+            return None
+        at += 3
+        if es[at] & 0x1f != 7:
+            continue
+        end = len(es)
+        for stop in (b"\x00\x00\x01", b"\x00\x00\x00"):
+            hit = es.find(stop, at)
+            if hit >= 0:
+                end = min(end, hit)
+        try:
+            return _sps_height(bytes(es[at + 1:end]).replace(b"\x00\x00\x03", b"\x00\x00"))
+        except (ValueError, IndexError):
+            return None
+
+
 def _known_silent(embed_url):
     """True if this embed was recently confirmed to carry no audio."""
     with _no_audio_lock:
@@ -1192,6 +1331,11 @@ def _validate_candidate(embed_url: str, label: str = ""):
     # this candidate aside - silent video is a poor outcome, but a far better
     # one than a channel that will not start at all.
     audio = _has_audio_track(first_body)
+    height = _video_height(first_body)
+    if height:
+        if len(_probed_height) >= 4096:
+            _probed_height.clear()      # a game's worth of URLs; they refill
+        _probed_height[embed_url] = height
     payload = (d, h, c, segs, {first_url: first_body})
     if audio is False:
         _mark_silent(embed_url)
@@ -1200,8 +1344,8 @@ def _validate_candidate(embed_url: str, label: str = ""):
                         "- deprioritising", len(first_body), embed_url)
             return False, payload, "%s:no-audio" % tag
 
-    log.info("Segment probe OK (%d bytes, audio=%s) for %s",
-             len(first_body), audio, embed_url)
+    log.info("Segment probe OK (%d bytes, audio=%s, height=%s) for %s",
+             len(first_body), audio, height, embed_url)
     return True, payload, "%s:ok" % tag
 
 
@@ -1260,24 +1404,97 @@ def fetch_streams_for_match(match: dict) -> list[dict]:
 
 # ─── M3U builder ──────────────────────────────────────────────────────────────
 
-SOURCE_ABBREV = {
-    "admin":   "A",
-    "alpha":   "AL",
-    "bravo":   "B",
-    "charlie": "C",
-    "delta":   "D",
-    "echo":    "E",
-    "foxtrot": "F",
-    "golf":    "G",
-    "hotel":   "H",
-    "intel":   "I",
-}
+# ─── Source ranking and labels ────────────────────────────────────────────────
+#
+# A Source is ranked by picture quality, then whether it carries audio, then
+# its Provider's place in PROVIDERS. Quality is the height in pixels the
+# Provider labels it with (`quality`); a Source with no label is of unknown
+# quality and ranks just below a labelled 1080p. Labels read
+# `[SF1-1080p]` / `[PPV1]`: Provider code, the Source's number among that
+# Provider's Sources for the game (in the order the Provider listed them, so it
+# does not move when the ranking does), and the quality when it is known.
+
+QUALITY_UNKNOWN = 1079   # ranks between a labelled 1080p and a labelled 720p
+HD_MIN_HEIGHT = 720
+
+# embed_url -> picture height the startup probe read from its first chunk.
+_probed_height = {}
 
 
-def format_channel_name(title: str, source: str, stream_no: int, hd: bool) -> str:
-    abbrev  = SOURCE_ABBREV.get(source.lower(), source[:1].upper())
-    quality = "HD" if hd else "SD"
-    return f"[{abbrev}{stream_no}-{quality}] {title}"
+def _provider_order() -> dict:
+    """Provider name -> (place in PROVIDERS, label code)."""
+    return {p.name: (i, getattr(p, "code", "") or "")
+            for i, p in enumerate(_enabled_providers())}
+
+
+def _src_embed(s) -> str:
+    return (s.get("embed_url") or s.get("embedUrl") or "").strip()
+
+
+def _src_provider(s) -> str:
+    return s.get("_provider") or s.get("provider") or ""
+
+
+def _src_quality(s):
+    """Labelled height in pixels, or None if the Provider gave none.
+
+    A team-map entry made before Sources carried `quality` only knows HD or
+    not; a Provider's own Source without it is of unknown quality.
+    """
+    if "quality" not in s and "embed_url" in s:
+        return HD_MIN_HEIGHT if s.get("hd") else 540
+    try:
+        q = int(s.get("quality") or 0)
+    except (TypeError, ValueError):
+        q = 0
+    return q or None
+
+
+def _is_hd(s) -> bool:
+    """720p or above; an unlabelled Source only if the startup probe saw it."""
+    q = _src_quality(s)
+    if q:
+        return q >= HD_MIN_HEIGHT
+    return _probed_height.get(_src_embed(s), 0) >= HD_MIN_HEIGHT
+
+
+def _code_of(name: str, order: dict) -> str:
+    """The label code of a Provider by name; letters only, so a console can
+    always take a label apart."""
+    return (order.get(name, (0, ""))[1]
+            or re.sub("[^A-Z]", "", name.upper())[:3] or "SRC")
+
+
+def _label_of(code: str, n: int, quality) -> str:
+    return "%s%d%s" % (code, n, "-%dp" % quality if quality else "")
+
+
+def _source_numbers(streams) -> list:
+    """Each Source's number among its Provider's, in listed order."""
+    seen: dict = {}
+    out = []
+    for s in streams:
+        name = _src_provider(s)
+        seen[name] = seen.get(name, 0) + 1
+        out.append(seen[name])
+    return out
+
+
+def format_channel_name(title: str, label: str) -> str:
+    return f"[{label}] {title}"
+
+
+def _source_key(s, order: dict):
+    """Sort key, best first."""
+    src = (s.get("source") or "").lower()
+    silent = REQUIRE_AUDIO and _known_silent(_src_embed(s))
+    return (
+        -(_src_quality(s) or QUALITY_UNKNOWN),
+        1 if silent else 0,
+        order.get(_src_provider(s), (len(order),))[0],
+        ALL_SOURCES.index(src) if src in ALL_SOURCES else len(ALL_SOURCES),
+        s.get("stream_no", s.get("streamNo", 1)),
+    )
 
 
 # --- Team index --------------------------------------------------------------
@@ -1471,17 +1688,17 @@ def _merge_streams(stream_lists) -> list:
     """
     merged, seen = [], set()
     for lst in stream_lists:
-        for s in lst or []:
-            url = s.get("embed_url")
+        # Each listing is ranked; its numbers still say the order it was listed in.
+        for x in sorted(lst or [], key=lambda x: x.get("n", 0)):
+            url = x.get("embed_url")
             if url and url not in seen:
                 seen.add(url)
-                merged.append(s)
-    merged.sort(key=lambda s: (
-        0 if s.get("hd") else 1,
-        ALL_SOURCES.index(s.get("source"))
-        if s.get("source") in ALL_SOURCES else len(ALL_SOURCES),
-        s.get("stream_no", 1),
-    ))
+                merged.append(dict(x))
+    # Each listing numbered its own Sources from 1; renumber across the pool.
+    for x, n in zip(merged, _source_numbers(merged)):
+        x["n"] = n
+    order = _provider_order()
+    merged.sort(key=lambda x: _source_key(x, order))
     return merged
 
 
@@ -1509,16 +1726,22 @@ def _channel_id(slug: str, entry: dict) -> str:
     return ("streamed.team.%s" if kind == "team" else "streamed.feed.%s") % slug
 
 
-def _rank_streams(streams: list[dict]) -> list[dict]:
-    """Best-first: HD before SD, then source reliability, then stream number."""
-    def key(s):
-        src = (s.get("source") or "").lower()
-        return (
-            0 if s.get("hd") else 1,
-            ALL_SOURCES.index(src) if src in ALL_SOURCES else len(ALL_SOURCES),
-            s.get("streamNo", 1),
-        )
-    return sorted(streams, key=key)
+def _entry_streams(streams: list[dict]) -> list[dict]:
+    """A game's Sources as the team map keeps them, best first."""
+    order = _provider_order()
+    numbered = list(zip(streams, _source_numbers(streams)))
+    numbered.sort(key=lambda sn: _source_key(sn[0], order))
+    return [
+        {"embed_url": _src_embed(x),
+         "source":    x.get("source", ""),
+         "stream_no": x.get("streamNo", 1),
+         "hd":        _is_hd(x),
+         "provider":  _src_provider(x),
+         "code":      _code_of(_src_provider(x), order),
+         "quality":   _src_quality(x),
+         "n":         n}
+        for x, n in numbered if _src_embed(x)
+    ]
 
 
 def _install_seed_roster():
@@ -1859,7 +2082,6 @@ def _roster_touch(slug: str, name: str, badge: str, sport: str,
 def _nonteam_candidate(match: dict, streams, kind: str, name: str,
                        event_title: str) -> dict:
     """A map entry for content that has no home/away teams."""
-    ranked = _rank_streams(streams or [])
     return {
         "team":        name,
         "match_id":    match.get("id", ""),
@@ -1871,13 +2093,7 @@ def _nonteam_candidate(match: dict, streams, kind: str, name: str,
         "starts":      match.get("date"),
         "kind":        kind,
         "side":        "",
-        "streams": [
-            {"embed_url": (x.get("embedUrl") or "").strip(),
-             "source":    x.get("source", ""),
-             "stream_no": x.get("streamNo", 1),
-             "hd":        bool(x.get("hd"))}
-            for x in ranked if (x.get("embedUrl") or "").strip()
-        ],
+        "streams": _entry_streams(streams or []),
     }
 
 
@@ -1977,7 +2193,6 @@ def update_team_index(matches: list[dict], streams_per_match: list[list[dict]]):
         if _roster_touch(slug, home, home_badge, sport, now_iso):
             added += 1
 
-        ranked = _rank_streams(streams or [])
         candidate = {
             "team":        home,
             "match_id":    match.get("id", ""),
@@ -1987,13 +2202,7 @@ def update_team_index(matches: list[dict], streams_per_match: list[list[dict]]):
             "sport":       match.get("category", ""),
             "poster":      match.get("poster", ""),
             "starts":      match.get("date"),
-            "streams": [
-                {"embed_url": (x.get("embedUrl") or "").strip(),
-                 "source":    x.get("source", ""),
-                 "stream_no": x.get("streamNo", 1),
-                 "hd":        bool(x.get("hd"))}
-                for x in ranked if (x.get("embedUrl") or "").strip()
-            ],
+            "streams":     _entry_streams(streams or []),
         }
 
         candidate["side"] = "home"
@@ -2094,8 +2303,10 @@ def update_team_index(matches: list[dict], streams_per_match: list[list[dict]]):
 
 
 def _source_label(s):
-    """'admin1-HD' for one of a match's streams."""
-    return "%s%s-%s" % (s["source"], s["stream_no"], "HD" if s["hd"] else "SD")
+    """'SF1-1080p' (or 'PPV1' when the quality is unknown) for one of a game's
+    Sources, as the team map holds it."""
+    code = s.get("code") or _code_of(s.get("source") or "", {})
+    return _label_of(code, s.get("n", s.get("stream_no", 1)), _src_quality(s))
 
 
 def _team_candidates(team: str, slot: str):
@@ -2183,11 +2394,12 @@ def build_m3u(matches: list[dict]) -> tuple[str, int]:
     except Exception:
         log.exception("Team index update failed (playlist unaffected)")
 
+    codes = _provider_order()
     for streams in streams_per_match:
         if not streams:
             continue
 
-        for stream in streams:
+        for stream, number in zip(streams, _source_numbers(streams)):
             embed_url = (stream.get("embedUrl") or "").strip()
             if not embed_url:
                 continue
@@ -2196,11 +2408,12 @@ def build_m3u(matches: list[dict]) -> tuple[str, int]:
             category  = stream["_match_category"]
             match_id  = stream["_match_id"]
             language  = stream.get("language", "")
-            hd        = stream.get("hd", False)
             stream_no = stream.get("streamNo", 1)
             source    = stream.get("source", "")
 
-            ch_name  = format_channel_name(title, source, stream_no, hd)
+            label    = _label_of(_code_of(_src_provider(stream), codes), number,
+                                 _src_quality(stream))
+            ch_name  = format_channel_name(title, label)
             tvg_id   = f"streamed.{match_id}.{source}.{stream_no}"
 
             proxy_url = f"{_BASE_PLACEHOLDER}/stream?url={quote(embed_url, safe='')}"
@@ -2292,8 +2505,7 @@ def _prewarm_one(slug, name, force=False):
                             key=lambda c: _known_silent(c["embed_url"]))
     with _warm_gate:
         for cand in warm_order[:CASCADE_MAX_ATTEMPTS]:
-            label = "%s%s-%s" % (cand["source"], cand["stream_no"],
-                                 "HD" if cand["hd"] else "SD")
+            label = _source_label(cand)
             ok, _payload, detail = _validate_candidate(cand["embed_url"], label)
             details.append(detail)
             if ok:
@@ -3799,7 +4011,8 @@ def _match_sources(slug):
     if not entry:
         return None, []
     return entry.get("match_id"), [
-        {"embed_url": s["embed_url"], "label": _source_label(s), "hd": bool(s.get("hd"))}
+        {"embed_url": s["embed_url"], "label": _source_label(s), "hd": _is_hd(s),
+         "provider": s.get("provider", "")}
         for s in entry.get("streams") or []]
 
 
@@ -4179,8 +4392,7 @@ def teams():
     playing = {k: v for k, v in tmap.items() if v["streams"]}
 
     def best(v):
-        s = v["streams"][0]
-        return "%s%s-%s" % (s["source"], s["stream_no"], "HD" if s["hd"] else "SD")
+        return _source_label(v["streams"][0])
 
     return jsonify({
         "roster_size":       len(roster),

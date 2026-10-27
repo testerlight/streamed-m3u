@@ -735,9 +735,9 @@ the fix the same stream ran at 0.984x with surplus oscillating around zero.
 `admin` source publishes a raw MLB.TV feed as a video-only transport stream —
 one H.264 elementary stream, no audio PID, ~99.8% of packets on the video PID
 and nothing else but PAT/SDT/padding. Playback looks perfect and is completely
-silent. `_rank_streams` sorts HD first then by `ALL_SOURCES` order, where
-`admin` sits ahead of `delta`, so with both HD the silent source wins by
-default. Measured when this was found: **59 teams simultaneously ranked to an
+silent. The ranking (then `_rank_streams`; now `_source_key`, #37) sorted HD
+first then by `ALL_SOURCES` order, where `admin` sits ahead of `delta`, so with
+both HD the silent source won by default. Measured when this was found: **59 teams simultaneously ranked to an
 `admin` source.** The `delta` copy of the same match carries AAC 48 kHz stereo.
 
 `_validate_candidate` already downloads a whole chunk to prove a source is
@@ -1266,6 +1266,42 @@ run: its origin is poll-driven and refuses chunks with 403, and a re-read
 uses up a poll; with the switch on that run's windows no longer line up
 (nothing is wrong, the harness assumed no extra playlist requests). A
 poll-driven harness that 403s chunks needs the same pin.
+
+**37. Sources rank by quality, then audio, then Provider; labels name the
+Provider.** Provider swap ticket 02
+(`.scratch/provider-swap/issues/02-provider-aware-ranking-labels.md`).
+`_source_key` is the one sort key, used by `_entry_streams` (a game's Sources
+as the team map holds them) and by `_merge_streams` (pooled listings of one
+event): quality (picture height the Provider labels, descending), then known
+silent (`_known_silent`, with `REQUIRE_AUDIO`), then the Provider's place in
+`PROVIDERS`, then the old `ALL_SOURCES` order and stream number inside one
+Provider. A Source whose Provider gives no height ranks as `QUALITY_UNKNOWN`
+(1079): just below a labelled 1080p, above 720p. Load-bearing:
+
+- **A Provider says quality with `quality` (pixels) on its Source, and has a
+  `code`.** streamed.pk only knows HD or not, so it reports 720 or 540. A
+  team-map entry written before `quality` existed (an old test fixture) is read
+  the same way from its `hd` flag; a Provider's own Source with no `quality`
+  key is *unknown*, not SD.
+- **Labels are `<code><n>[-<quality>p]`**: `ST1-720p`, `SF1-1080p`, `PPV1`
+  (no suffix when unknown). Channel names wrap it in brackets. `n` counts that
+  Provider's Sources for the game **in the order it listed them**, never in
+  rank order: a pin and the console's "playing" marker compare labels as text,
+  and a no-audio verdict re-sorts the list, which must not rename anything.
+  The `tvg-id` is untouched (`streamed.<match>.<source>.<streamNo>`), so
+  Dispatcharr sees the same channels. `_merge_streams` renumbers across the
+  pooled listings, since each started at 1.
+- **HD means 720p or above** (`_is_hd`). For an unlabelled Source it is true
+  only once the startup probe has seen 720 or more: `_validate_candidate`
+  reads the H.264 SPS out of the chunk it already downloads
+  (`_video_height`, `_probed_height`, cropping applied, so 1080 is not 1088).
+  Before the first probe it is SD. The probe never moves a Source in the
+  ranking; only the badge. Undecidable chunks (no PMT or SPS in them) record
+  nothing, they are not "small".
+- The console shows the Provider's name and an HD/SD badge on each option.
+
+Checked by `tools/check_ranking.py` (15), with scripted Providers: order, the
+silent tie-break, labels, HD, and the SPS reader on 720p, 480p and cropped 1080p.
 
 ## 8. Endpoint reference
 
