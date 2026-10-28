@@ -4,14 +4,14 @@
 
 **Blocked by:** 08
 
-**Status:** implemented on provider-swap (awaiting review); Jellyfin leg not done
+**Status:** implemented on provider-swap (awaiting review); verified in Jellyfin
 
 - [x] A recorded streamfree embed page is kept as a fixture; the token is read from it and the playlist is requested with the embed page as referrer, checked through the test seam with stubbed HTTP.
 - [x] The extraction result has the same shape as the browser extractor's, so existing startup probing, audio check, pacing and Recovery apply unchanged.
 - [x] If the page layout no longer yields a token, the browser fallback is used and loads the page with no Referer.
 - [x] A 403 or Violation answer is treated as a failed Source, logged, and counted so the Provider's health shows in the dashboard.
 - [x] Token reuse respects its lifetime, and expired tokens are re-fetched.
-- [~] A live streamfree Channel plays through to Jellyfin for several minutes behind the VPN on a scratch-tagged image.
+- [x] A live streamfree Channel plays through to Jellyfin for several minutes behind the VPN on a scratch-tagged image.
 - [x] Embed pages are fetched only for prewarming and tune-in, and prewarming stays serial and light.
 - [x] Existing checks still pass on a scratch-tagged image.
 
@@ -21,5 +21,6 @@
 - Recorded embed page: `tools/fixtures/streamfree_embed.html`. Checked by `tools/check_streamfree_playback.py` (28 checks, including real Chromium proving the fallback sends no Referer) on scratch image `streamed-m3u:playback-09`.
 - Existing checks on that image: streamfree, ppv, providers, ranking, merge, resilience, pick, console, reorder, cushion, freshlink, health, render all pass (render failed once, passed on two re-runs and on `streamfree-08`: a flake, not this change).
 - Live, behind the VPN (scratch container in the live network namespace, port 8799, copy of the data dir): a live NBA game streamed for 6 minutes, 5.9 Mbps average, first byte 3.5 s, no gap, no browser started; a second variant (NHL) for 40 s. Live image not touched.
-- **Not done: playing into Jellyfin.** Pulled `/stream` directly, as in ticket 07; a human or a deployed channel is needed for that, hence `[~]`.
 - Not deployed. Needs the user's go-ahead (ticket 10).
+
+2026-10-28 (agent). Jellyfin leg done. Scratch container (`streamed-m3u:playback-09`, port 8788 in the gluetun namespace, copy of the data dir) served the live Brewers vs Rays game (`[SF1-1080p]`, variant `...1080p2`); the user added it in Dispatcharr and watched it in Jellyfin and reported it played perfectly. Server side at about 3.5 min into that session: 237 MB sent, 0 freezes, 0 empty chunks, 0 failed downloads, 0 playlist errors, no browser launched. Four `source_quiet` early warnings were raised (no new chunk for 8 s); three were scored false and none was followed by a freeze. All checklist items are done. Not deployed (ticket 10).
