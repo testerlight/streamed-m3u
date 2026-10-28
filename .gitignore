@@ -52,3 +52,7 @@ venv/
 # Screenshots from tools/check_render.py
 _shots/
 .claude/
+
+# local gh CLI used for pushing
+gh_*_linux_amd64/
+gh_*_linux_amd64.tar.gz
