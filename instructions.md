@@ -1548,6 +1548,49 @@ container in the live network namespace: a live NBA game through `/stream` for
 6 minutes at 5.9 Mbps average, first byte 3.5 s, no gap after that, no browser
 started. Playing into Jellyfin was not done by the agent.
 
+**45. streamfree on real traffic (provider swap ticket 10, checked 2026-10-28, behind the VPN).**
+Scratch image `streamed-m3u:playback-09` (the code that ships), default
+`PROVIDERS=streamfree,ppv`, run in the live container's network namespace on a
+spare port with a copy of the data dir. Observed, not assumed:
+
+- **The default already enables it.** `PROVIDERS` defaults to `streamfree,ppv`;
+  the live box only reads `# Providers: ppv` because its image predates
+  streamfree. Deploying the new image turns streamfree on with no config
+  change. To go back to ppv.st alone without a redeploy, set `PROVIDERS=ppv`
+  (live setting).
+- **RedZone needed no lineup change.** `nfl-vs-redzone` (the pinned slug, #12) was
+  already in the allowlist, so `lineup.json` is unchanged (backup
+  `lineup.json.pre-streamfree-2026-10-28` taken anyway). streamfree's
+  `redzone` listing resolves to it (`/teams?team=NFL RedZone` -> `kind: feed`,
+  `in_lineup: true`). Outside NFL Sundays its `live_sources` is empty, so the
+  entry has `streams: []`: no Source, no playlist line, Channel untouched (#43).
+  **Not yet watched playing** (it only carries video on game days).
+- **MLB:** Brewers vs Rays (`[SF1-1080p]`, variant `...1080p2`) ran 292 s at
+  7.4 Mbit/s average, first byte 3.8 s, 0 freezes, 0 holes, 0 failed
+  downloads, no browser, until the game's playlist went `ENDLIST`. The app then
+  waits `STREAM_IDLE_TIMEOUT` (45 s) and ends the stream, and the history row
+  counts that tail as one 10 s "Source not publishing" freeze. It is the game
+  ending, not a fault. A game that has ended is dropped from the next list.
+- **Four games merge across Providers** (Blazers-Lakers, Senators-Golden
+  Knights, Canucks-Ducks, Sabres-Sharks): one entry set, `SF` Sources first,
+  then `PPV`. Willow lists on both, merged as a feed.
+- **Outage / fallback.** With both streamfree hosts refused for requests and
+  curl_cffi mid-stream, the playing Stream failed its playlist six times in
+  12 s and ended (`Playlist failed repeatedly`); the client's reconnect ran the
+  cascade, `Cascade succeeded on attempt 2 (PPV1) after 11.4 s`, and played 37 s
+  with no freezes. The list refresh logged `serving its last good list of 8
+  games` and the playlist stayed at 225 entries; the Sabres game kept both
+  Sources.
+- **How to fake an outage that actually bites.** Blocking DNS does nothing
+  to a stream already running (pooled connections), and the 5-minute extract
+  cache hides a dead host from the next tune-in. Block at the request layer:
+  a `sitecustomize.py` on `PYTHONPATH` that makes `requests`' `HTTPAdapter.send`
+  and curl_cffi's `Session.request` raise for the hosts while a flag file
+  exists. Scratch only; never `iptables` in gluetun's namespace, which the live
+  app shares.
+- **Rollback:** images `ix-streamed-m3u-streamed-m3u{,-sync}:pre-streamfree-2026-10-28`
+  (the Step 1 build) and `lineup.json.pre-streamfree-2026-10-28`.
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when
