@@ -1428,6 +1428,38 @@ the embed URL), but two things broke across Providers:
 
 Checked by `tools/check_pick.py` (offline, same fixtures as #40).
 
+**42. ppv.st on real traffic (provider swap ticket 07, checked 2026-10-27, behind the VPN).**
+Scratch image `streamed-m3u:rollout-07`, `PROVIDERS=ppv`, run in the live
+container's network namespace on a spare port. Observed, not assumed:
+
+- **The list call is cheap and complete**: 203 games, 226 playlist entries,
+  NFL Network (`/embed/nfl-network`) included as a feed.
+- **Playback was clean.** Four live NBA/MLB games ran 40-60 s each and one ran
+  278 s (71 chunks, 1080p h264 + aac, valid TS, no Freezes, no Holes); NFL
+  Network ran 177 s (39 chunks, no Freezes). The 42-byte WebP wrapper is
+  stripped (#17). Not yet watched end to end in Jellyfin; the checks used the
+  app's `/stream` directly.
+- **Extraction is occasionally slow.** The first NFL Network request hit the
+  30 s browser timeout (`url:no-extract`, 502); the next one extracted in
+  about 25 s. A client that retries (Dispatcharr does) recovers.
+- **Signed links go stale in minutes.** A cached ppv.st m3u8 returned 403 about
+  230 s after it was extracted; the probe evicts it (`probe-403`) and the
+  request after that re-extracts. The first request after a pause can
+  therefore 502 once.
+- **A source can go quiet mid-game** ("No new chunk for 10-12 s", seen on MLB
+  and NFL Network). It recovered by itself each time; the stream reconnected
+  and replayed 2 chunks (~10 s).
+- **Quality varies by game**: 9.2 Mbit/s 1080p for most, but the Lakers game
+  ran at 1.0 Mbit/s over a 5 Mbit/s link and delivered a fifth of the bytes of
+  the others in the same minute.
+- **Outage:** with `PPV_BASE_URL` pointed at a dead host the playlist kept all
+  216 last-good entries and the guide kept its 1748 channels, with a WARNING
+  per refresh. Restarting the app during an outage loses the held list (#39).
+- **NFL Network was already in the live allowlist** (`nfl-network`, Sep 27 set);
+  no lineup change was needed or made.
+- The live address and mirrors are the ones in the settings table; no
+  streamed.pk host is contacted when `PROVIDERS` omits it.
+
 ## 8. Endpoint reference
 
 The endpoint table is in the README. Recipes that are only useful when
