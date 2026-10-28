@@ -91,6 +91,14 @@ PPV_MIRRORS       = [t.strip() for t in os.getenv(
 # How long a Provider whose list call keeps failing is still served from its
 # last good list. Past this its games drop out of the playlist; Channels never
 # change because of a failed fetch.
+# streamfree ("streamfree"): its API and its embed pages are on different
+# hosts, so each has a base and mirrors. Same rule: only these are contacted.
+STREAMFREE_BASE_URL = os.getenv("STREAMFREE_BASE_URL", "https://streamfree.top")
+STREAMFREE_MIRRORS  = [t.strip() for t in os.getenv(
+    "STREAMFREE_MIRRORS", "").split(",") if t.strip()]
+STREAMFREE_EMBED_BASE_URL = os.getenv("STREAMFREE_EMBED_BASE_URL", "https://strmfree.st")
+STREAMFREE_EMBED_MIRRORS  = [t.strip() for t in os.getenv(
+    "STREAMFREE_EMBED_MIRRORS", "").split(",") if t.strip()]
 PROVIDER_STALE_HOURS = float(os.getenv("PROVIDER_STALE_HOURS", "6"))
 REFRESH_SECONDS   = int(os.getenv("REFRESH_SECONDS", "480"))
 REQUEST_TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT", "10"))
@@ -311,6 +319,7 @@ FEED_CHANNELS = [t.strip() for t in os.getenv(
 # anywhere - it just goes to "No game scheduled" forever.
 FEED_TITLE_ALIASES = {
     "nfl vs redzone": "NFL RedZone",
+    "redzone":        "NFL RedZone",
     "nfl redzone":    "NFL RedZone",
     "nfl red zone":   "NFL RedZone",
     "nfl vs red zone": "NFL RedZone",
@@ -1378,19 +1387,26 @@ def _enabled_providers() -> list:
         if name in seen:
             continue
         seen.add(name)
-        if name in ("streamed", "ppv"):
+        if name in ("streamed", "ppv", "streamfree"):
             if name == "streamed":
-                bases = tuple(providers.clean_bases(BASE_URL, STREAMED_MIRRORS))
+                bases = (tuple(providers.clean_bases(BASE_URL, STREAMED_MIRRORS)),)
+            elif name == "ppv":
+                bases = (tuple(providers.clean_bases(PPV_BASE_URL, PPV_MIRRORS)),)
             else:
-                bases = tuple(providers.clean_bases(PPV_BASE_URL, PPV_MIRRORS))
+                bases = (tuple(providers.clean_bases(STREAMFREE_BASE_URL, STREAMFREE_MIRRORS)),
+                         tuple(providers.clean_bases(STREAMFREE_EMBED_BASE_URL,
+                                                     STREAMFREE_EMBED_MIRRORS)))
             with _provider_lock:
                 held = _provider_cache.get(name)
                 if held is None or held[0] != bases:
                     if name == "streamed":
                         made = providers.StreamedPk(
-                            list(bases), REQUEST_TIMEOUT, API_HEADERS, ALL_SOURCES)
+                            list(bases[0]), REQUEST_TIMEOUT, API_HEADERS, ALL_SOURCES)
+                    elif name == "ppv":
+                        made = providers.Ppv(list(bases[0]), REQUEST_TIMEOUT, API_HEADERS)
                     else:
-                        made = providers.Ppv(list(bases), REQUEST_TIMEOUT, API_HEADERS)
+                        made = providers.Streamfree(
+                            list(bases[0]), list(bases[1]), REQUEST_TIMEOUT, API_HEADERS)
                     held = (bases, made)
                     _provider_cache[name] = held
             prov = held[1]

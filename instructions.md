@@ -68,7 +68,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `app.py` | The service: scrape, playlist, guide, resolution, proxy. |
 | `settings.py` | The settings schema, the `/data/settings.json` overlay, atomic writes. §3. |
 | `auth.py` | Optional console login and CSRF. §4. |
-| `providers.py` | The Provider layer (provider-swap tickets 01, 03): `Ppv` (ppv.st, #38), `Mirrors` (ordered, configured base URLs; the last one that answered is tried first, and each refresh starts again from the first) and `StreamedPk`, which lists games and Sources in the app's existing shapes and stamps `_provider`. `app.py` picks the Providers named in `PROVIDERS`; a name it does not know is ignored. Only configured addresses are ever contacted. Checked by `tools/check_providers.py` (`--baseline` in the old image, `--compare` in the new). |
+| `providers.py` | The Provider layer (provider-swap tickets 01, 03, 08): `Ppv` (ppv.st, #38), `Streamfree` (streamfree, #43), `Mirrors` (ordered, configured base URLs; the last one that answered is tried first, and each refresh starts again from the first) and `StreamedPk`, which lists games and Sources in the app's existing shapes and stamps `_provider`. `app.py` picks the Providers named in `PROVIDERS`; a name it does not know is ignored. Only configured addresses are ever contacted. Checked by `tools/check_providers.py` (`--baseline` in the old image, `--compare` in the new). |
 | `dashboard.py`, `templates/`, `static/` | The console. |
 | `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
@@ -85,6 +85,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/check_console.py`, `tools/check_render.py` | Verification harnesses. Bind-mounted into a scratch image, never shipped. |
 | `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, a hanging playlist request, reconnecting) through the real `/stream` route, checking each raises the early warning it should. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
 | `tools/check_health_render.py`, `tools/check_health_live.py` | The health UI driven in Chromium against scripted streams; and one real stream pulled through a scratch image inside gluetun's namespace (binds no port, own `/data`), reporting health and TS alignment. #29. |
+| `tools/check_streamfree.py` | The streamfree Provider (provider-swap 08): quality from the link, live-only Sources, empty-Source games in the schedule, categories, feeds, merge with ppv.st, API and embed hosts with mirrors, last good list on 403/Violation. Same style as `check_ppv.py`; fixture `tools/fixtures/streamfree_streams.json`. #43. |
 | `tools/check_merge.py` | Cross-Provider merging (provider-swap 05): one game from two Providers, too-far-apart and unsure pairs kept separate, feeds merged by name or alias. Same style as `check_ppv.py`. #40. |
 | `tools/check_pick.py` | Picking and pinning a Source across Providers (provider-swap 06): a pick of the other Provider's Source is honoured, survives reconnects and the merged game's primary listing changing, falls back when it fails; the cascade reaches every Provider. #41. Same style as `check_merge.py`. |
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
@@ -1459,6 +1460,55 @@ container's network namespace on a spare port. Observed, not assumed:
   no lineup change was needed or made.
 - The live address and mirrors are the ones in the settings table; no
   streamed.pk host is contacted when `PROVIDERS` omits it.
+
+**43. streamfree: one list call, live Sources only, two host families (provider swap ticket 08).**
+`providers.Streamfree` (name `streamfree`, label code `SF`). Recorded
+2026-10-27 from `https://streamfree.top/api/v1/streams`
+(`tools/fixtures/streamfree_streams.json`); the site documents the API at
+`/api`.
+
+- **One list call per refresh** (`GET /api/v1/streams`, no API key). The
+  operator asks for caching and light polling, so nothing else is requested:
+  `list_sources` makes no request, and the embed pages are not touched by the
+  list. The older `/streams` (by category) carries no Sources and is not used.
+- **Two host families.** The API is `streamfree.top`, the embed pages are on
+  `strmfree.st`. Settings: `STREAMFREE_BASE_URL` / `STREAMFREE_MIRRORS` (API)
+  and `STREAMFREE_EMBED_BASE_URL` / `STREAMFREE_EMBED_MIRRORS`. The embed
+  link comes from the response, but a link on a host that is **not** a
+  configured embed address is moved onto the first configured one (path kept),
+  with a WARNING; with none configured it is dropped. So a response, or a
+  hijacked mirror, cannot send the app to a domain nobody wrote down (spec
+  user story 17 beats 18). Lookalikes (`streamfree.st`, `strmfree.top`,
+  `streamfree.cc`) are not streamfree.
+- **Quality is in the link.** `.../redzone1080p`, `...1080p2`, `...720p`: the
+  trailing `<height>p<variant>` is read as the Source's `quality`, so the
+  label is `[SF1-1080p]`. The variant number is only the variant, not the
+  label number (that counts the Sources offered, #37).
+- **`sources` is not what is live.** Every game lists its `1080p` and `1080p2`
+  variants "that start playing on their own once it goes live"; `live_sources`
+  is the subset up now. Only `live_sources` become Sources (a RedZone with
+  `live_sources: []` has none yet), otherwise a Source that cannot play would
+  rank first. A game with none is still returned: it stays in the schedule
+  and the guide, and gains Sources on a later refresh. If a response has no
+  `live_sources` key at all, `sources` is used.
+- **Feeds.** A listing with no `team1`/`team2` (RedZone, Sky Sports F1/Tennis/
+  Cricket, Willow) is `always_live`, with no start (the site's timestamp for
+  them is a stale date). `redzone` is a feed alias for NFL RedZone; Sky
+  Sports F1 already matched the Formula 1 feed. The other feeds have no
+  Channel and, like ppv.st's, take no shared slot.
+- **Teams.** `team1` is taken as home, as for ppv.st's "X vs. Y"; merging
+  does not depend on the order (#40). streamfree's categories map to the
+  app's sport ids: soccer -> `football`, football -> `american-football`,
+  racing -> `motor-sports`, combat -> `fight`; baseball, basketball, hockey,
+  tennis and cricket are as named.
+- **Failure.** A 403 and a 200 `Violation` text both raise `ProviderError`
+  (#39): the last good list is served for `PROVIDER_STALE_HOURS`.
+- **Not in this ticket:** playback. The embed page, its signed token and the
+  no-Referer rule are ticket 09; streamfree Sources still resolve through the
+  browser extractor until then.
+
+Checked by `tools/check_streamfree.py` (offline, recorded list moved in time to
+sit around now, merged with the recorded ppv.st list).
 
 ## 8. Endpoint reference
 

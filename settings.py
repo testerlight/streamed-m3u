@@ -109,10 +109,23 @@ SCHEMA = [
        "Extra web addresses for the ppv.st API, tried in order if the main one is down. "
        "Only addresses listed here (and the main one) are ever contacted.",
        allow_empty=True),
+    _s("STREAMFREE_BASE_URL", "STREAMFREE_BASE_URL", "Upstream", "live", "url",
+       "streamfree API the service lists games from. Change this when it moves domain."),
+    _s("STREAMFREE_MIRRORS", "STREAMFREE_MIRRORS", "Upstream", "live", "list",
+       "Extra web addresses for the streamfree API, tried in order if the main one is down. "
+       "Only addresses listed here (and the main one) are ever contacted.",
+       allow_empty=True),
+    _s("STREAMFREE_EMBED_BASE_URL", "STREAMFREE_EMBED_BASE_URL", "Upstream", "live", "url",
+       "Address of streamfree's embed pages, which differs from its API. A link in the "
+       "game list on any other address is moved onto this one."),
+    _s("STREAMFREE_EMBED_MIRRORS", "STREAMFREE_EMBED_MIRRORS", "Upstream", "live", "list",
+       "Extra addresses for streamfree's embed pages. Links on these are used as listed; "
+       "no other embed address is ever used.",
+       allow_empty=True),
     _s("PROVIDERS", "PROVIDERS", "Upstream", "live", "list",
        "Which services supply games and streams, in preference order. "
-       "Known names: ppv, streamed (closed in October 2026). Unknown names are ignored, "
-       "so streamfree can be listed ahead of the build that supports it.",
+       "Known names: streamfree, ppv, streamed (closed in October 2026). "
+       "Unknown names are ignored.",
        allow_empty=True),
     _s("PROVIDER_STALE_HOURS", "PROVIDER_STALE_HOURS", "Upstream", "live", "float",
        "Hours a service whose game list fails is still served from its last good list. "

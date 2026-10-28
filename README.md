@@ -348,7 +348,11 @@ Generated from the schema in `settings.py` (`python settings.py --markdown`).
 | `STREAMED_MIRRORS` | `(empty)` | live | Extra web addresses for the catalog, tried in order if the main one is down. Only addresses listed here (and the main one) are ever contacted. |
 | `PPV_BASE_URL` | `https://api.ppv.st` | live | ppv.st API the service lists games from. Change this when it moves domain. |
 | `PPV_MIRRORS` | `(empty)` | live | Extra web addresses for the ppv.st API, tried in order if the main one is down. Only addresses listed here (and the main one) are ever contacted. |
-| `PROVIDERS` | `streamfree, ppv` | live | Which services supply games and streams, in preference order. Known names: ppv, streamed (closed in October 2026). Unknown names are ignored, so streamfree can be listed ahead of the build that supports it. |
+| `STREAMFREE_BASE_URL` | `https://streamfree.top` | live | streamfree API the service lists games from. Change this when it moves domain. |
+| `STREAMFREE_MIRRORS` | `(empty)` | live | Extra web addresses for the streamfree API, tried in order if the main one is down. Only addresses listed here (and the main one) are ever contacted. |
+| `STREAMFREE_EMBED_BASE_URL` | `https://strmfree.st` | live | Address of streamfree's embed pages, which differs from its API. A link in the game list on any other address is moved onto this one. |
+| `STREAMFREE_EMBED_MIRRORS` | `(empty)` | live | Extra addresses for streamfree's embed pages. Links on these are used as listed; no other embed address is ever used. |
+| `PROVIDERS` | `streamfree, ppv` | live | Which services supply games and streams, in preference order. Known names: streamfree, ppv, streamed (closed in October 2026). Unknown names are ignored. |
 | `PROVIDER_STALE_HOURS` | `6.0` | live | Hours a service whose game list fails is still served from its last good list. Past this its games drop out of the playlist; Channels are never removed because of a failed fetch. |
 | `REQUEST_TIMEOUT` | `10` | live | Seconds before an upstream API call is abandoned. |
 | `BUILD_WORKERS` | `8` | live | Parallel workers for a playlist build. Modest values avoid rate limits. |

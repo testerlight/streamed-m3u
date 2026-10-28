@@ -8,7 +8,7 @@ never needs to know which service a game came from:
     list_sources(game)    -> [source, ...]    ways to watch one game
 
 streamed.pk is the first Provider and keeps the exact shapes it always had;
-ppv.st maps its one list response onto those same shapes.
+ppv.st and streamfree map their one list response onto those same shapes.
 Each game and source is stamped with `_provider` (the Provider's name) so a
 later step can route a game back to the Provider that listed it.
 
@@ -25,6 +25,7 @@ module imports nothing from app.py.
 import logging
 import re
 import threading
+from urllib.parse import urlsplit
 
 import requests
 
@@ -310,3 +311,145 @@ class Ppv:
             "_match_poster": game.get("poster", ""),
             "_provider": self.name,
         } for n, (url, tag) in enumerate(game.get("_links") or [], 1)]
+
+
+# streamfree's categories, as the app's sport ids (streamed.pk's: soccer is
+# "football", and the NFL's sport is "american-football").
+_SF_SPORT_IDS = {
+    "soccer": "football", "football": "american-football",
+    "racing": "motor-sports", "combat": "fight",
+}
+
+# A streamfree embed link ends `<stream_key><height>p<variant>`: ".../redzone1080p2".
+_SF_VARIANT = re.compile(r"(\d{3,4})p(\d*)$")
+
+
+def _origin(url: str) -> str:
+    parts = urlsplit(url)
+    return "%s://%s" % (parts.scheme.lower(), parts.netloc.lower()) if parts.netloc else ""
+
+
+class Streamfree:
+    """streamfree: one call lists every live and upcoming game with its Sources.
+
+    The API and the embed pages live on different hosts, so each has its own
+    configured, ordered base list. A Source's picture quality is read off its
+    link (`...1080p`, `...1080p2`). Until a game is about to start the
+    Provider has no live Sources for it; the game is still returned (it
+    belongs in the schedule) with none, and gains them on a later refresh.
+
+    Embed hosts come out of the response, but only a host the operator has
+    configured is ever used: a link on any other host is moved onto the first
+    configured embed base, so a response cannot send the app to a domain nobody
+    wrote into the settings. `list_sources` makes no request.
+    """
+
+    name = "streamfree"
+    code = "SF"
+    LIST_PATH = "/api/v1/streams"
+
+    def __init__(self, bases: list[str], embed_bases: list[str], timeout: float,
+                 headers: dict):
+        self.mirrors = Mirrors(bases)
+        self.embed_bases = list(embed_bases)
+        self.timeout = timeout
+        self.headers = headers
+
+    def list_games(self) -> list[dict]:
+        self.mirrors.prefer_first()
+        payload = self.mirrors.get_json(self.LIST_PATH, self.timeout, self.headers)
+        items = payload.get("streams") if isinstance(payload, dict) else None
+        if isinstance(items, dict):         # by category, as the site's own list is
+            items = [g for gs in items.values() if isinstance(gs, list) for g in gs]
+        if not isinstance(items, list):
+            # No answer, or a refusal ("Violation"), which is not a game list.
+            why = self.mirrors.last_error
+            if not why and isinstance(payload, dict):
+                why = "unexpected answer: %s" % (
+                    payload.get("error") or payload.get("message") or sorted(payload)[:4])
+            raise ProviderError(why or "unexpected answer")
+        games: list[dict] = []
+        seen: set = set()
+        for g in items:
+            game = self._game(g)
+            if game and game["id"] not in seen:
+                seen.add(game["id"])
+                games.append(game)
+        log.info("streamfree: collected %d games, %d with Sources", len(games),
+                 sum(1 for g in games if g["_links"]))
+        return games
+
+    def _embed(self, link) -> str:
+        """The link on a configured embed host, or "" if none is configured."""
+        link = str(link or "").strip()
+        parts = urlsplit(link)
+        if not (parts.scheme.lower() in ("http", "https") and parts.netloc):
+            return ""
+        if _origin(link) in [b.lower() for b in self.embed_bases]:
+            return link
+        if not self.embed_bases:
+            return ""
+        log.warning("streamfree: embed link on %s, which is not a configured embed address; "
+                    "using %s", parts.netloc, self.embed_bases[0])
+        return self.embed_bases[0] + link[len("%s://%s" % (parts.scheme, parts.netloc)):]
+
+    def _poster(self, g: dict) -> str:
+        thumb = str(g.get("thumbnail_url") or "").strip()
+        if thumb.startswith("/") and self.mirrors.bases:
+            return self.mirrors.bases[0] + thumb
+        return thumb
+
+    def _game(self, g):
+        if not isinstance(g, dict) or not g.get("stream_key") or not g.get("name"):
+            return None
+        category = str(g.get("category") or "").strip().lower()
+        home = str((g.get("team1") or {}).get("name") or "").strip()
+        away = str((g.get("team2") or {}).get("name") or "").strip()
+        # A channel such as RedZone or Sky Sports F1 names no teams and runs
+        # all day: a feed, not an event.
+        always = not (home and away)
+        listed = [str(u) for u in (g.get("sources") or [])]
+        # Only what is live now. The list also names the variants that "start
+        # on their own" later; those would be dead Sources until then.
+        live = g["live_sources"] if isinstance(g.get("live_sources"), list) else listed
+        links = []
+        for url in live:
+            embed = self._embed(url)
+            if not embed:
+                continue
+            m = _SF_VARIANT.search(embed.rstrip("/").rsplit("/", 1)[-1])
+            # The variant's place in the full list is its stable number.
+            n = listed.index(url) + 1 if url in listed else len(links) + 1
+            links.append((embed, int(m.group(1)) if m else 0, n))
+        game = {
+            "id": "sf-%s" % g["stream_key"],
+            "title": str(g["name"]).strip(),
+            "category": _SF_SPORT_IDS.get(category, category),
+            "poster": self._poster(g),
+            "teams": {} if always else {"home": {"name": home}, "away": {"name": away}},
+            "always_live": always,
+            "_category": str(g.get("league") or category.title() or "Sports"),
+            "_provider": self.name,
+            "_links": links,
+        }
+        if g.get("match_timestamp") and not always:
+            try:
+                game["date"] = int(g["match_timestamp"]) * 1000
+            except (TypeError, ValueError):
+                pass
+        return game
+
+    def list_sources(self, game: dict) -> list[dict]:
+        return [{
+            "id": "%s-%d" % (game["id"], n),
+            "streamNo": n,
+            "language": "",
+            "embedUrl": url,
+            "source": self.name,
+            "quality": quality or None,
+            "_match_title": game.get("title", "Unknown Match"),
+            "_match_id": game.get("id", ""),
+            "_match_category": game.get("_category", "Sports"),
+            "_match_poster": game.get("poster", ""),
+            "_provider": self.name,
+        } for url, quality, n in (game.get("_links") or [])]
