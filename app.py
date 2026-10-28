@@ -742,6 +742,28 @@ def extract_m3u8_via_browser(embed_url: str, force: bool = False) -> dict | None
                     log.info("Cache hit (post-lock) for: %s", embed_url)
                     return entry["data"]
 
+        # 2b. streamfree: plain HTTP, no browser. The browser below is only for
+        #     a page that no longer yields a token.
+        sf = _streamfree_for(embed_url)
+        if sf is not None:
+            if force:                      # a console refresh wants a new token too
+                _STREAMFREE_EXTRACTOR.forget(embed_url)
+            try:
+                data = _STREAMFREE_EXTRACTOR.extract(embed_url)
+            except providers.StreamfreeLayoutChanged as exc:
+                log.warning("streamfree page layout changed (%s); using the browser", exc)
+            except Exception as exc:                               # noqa: BLE001
+                log.warning("streamfree extraction failed for %s: %s", embed_url, exc)
+                _note_playback(sf.name, False, str(exc) or type(exc).__name__)
+                return None
+            else:
+                log.info("streamfree extraction OK (no browser): %s", data["url"].split("?")[0])
+                _note_playback(sf.name, True)
+                with _extract_cache_lock:
+                    _extract_cache[embed_url] = {"data": data, "ts": time.time()}
+                _save_extract_cache()
+                return data
+
         # 3. Launch subprocess in its own process group so SIGKILL reaches
         #    Chromium and every child process it spawned
         log.info("Browser navigating to: %s%s",
@@ -753,6 +775,8 @@ def extract_m3u8_via_browser(embed_url: str, force: bool = False) -> dict | None
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,  # new process group = clean kill
+                # streamfree answers a Referer with 403 "Violation".
+                env=dict(os.environ, EXTRACT_NO_REFERER="1") if sf is not None else None,
             )
             hard_timeout = BROWSER_TIMEOUT + 15
             try:
@@ -764,6 +788,8 @@ def extract_m3u8_via_browser(embed_url: str, force: bool = False) -> dict | None
                 except ProcessLookupError:
                     pass
                 proc.wait()
+                if sf is not None:
+                    _note_playback(sf.name, False, "browser timed out")
                 return None
 
             if proc.returncode == 0 and stdout.strip():
@@ -772,14 +798,20 @@ def extract_m3u8_via_browser(embed_url: str, force: bool = False) -> dict | None
                 with _extract_cache_lock:
                     _extract_cache[embed_url] = {"data": data, "ts": time.time()}
                 _save_extract_cache()
+                if sf is not None:
+                    _note_playback(sf.name, True)
                 return data
             else:
                 log.warning("No m3u8 for: %s (stderr: %s)",
                             embed_url, stderr.decode(errors="replace")[:200])
+                if sf is not None:
+                    _note_playback(sf.name, False, "browser found no playlist")
                 return None
 
         except Exception as exc:
             log.error("Browser extraction failed for %s: %s", embed_url, exc)
+            if sf is not None:
+                _note_playback(sf.name, False, "browser failed: %s" % exc)
             return None
 
         finally:
@@ -1418,6 +1450,52 @@ def _enabled_providers() -> list:
     return found
 
 
+# ── streamfree playback ──
+# Embed pages are fetched here and only here, which is reached for prewarming
+# and tune-in (extract_m3u8_via_browser), so the page is never polled.
+
+_STABLE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+
+
+def _streamfree_fetch(url, headers):
+    r = cf_requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, impersonate="chrome",
+                        curl_options=_upstream_curl_options())
+    return r.status_code, r.text
+
+
+_STREAMFREE_EXTRACTOR = providers.StreamfreeExtractor(_streamfree_fetch, user_agent=_STABLE_UA)
+
+
+def _streamfree_for(embed_url):
+    """The enabled streamfree Provider if this link is on its embed host, else None."""
+    for prov in _enabled_providers():
+        if prov.name == "streamfree" and prov.owns(embed_url):
+            return prov
+    return None
+
+
+# Playback outcomes per Provider: {"ok", "failed", "last_ok", "last_failure", "error"}.
+_provider_playback: dict = {}
+
+
+def _note_playback(name: str, ok: bool, error: str = "") -> None:
+    """Count one tune-in/prewarm extraction for the dashboard's Provider health."""
+    now = time.time()
+    with _provider_lock:
+        st = _provider_playback.setdefault(
+            name, {"ok": 0, "failed": 0, "last_ok": None, "last_failure": None, "error": ""})
+        if ok:
+            st["ok"] += 1
+            st["last_ok"] = now
+        else:
+            st["failed"] += 1
+            st["last_failure"] = now
+            st["error"] = error[:300]
+    if not ok:
+        log.warning("Provider %s playback failed: %s", name, error)
+
+
 # What each Provider last gave and how its last attempt went, by name:
 # {"games", "last_success", "last_attempt", "error"} (epoch seconds). Read by
 # the dashboard and by tests; written only by `_fetch_provider_games`.
@@ -1476,6 +1554,9 @@ def _provider_status() -> list[dict]:
             st = dict(_provider_state.get(prov.name) or {})
         since, tried = st.get("last_success"), st.get("last_attempt")
         failing = bool(tried) and bool(st.get("error"))
+        with _provider_lock:
+            pb = dict(_provider_playback.get(prov.name) or {})
+        lf, lo = pb.get("last_failure"), pb.get("last_ok")
         out.append({
             "name":          prov.name,
             "code":          prov.code,
@@ -1486,6 +1567,14 @@ def _provider_status() -> list[dict]:
             "serving_stale": bool(failing and _within_retention(since, now)),
             "games":         len(st.get("games") or []),
             "stale_hours":   PROVIDER_STALE_HOURS,
+            "playback_ok":     pb.get("ok", 0),
+            "playback_failed": pb.get("failed", 0),
+            # Failing now: the latest extraction failed (a later good one clears it).
+            # and only for an hour: with nobody tuning in, it must not stay up forever.
+            "playback_failing": bool(lf and (not lo or lf > lo) and time.time() - lf < 3600),
+            "playback_error":  pb.get("error") or "",
+            "last_playback_failure": (datetime.fromtimestamp(lf, timezone.utc).isoformat()
+                                      if lf else None),
         })
     return out
 

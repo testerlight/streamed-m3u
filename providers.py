@@ -24,7 +24,9 @@ module imports nothing from app.py.
 
 import logging
 import re
+import json
 import threading
+import time
 from urllib.parse import urlsplit
 
 import requests
@@ -393,6 +395,10 @@ class Streamfree:
                     "using %s", parts.netloc, self.embed_bases[0])
         return self.embed_bases[0] + link[len("%s://%s" % (parts.scheme, parts.netloc)):]
 
+    def owns(self, embed_url: str) -> bool:
+        """Is this link on one of the configured embed hosts?"""
+        return _origin(str(embed_url or "")) in [b.lower() for b in self.embed_bases]
+
     def _poster(self, g: dict) -> str:
         thumb = str(g.get("thumbnail_url") or "").strip()
         if thumb.startswith("/") and self.mirrors.bases:
@@ -453,3 +459,125 @@ class Streamfree:
             "_match_poster": game.get("poster", ""),
             "_provider": self.name,
         } for url, quality, n in (game.get("_links") or [])]
+
+
+# ─── streamfree playback ──────────────────────────────────────────────────────
+#
+# A streamfree embed page carries a signed playlist token for each quality
+# (`const _0x = {"1080p": {"_t": ..., "_e": <expiry epoch>, "_n": ...}, ...}`),
+# good for about 8 hours. The playlist is then
+# `<embed host>/live/<last path segment of the embed link>/index.m3u8?_t=&_e=&_n=`
+# and is only answered when the embed page is its Referer. The page itself must
+# be fetched with NO Referer: one from streamfree is answered 403 "Violation".
+
+class StreamfreeRefused(ProviderError):
+    """streamfree answered 403 or "Violation": the Source failed."""
+
+
+class StreamfreeLayoutChanged(Exception):
+    """The embed page no longer carries a token: use the browser instead."""
+
+
+_SF_TOKEN_BLOCK = re.compile(r"\b_0x\s*=\s*(\{.*?\})\s*;", re.S)
+_SF_ROUTES = {"origin": "live", "cdn": "live-cdn", "tiktok": "live-tiktok"}
+_SF_TOKEN_MARGIN_S = 1800
+
+
+class StreamfreeExtractor:
+    """Embed page -> signed playlist, over plain HTTP, in the browser extractor's shape.
+
+    `fetch(url, headers) -> (status, text)` is the only way out, so a check
+    can stub it. Tokens are kept per embed link until shortly before they
+    expire, so a link tuned in again costs no page fetch; a refused held
+    token is fetched again once.
+    """
+
+    def __init__(self, fetch, clock=time.time, user_agent=""):
+        self.fetch, self.clock, self.user_agent = fetch, clock, user_agent
+        self._tokens: dict = {}
+        self._lock = threading.Lock()
+
+    def forget(self, embed_url: str) -> None:
+        with self._lock:
+            self._tokens.pop(embed_url, None)
+
+    @staticmethod
+    def _refusal(status, text) -> str:
+        # The refusal text is short; a full page that merely contains the word is not one.
+        violation = len(text or "") < 500 and "violation" in (text or "").lower()
+        if status == 403 or violation:
+            return "streamfree refused (HTTP %s%s)" % (status, ", Violation" if violation else "")
+        return ""
+
+    def _token(self, embed_url: str, variant: str):
+        """(token, fetched_now)."""
+        m = _SF_VARIANT.search(variant)
+        quality = m.group(1) if m else ""
+        with self._lock:
+            held = self._tokens.get(embed_url)
+        if held and held["_e"] - self.clock() > _SF_TOKEN_MARGIN_S:
+            return held, False
+        status, text = self.fetch(embed_url, {"User-Agent": self.user_agent})
+        refused = self._refusal(status, text)
+        if refused:
+            raise StreamfreeRefused(refused)
+        if status != 200:
+            raise ProviderError("streamfree embed page: HTTP %s" % status)
+        tok = None
+        block = _SF_TOKEN_BLOCK.search(text or "")
+        if block and quality:
+            try:
+                raw = json.loads(block.group(1))["%sp" % quality]
+                tok = {"_t": str(raw["_t"]), "_e": int(raw["_e"]), "_n": str(raw["_n"])}
+            except (ValueError, KeyError, TypeError):
+                tok = None
+        if not tok:
+            raise StreamfreeLayoutChanged("no playlist token for %sp in %s" % (quality, embed_url))
+        with self._lock:
+            self._tokens[embed_url] = tok
+        return tok, True
+
+    def _playlist(self, embed_url, route, variant, tok):
+        parts = urlsplit(embed_url)
+        url = "%s://%s/%s/%s/index.m3u8?_t=%s&_e=%s&_n=%s" % (
+            parts.scheme, parts.netloc, route, variant, tok["_t"], tok["_e"], tok["_n"])
+        status, text = self.fetch(url, {"User-Agent": self.user_agent, "Referer": embed_url})
+        return url, status, text
+
+    def _route(self, embed_url, variant):
+        """The playlist route the page would pick, from /get-stream-key."""
+        parts = urlsplit(embed_url)
+        key = re.sub(r"\d{3,4}p\d*$", "", variant)
+        status, text = self.fetch("%s://%s/get-stream-key/%s" % (parts.scheme, parts.netloc, key),
+                                  {"User-Agent": self.user_agent, "Referer": embed_url})
+        try:
+            data = json.loads(text) if status == 200 else {}
+            return _SF_ROUTES.get(str(data.get("server_name") or "origin"))
+        except (ValueError, AttributeError):
+            return None
+
+    def extract(self, embed_url: str) -> dict:
+        """The extraction result. Raises StreamfreeRefused (403/Violation), ProviderError
+        (any other failure) or StreamfreeLayoutChanged (use the browser)."""
+        variant = urlsplit(embed_url).path.rstrip("/").rsplit("/", 1)[-1]
+        tok, fresh = self._token(embed_url, variant)
+        route, tried = "live", set()
+        while True:
+            tried.add(route)
+            url, status, text = self._playlist(embed_url, route, variant, tok)
+            if status == 200 and (text or "").lstrip().startswith("#EXTM3U"):
+                return {"url": url, "cookies": {}, "headers": {"Referer": embed_url},
+                        "browser_m3u8_status": 200}
+            refused = self._refusal(status, text)
+            if refused and not fresh:               # a held token may have gone stale
+                self.forget(embed_url)
+                tok, fresh = self._token(embed_url, variant)
+                tried.discard(route)
+                continue
+            if refused:
+                raise StreamfreeRefused(refused)
+            nxt = self._route(embed_url, variant) if len(tried) == 1 else None
+            if nxt and nxt not in tried:
+                route = nxt
+                continue
+            raise ProviderError("streamfree playlist: HTTP %s" % status)

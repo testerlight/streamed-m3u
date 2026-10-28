@@ -70,7 +70,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `auth.py` | Optional console login and CSRF. §4. |
 | `providers.py` | The Provider layer (provider-swap tickets 01, 03, 08): `Ppv` (ppv.st, #38), `Streamfree` (streamfree, #43), `Mirrors` (ordered, configured base URLs; the last one that answered is tried first, and each refresh starts again from the first) and `StreamedPk`, which lists games and Sources in the app's existing shapes and stamps `_provider`. `app.py` picks the Providers named in `PROVIDERS`; a name it does not know is ignored. Only configured addresses are ever contacted. Checked by `tools/check_providers.py` (`--baseline` in the old image, `--compare` in the new). |
 | `dashboard.py`, `templates/`, `static/` | The console. |
-| `extract_stream.py` | Playwright worker that sniffs out the real stream URL. |
+| `extract_stream.py` | Playwright worker that sniffs out the real stream URL. With `EXTRACT_NO_REFERER=1` (set by `app.py` for streamfree links only) it loads the page with no Referer. #44. |
 | `dispatcharr_sync.py` | Channel sync. One cycle by default; `--loop` in the sync container. |
 | `streamhealth.py` | Watch-only stream health: speed, cushion, freezes and causes, jumps, end reasons, early warnings scored against the freezes that followed, and the `/data/stream_history.jsonl` writer. Changes nothing a stream sends. Gotcha #29. |
 | `restamp.py` | Closes the timestamp jump a long hole leaves: moves PTS/DTS/PCR of the chunks after it back by the missing span, so Jellyfin's audio stays in step. Pure, fail-safe, live off switch `HOLE_RESTAMP`. Gotcha #34. |
@@ -86,6 +86,7 @@ fingerprint → re-served as a raw TS byte stream.
 | `tools/check_health.py` | Stream health: unit tests, then scripted messy streams (slow, stalled, erroring, restarting, ending, a hanging playlist request, reconnecting) through the real `/stream` route, checking each raises the early warning it should. `--baseline` in the old image and `--compare` prove the video is byte-identical. #29. |
 | `tools/check_health_render.py`, `tools/check_health_live.py` | The health UI driven in Chromium against scripted streams; and one real stream pulled through a scratch image inside gluetun's namespace (binds no port, own `/data`), reporting health and TS alignment. #29. |
 | `tools/check_streamfree.py` | The streamfree Provider (provider-swap 08): quality from the link, live-only Sources, empty-Source games in the schedule, categories, feeds, merge with ppv.st, API and embed hosts with mirrors, last good list on 403/Violation. Same style as `check_ppv.py`; fixture `tools/fixtures/streamfree_streams.json`. #43. |
+| `tools/check_streamfree_playback.py` | streamfree playback (provider-swap 09): token from the recorded embed page (`tools/fixtures/streamfree_embed.html`), playlist with the page as Referer, result shape, token lifetime, the other route, browser fallback, 403/Violation counted, and real Chromium proving the fallback sends no Referer. Stubs only the extractor's HTTP function and the browser subprocess. #44. |
 | `tools/check_merge.py` | Cross-Provider merging (provider-swap 05): one game from two Providers, too-far-apart and unsure pairs kept separate, feeds merged by name or alias. Same style as `check_ppv.py`. #40. |
 | `tools/check_pick.py` | Picking and pinning a Source across Providers (provider-swap 06): a pick of the other Provider's Source is honoured, survives reconnects and the merged game's primary listing changing, falls back when it fails; the cascade reaches every Provider. #41. Same style as `check_merge.py`. |
 | `tools/check_ffmpeg.py` | Verifies the image's composite capability: filters, VAAPI encode, and that live filter commands actually take effect. Same bind-mount pattern. §5b. |
@@ -1503,12 +1504,49 @@ container's network namespace on a spare port. Observed, not assumed:
   tennis and cricket are as named.
 - **Failure.** A 403 and a 200 `Violation` text both raise `ProviderError`
   (#39): the last good list is served for `PROVIDER_STALE_HOURS`.
-- **Not in this ticket:** playback. The embed page, its signed token and the
-  no-Referer rule are ticket 09; streamfree Sources still resolve through the
-  browser extractor until then.
+- **Playback** is #44.
 
 Checked by `tools/check_streamfree.py` (offline, recorded list moved in time to
 sit around now, merged with the recorded ppv.st list).
+
+**44. streamfree playback: plain HTTP, no browser (provider-swap ticket 09).**
+`providers.StreamfreeExtractor`, reached from `extract_m3u8_via_browser` for a
+link on a configured streamfree embed host (`Streamfree.owns`). Recorded
+2026-10-27 from `https://strmfree.st/embed/...` (`tools/fixtures/streamfree_embed.html`).
+
+- **The page carries the token.** `const _0x = {"1080p": {"_t", "_e", "_n"}, ...}`,
+  one per quality; `_e` is the expiry (epoch seconds, about 8 hours out). The
+  playlist is `<embed host>/live/<last path segment of the link>/index.m3u8?_t=&_e=&_n=`
+  (the segment is the variant, `...1080p2`). Its segments are relative and need
+  no Referer; only the playlist does.
+- **Referer rules are opposite for the two requests.** The page is fetched with
+  **no Referer** (a streamfree one is answered 403 `Violation`); the playlist
+  with **the embed page as Referer** (no Referer: 403 from nginx on `/live/`).
+  The result is `{"url", "cookies": {}, "headers": {"Referer": <page>},
+  "browser_m3u8_status": 200}`, the browser extractor's keys, so probing, audio
+  check, pacing and Recovery are untouched.
+- **Route.** The page asks `/get-stream-key/<key>` and picks `/live/` (origin),
+  `/live-cdn/` or `/live-tiktok/` from `server_name`. We try `/live/` first (it
+  served a `cdn` game too) and ask `/get-stream-key` only if that is not a
+  playlist, so a normal tune-in is two requests.
+- **Token lifetime.** Held per embed link until 30 minutes before `_e`
+  (`_SF_TOKEN_MARGIN_S`); inside the 5-minute extract cache nothing is requested
+  at all. A held token the server refuses is dropped and the page fetched once
+  more. Embed pages are fetched only from this call, i.e. tune-in and pre-warm.
+- **Fallback.** Page 200 but no token for the quality (`StreamfreeLayoutChanged`)
+  runs the browser with `EXTRACT_NO_REFERER=1`, so `extract_stream.py` adds no
+  Referer. Every other link keeps the Referer it always had.
+- **Failure is a failed Source, not a fallback.** A 403 or `Violation` (page or
+  playlist) is logged and counted in `_provider_playback`; `/api/overview`
+  `providers[]` gains `playback_ok`, `playback_failed`, `playback_failing`
+  (the latest attempt failed, within the hour; a later good one clears it) and `playback_error`,
+  and the dashboard's Provider banner shows a failing playback. Browser outcomes
+  count the same way. A refusal does not start Chromium (it would be refused too).
+
+Checked by `tools/check_streamfree_playback.py`. Live, 2026-10-28, scratch
+container in the live network namespace: a live NBA game through `/stream` for
+6 minutes at 5.9 Mbps average, first byte 3.5 s, no gap after that, no browser
+started. Playing into Jellyfin was not done by the agent.
 
 ## 8. Endpoint reference
 

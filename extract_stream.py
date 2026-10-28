@@ -3,7 +3,7 @@ Extract m3u8 URL from a sports embed page (embedsporty.top, embedsports.top, etc
 Outputs JSON: {"url": "...", "cookies": {...}, "headers": {...}}
 Usage: python extract_stream.py <embed_url> [timeout_seconds]
 """
-import sys, json, time
+import os, sys, json, time
 from urllib.parse import urlparse
 
 def main():
@@ -41,7 +41,10 @@ def main():
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/145.0.0.0 Safari/537.36"
                 ),
-                extra_http_headers={"Referer": f"{embed_origin}/"},
+                # streamfree answers any Referer on its embed page with 403
+                # "Violation", so app.py sets EXTRACT_NO_REFERER for it.
+                extra_http_headers=({} if os.environ.get("EXTRACT_NO_REFERER")
+                                    else {"Referer": f"{embed_origin}/"}),
                 viewport={"width": 1280, "height": 720},
                 service_workers="block",
             )

@@ -282,11 +282,16 @@
   function renderProviderBanner(list, now) {
     var el = $("provider-banner");
     if (!el) { return; }
-    var bad = (list || []).filter(function (p) { return p.ok === false; });
+    var bad = (list || []).filter(function (p) { return p.ok === false || p.playback_failing; });
     if (!bad.length) { el.hidden = true; el.innerHTML = ""; return; }
     el.hidden = false;
     el.innerHTML = "<b>Provider failing</b>" + bad.map(function (p) {
       var ago = agoS(p.last_success, now);
+      if (p.ok !== false) {
+        return "<span><span class=\"mono\">" + esc(p.name) + "</span>: playback failed (" +
+          esc(p.playback_error || "no answer") + "); " + num(p.playback_failed) + " failed, " +
+          num(p.playback_ok) + " ok since start.</span>";
+      }
       return "<span><span class=\"mono\">" + esc(p.name) + "</span>: " + esc(p.error || "no answer") +
         ". " + (ago === null ? "Never had a good list."
                 : "Last good list " + dur(ago) + " ago, " +

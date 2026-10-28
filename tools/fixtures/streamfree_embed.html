@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Portland Trail Blazers vs Los Angeles Lakers | Live Stream</title>
+    <script src="/static/mirror-client.js?v=2"></script>
+
+    
+    <script src="/analytics.js"></script>
+    
+
+    <script>
+        (function() {
+            const referrer = document.referrer;
+            const isLocal = referrer.includes('streamfree.top') || referrer.includes('strmfree.st');
+            window.__isOwnSite = isLocal;
+
+            if (isLocal) {
+                aclib.runPop({ zoneId: '12266006' });
+            } else {
+                aclib.runPop({ zoneId: '10818186' });
+            }
+        })();
+    </script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@swarmcloud/hls/hls.min.js"></script>
+    <script src="https://cdn.jwplayer.com/libraries/KB5zFt7A.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/swarmcloud-jwplayer-hlsjs@latest/dist/jwplayer.hlsjs.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background-color: #000;
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+        }
+        #player-container {
+            width: 100vw;
+            height: 100vh;
+            background-color: #000;
+            position: relative;
+        }
+        #jwplayer {
+            width: 100% !important;
+            height: 100% !important;
+        }
+
+        @keyframes ss-spin {
+            to { transform: rotate(360deg); }
+        }
+
+        #starting-soon-message {
+            position: absolute;
+            inset: 0;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            padding: 20px;
+            background: #000;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            text-align: center;
+        }
+
+        #starting-soon-message.show {
+            display: flex;
+        }
+
+        .starting-soon-spinner {
+            width: 28px;
+            height: 28px;
+            margin-bottom: 6px;
+            border: 3px solid rgba(255, 255, 255, 0.15);
+            border-top-color: rgba(255, 255, 255, 0.6);
+            border-radius: 50%;
+            animation: ss-spin 1s linear infinite;
+        }
+
+        .starting-soon-text {
+            font-size: 18px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .starting-soon-subtext {
+            max-width: 360px;
+            font-size: 13px;
+            line-height: 1.5;
+            color: rgba(255, 255, 255, 0.55);
+        }
+
+        @media (max-width: 480px) {
+            .starting-soon-spinner { width: 22px; height: 22px; border-width: 2px; }
+            .starting-soon-text { font-size: 15px; }
+            .starting-soon-subtext { font-size: 12px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="player-container">
+        <div id="jwplayer"></div>
+        <div id="starting-soon-message">
+            <div class="starting-soon-spinner"></div>
+            <div class="starting-soon-text">Stream starting soon</div>
+            <div class="starting-soon-subtext">This stream will start playing automatically once it goes live.</div>
+        </div>
+    </div>
+
+    <script>
+        let player = null;
+        let isSandboxed = false;
+
+        const STREAM_NAME = 'Portland Trail Blazers vs Los Angeles Lakers';
+        const SOURCE_SUFFIX = '';
+        const QUALITY = '1080p';
+        const VARIANT = 'portland-trail-blazers-vs-los-angeles-lakers' + QUALITY + SOURCE_SUFFIX;
+        const AUTOSTART = getAutostartFromURL();
+        const IS_LIVE = true;
+        const LIVE_CHECK_MS = 10000;
+
+        const p2pConfig = {
+            live: true,
+            token: "streamfree",
+            channelId: `${STREAM_NAME}_${QUALITY}${SOURCE_SUFFIX}`.replace(/\s/g, '_'),
+            announce: "https://ann.cdn-lab.shop/v1",
+            showSlogan: false,
+            sharePlaylist: false,
+            startFromSegmentOffset: 0,
+            trickleICE: true
+        };
+
+        function getAutostartFromURL() {
+            if (!window.__isOwnSite) return false;
+            const urlParams = new URLSearchParams(window.location.search);
+            return urlParams.get('autostart') === '1';
+        }
+
+        const _0x = {"1080p": {"_e": 1793188440, "_n": "fb7e2a2151d84e62", "_t": "bGtaBL8ZRWruH2HyPvXZ2w"}, "2160p": {"_e": 1793188440, "_n": "fb7e2a2151d84e62", "_t": "zTFuXJB1rXmVgRR_dSKobg"}, "540p": {"_e": 1793188440, "_n": "fb7e2a2151d84e62", "_t": "_8kuWuGBMAUOyL1pMOA0Ww"}, "720p": {"_e": 1793188440, "_n": "fb7e2a2151d84e62", "_t": "gJq6GiAfXJCr_zU_aKvyzw"}};
+
+        async function getStreamSource() {
+            try {
+                const data = await window.sfFetch('/get-stream-key/portland-trail-blazers-vs-los-angeles-lakers').then(r => r.json());
+
+                if (data.is_external && data.external_url) {
+                    return data.external_url;
+                }
+
+                const serverName = data.server_name || 'origin';
+
+                let url;
+                if (serverName === 'tiktok') {
+                    // Segments live on TikTok's CDN; byte-range HLS, no worker needed.
+                    url = `/live-tiktok/${VARIANT}/index.m3u8`;
+                } else if (serverName !== 'origin') {
+                    url = `/live-cdn/${VARIANT}/index.m3u8`;
+                } else {
+                    url = `/live/${VARIANT}/index.m3u8`;
+                }
+                const p = _0x[QUALITY];
+                if (p) {
+                    url += `?_t=${p._t}&_e=${p._e}&_n=${p._n}`;
+                }
+
+                return url;
+            } catch (error) {
+                return `/live/${VARIANT}/index.m3u8`;
+            }
+        }
+
+        async function initPlayer(autostart = AUTOSTART) {
+            const source = await getStreamSource();
+
+            const isSamsungBrowser = navigator.userAgent.indexOf('SamsungBrowser') > -1;
+            if (!isSamsungBrowser && !Hls.P2pEngine.isMSESupported() || Hls.P2pEngine.getBrowser() === 'iPhone-Safari') {
+                new Hls.P2pEngine.ServiceWorkerEngine(p2pConfig);
+            }
+
+            const playerConfig = {
+                file: source,
+                type: "hls",
+                preload: "auto",
+                autostart: autostart,
+                mute: false,
+                width: "100%",
+                height: "100%",
+                stretching: "uniform",
+                controls: true,
+                displaytitle: false,
+                displaydescription: false,
+                abouttext: "",
+                aboutlink: "",
+                reconnectTimeout: 1,
+                retryOnFailure: true,
+                liveTimeout: 60,
+                skin: { name: "seven" },
+                logo: { hide: true },
+                related: { displayMode: "none" }
+            };
+
+            Hls.P2pEngine.tryRegisterServiceWorker(p2pConfig).then(() => {
+                player = jwplayer("jwplayer").setup({ ...playerConfig, hlsjsdefault: true, hlsjsConfig: { p2pConfig } });
+                jwplayer_hls_provider.attach();
+            }).catch(() => {
+                player = jwplayer("jwplayer").setup(playerConfig);
+            });
+        }
+
+        async function waitUntilLive() {
+            try {
+                const res = await window.sfFetch('/api/v1/sources/' + encodeURIComponent('portland-trail-blazers-vs-los-angeles-lakers'));
+                if (res.ok) {
+                    const data = await res.json();
+                    const live = (data.live_sources || [])
+                        .some(url => url.split('?')[0].split('/').pop() === VARIANT);
+                    if (live) {
+                        document.getElementById('starting-soon-message').classList.remove('show');
+                        initPlayer(AUTOSTART || window.__isOwnSite);
+                        return;
+                    }
+                }
+            } catch (e) {
+            }
+            setTimeout(waitUntilLive, LIVE_CHECK_MS);
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            if (IS_LIVE) {
+                initPlayer();
+            } else {
+                document.getElementById('starting-soon-message').classList.add('show');
+                setTimeout(waitUntilLive, LIVE_CHECK_MS);
+            }
+        });
+
+        window.sandDetect = () => {
+            isSandboxed = true;
+            document.body.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;width:100vw;height:100vh;padding:20px;box-sizing:border-box;background:#000;color:#fff;font-family:Segoe UI,Tahoma,Geneva,Verdana,sans-serif;font-size:1.5rem;text-align:center;">Embed this stream without sandbox<div id="sandbox-ua" style="max-width:640px;font-family:monospace;font-size:12px;line-height:1.5;color:rgba(255,255,255,.45);word-break:break-all;"></div></div>';
+            document.getElementById('sandbox-ua').textContent = navigator.userAgent;
+        };
+
+        const iOS = /iPad|iPhone|iPod/.test(window.navigator.platform) ||
+            ("MacIntel" === window.navigator.platform && navigator.maxTouchPoints > 1),
+            Edge = /Edge/.test(window.navigator.userAgent),
+            Opera = /OPR/.test(window.navigator.userAgent) && /Mobile Safari/.test(window.navigator.userAgent),
+            Android = /Andr[o0]id/i.test(window.navigator.userAgent),
+            isWebOS = /Web[0O]S/.test(window.navigator.userAgent),
+            NetCast = /NetCast/.test(window.navigator.userAgent),
+            TitanOS = /WhaleTV/.test(window.navigator.userAgent);
+
+        if (!(iOS || Edge || isWebOS || NetCast || TitanOS || Android || Opera)) {
+            document.body.insertAdjacentHTML("beforeend",
+                '<object id="sandDetect" data="data:application/pdf;base64,aG1t" width="1px" height="1px" style="position:absolute;top:-500px;left:-500px;visibility:hidden;" onerror="window.sandDetect()"></object>'
+            );
+        }
+
+        document.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+        });
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'F12' ||
+                (e.ctrlKey && e.shiftKey && e.key === 'I') ||
+                (e.ctrlKey && e.shiftKey && e.key === 'C') ||
+                (e.ctrlKey && e.key === 'u')) {
+                e.preventDefault();
+            }
+        });
+
+        (()=>{let a=()=>{document.body.insertAdjacentHTML('beforeend','<iframe style="visibility:hidden"id="close"width="1"height="1"scrolling="no"frameborder="0"src="/ad.html"></iframe>');setTimeout(()=>{document.querySelector("#close").remove();},9000);setTimeout(a,600000)};a()})();
+    </script>
+
+</body>
+</html>
