@@ -1576,7 +1576,7 @@ spare port with a copy of the data dir. Observed, not assumed:
   then `PPV`. Willow lists on both, merged as a feed.
 - **Outage / fallback.** With both streamfree hosts refused for requests and
   curl_cffi mid-stream, the playing Stream failed its playlist six times in
-  12 s and ended (`Playlist failed repeatedly`); the client's reconnect ran the
+  10 s and ended (`Playlist failed repeatedly`); the client's reconnect ran the
   cascade, `Cascade succeeded on attempt 2 (PPV1) after 11.4 s`, and played 37 s
   with no freezes. The list refresh logged `serving its last good list of 8
   games` and the playlist stayed at 225 entries; the Sabres game kept both
