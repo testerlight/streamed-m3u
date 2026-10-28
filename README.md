@@ -64,6 +64,27 @@ If channels time out before they start playing, set Dispatcharr's channel
 init grace period to `60` seconds ([Quick start](#quick-start), step 3). For
 a richer sports guide, see [Better guide with Teamarr](#better-guide-with-teamarr-optional).
 
+## Upgrading from 1.0.x
+
+Version 1.1 replaces the closed streamed.pk with two new services, streamfree
+and ppv.st. Nothing needs doing: pull the new image and recreate the
+containers. What you will notice:
+
+- **Where games come from.** `PROVIDERS` now defaults to `streamfree, ppv`.
+  streamfree is tried first (it plays without starting a browser, so a click
+  starts in a few seconds); ppv.st is the backup. A game both list shows once,
+  with Sources from each. To go back to ppv.st alone, set `PROVIDERS=ppv`. It
+  is a live setting, so no restart is needed. streamed.pk is off by default.
+- **Source names change.** The old letters (`[B1-HD]`) become the service,
+  a number and the picture height: `[SF1-1080p]` for streamfree, `[PPV1]` for
+  ppv.st (which does not say its quality). Sources are ranked by quality, then
+  by whether the audio checked out, then by service order.
+- **Nothing else moves.** Channels, channel numbers, your lineup, favourites
+  and the `streamed.pk teams` names in Dispatcharr are untouched, and a
+  failed fetch from one service never removes a channel.
+- **RedZone** is carried by streamfree and only has a stream on NFL game days;
+  outside those it stays on the lineup with nothing to play.
+
 ## Requirements
 
 - Docker with Compose v2, on `linux/amd64`. The image bundles a Playwright
