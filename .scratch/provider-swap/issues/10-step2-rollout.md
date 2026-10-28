@@ -4,7 +4,7 @@
 
 **Blocked by:** 07, 09
 
-**Status:** verified on scratch image `streamed-m3u:playback-09`; waiting for the user's go-ahead to deploy
+**Status:** deployed 2026-10-28
 
 - [x] Before any change, a backup of the lineup file and a rollback tag of the live image are made.
 - [x] RedZone is added to the allowlist; no other lineup change is made.
@@ -12,7 +12,7 @@
 - [x] A game listed by both Providers shows as one game with Sources from each, ranked as agreed.
 - [x] Blocking one Provider mid-test leaves Channels intact, and a playing Stream falls back to the other Provider's Sources.
 - [x] The README settings table is regenerated, and the maintainer doc has gotchas for each streamfree quirk found (two domains, Referer rule, token lifetime, empty Source lists).
-- [ ] The results are shown to the user, and the live image is retagged only after the user approves.
+- [x] The results are shown to the user, and the live image is retagged only after the user approves.
 
 ## Log
 
@@ -26,3 +26,5 @@
 - README settings table regenerated in the image: no difference from the committed table.
 - Offline checks pass on the scratch image: streamfree, streamfree_playback, providers, merge, pick, resilience, ranking, console.
 - Deploy: not done. Needs the user's approval. `PROVIDERS` already defaults to `streamfree,ppv`, so the new image turns streamfree on with no config change; `PROVIDERS=ppv` turns it off again without a redeploy.
+
+2026-10-28 (agent). Deployed on the user's go-ahead (commit fa00992): compose build + `up -d --no-deps` for streamed-m3u and sync, no active streams at the time, gluetun untouched. Live app serves `# Providers: streamfree, ppv`, 232 entries, 2 merged games; sync cycle completed. Still to confirm by eye: a streamfree game in Jellyfin; RedZone on an NFL Sunday.
